@@ -1,0 +1,447 @@
+<!doctype html>
+<!--
+  UI preview for src/ui without the real site.
+  Uses an inline stub of the stats API (v1 + v2 functions) and ~2500 fake events
+  (cases, normal and mystery upgrades, super-drop cards, deposits, withdrawals).
+  The stub is a rough stand-in for testing the UI only; docs/integration.html uses the real src/stats.
+
+  Browsers block ES module imports from file:// pages, so serve the project root over HTTP:
+    npx http-server . -p 8080 -c-1
+  or, without npm:
+    node -e "const h=require('http'),f=require('fs'),p=require('path');h.createServer((q,r)=>{const x=p.join(process.cwd(),decodeURIComponent(q.url.split('?')[0]));f.readFile(x,(e,d)=>{r.writeHead(e?404:200,{'content-type':x.endsWith('.js')?'text/javascript':'text/html; charset=utf-8'});r.end(d)})}).listen(8080,'127.0.0.1')"
+  then open http://localhost:8080/docs/ui-preview.html
+  Add ?stats=real to run the same fake events through the real src/stats instead of the stub.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI preview</title>
+<style>
+  body { margin: 0; background: #0b0d10; color: #c9cdd3; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 720px; padding: 24px 16px 120px; }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #e6e8eb; }
+  p { margin: 0 0 16px; color: #8d949e; }
+  fieldset { border: 1px solid #272c34; border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; }
+  legend { padding: 0 6px; color: #8d949e; }
+  label { display: inline-flex; gap: 6px; align-items: center; margin: 4px 14px 4px 0; }
+  input[type=number] { width: 110px; background: #161a1f; color: #e6e8eb; border: 1px solid #363c46; border-radius: 6px; padding: 5px 8px; }
+  button { background: #1d2128; color: #e6e8eb; border: 1px solid #363c46; border-radius: 6px; padding: 6px 12px; margin: 4px 6px 4px 0; cursor: pointer; }
+  /* Hostile site CSS: must not leak into the shadow roots. */
+  button, table, td, th, h3, p, div { letter-spacing: 0.3em !important; }
+  * { font-family: "Comic Sans MS", cursive; }
+</style>
+</head>
+<body>
+<main>
+  <h1>caser-stat-tracker UI preview</h1>
+  <p>Launcher is bottom-left. The upgrade card shows while "Selection active" is checked. Page CSS here is deliberately hostile (letter-spacing, Comic Sans) to prove the shadow roots isolate styles.</p>
+  <fieldset>
+    <legend>Upgrade selection</legend>
+    <label><input type="checkbox" id="selOn" checked> Selection active</label>
+    <label>Stake <input type="number" id="stake" value="250" min="0" step="1"></label>
+    <label>Target price <input type="number" id="target" value="1200" min="0" step="1"></label>
+  </fieldset>
+  <fieldset>
+    <legend>Data</legend>
+    <button id="addEv" type="button">Add a live event</button>
+    <button id="loadFull" type="button">Load fake events</button>
+    <button id="loadEmpty" type="button">Load no events</button>
+  </fieldset>
+</main>
+
+<script type="module">
+import { mountDashboard, mountUpgradeOverlay } from '../src/ui/index.js';
+
+// ---------------- fake data ----------------
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const R = rng(42);
+const pick = (a) => a[Math.floor(R() * a.length)];
+const CASES = [
+  { slug: 'mil-spec', name: 'Mil-Spec Box', price: 49 },
+  { slug: 'restricted', name: 'Restricted Run', price: 129 },
+  { slug: 'covert-ops', name: 'Covert Ops', price: 349 },
+  { slug: 'knife-dream', name: 'Knife Dream', price: 1190 },
+  { slug: 'daily-free', name: 'Daily Free', price: 0 },
+];
+const SKINS = ['AK-47 | Slate', 'M4A1-S | Nitro', 'AWP | Atheris', 'Glock-18 | Vogue', 'USP-S | Cortex', 'Desert Eagle | Printstream', 'Karambit | Doppler', 'MP9 | Starlight'];
+let n = 0;
+const round2 = (v) => Math.round(v * 100) / 100;
+function item(price) { return { id: 'i' + (++n), name: pick(SKINS), price: round2(price), rarity: null, image: null }; }
+function dropPrice(casePrice) {
+  const base = casePrice || 20;
+  const u = R();
+  const mult = u < 0.6 ? 0.15 + R() * 0.5 : u < 0.92 ? 0.8 + R() * 1.2 : u < 0.99 ? 2 + R() * 2 : 4 + R() * 6;
+  return base * mult * 0.97;
+}
+// Real win probability: low shown chances win more often than shown, high chances less often.
+const realProb = (p) => p * (1.6 - 1.1 * p);
+function makeEvents(count, startTs = Date.now() - 45 * 864e5) {
+  const out = [];
+  let ts = startTs;
+  let balance = 5000;
+  while (out.length < count) {
+    ts += (R() < 0.08 ? 6 + R() * 30 : 0.2 + R() * 3) * 36e5 * (R() < 0.1 ? 1 : 0.02);
+    const base = { ts: Math.round(ts), site: R() < 0.8 ? 'caser.gg' : 'caser.one', userId: 'u1', source: R() < 0.3 ? 'import' : 'live', balanceBefore: balance };
+    const u = R();
+    if (u < 0.03) {
+      const amount = pick([500, 1000, 1000, 2000, 5000]);
+      const status = R() < 0.82 ? 'completed' : pick(['failed', 'expired']);
+      out.push({ ...base, id: 'd' + out.length, kind: 'deposit', amount, method: pick(['card', 'sbp', 'crypto']), status, completedTs: status === 'completed' ? base.ts + 60000 : null, balanceAfter: balance + (status === 'completed' ? amount : 0) });
+      if (status === 'completed') balance += amount;
+    } else if (u < 0.04) {
+      const value = round2(300 + R() * 4000);
+      out.push({ ...base, id: 'w' + out.length, kind: 'withdrawal', item: item(value), value, exactTime: R() < 0.3, balanceAfter: balance });
+    } else if (u < 0.4) {
+      const c = pick(CASES);
+      out.push({ ...base, id: 'c' + out.length, kind: 'case', caseSlug: c.slug, caseId: null, caseName: c.name, casePrice: c.price, free: c.price === 0,
+        batchId: 'b' + out.length, batchSize: 1, gameMode: R() < 0.7 ? 'normal' : 'fast', item: item(dropPrice(c.price)), balanceAfter: balance - c.price });
+      balance -= c.price;
+    } else {
+      const stake = round2(20 + R() ** 2 * 3000);
+      const status = R() < 0.005 ? 'pending' : null;
+      const common = { ...base, id: 'u' + out.length, kind: 'upgrade', stake, betItems: [item(stake)], addedBalance: R() < 0.3 ? 10 : 0, gameMode: 'normal', chanceServer: null, compensation: [] };
+      if (R() < 0.15) {
+        // Mystery: chance hidden, the user always receives an item.
+        const mult = R() < 0.62 ? 0.1 + R() * 0.85 : R() < 0.85 ? 1 + R() * 0.8 : 1.8 + R() * 3;
+        const won = mult >= 1;
+        const returned = round2(stake * mult);
+        out.push({ ...common, mystery: true, target: item(returned), chanceShown: null, mysteryMultiplier: mult, status: status || (won ? 'won' : 'lost'), won,
+          superDrop: null, returned, net: returned - stake, balanceAfter: balance + returned - stake });
+        balance += returned - stake;
+      } else {
+        const chance = pick([1.5, 3, 7, 12, 12, 18, 18, 25, 35, 48, 60, 72]);
+        const targetPrice = round2(stake / (chance / 103));
+        const chanceShown = Math.min(100, (stake / targetPrice) * 103);
+        const sdShown = R() < 0.08;
+        const p = realProb(chanceShown / 100) * (sdShown ? 1.6 : 1);
+        const won = R() < p;
+        const sdWon = sdShown && won && R() < 0.4;
+        const returned = won ? round2(targetPrice * (sdWon ? 1.2 + R() * 1.8 : 1)) : 0;
+        out.push({ ...common, mystery: false, target: item(targetPrice), chanceShown, mysteryMultiplier: null, status: status || (won ? 'won' : 'lost'), won,
+          superDrop: { shown: sdShown, won: sdWon, item: sdWon ? item(returned) : null }, returned, net: returned - stake, balanceAfter: balance + returned - stake });
+        balance += returned - stake;
+      }
+    }
+  }
+  return out;
+}
+const FAKE_COUNT = 2500;
+let EVENTS = makeEvents(FAKE_COUNT);
+
+// ---------------- stats stub (preview only, not the real module) ----------------
+const isUp = (e) => e.kind === 'upgrade' && e.status !== 'pending';
+const isCase = (e) => e.kind === 'case';
+const isNormal = (e) => isUp(e) && !e.mystery && typeof e.chanceShown === 'number';
+const sdShown = (e) => !!(e.superDrop && e.superDrop.shown);
+const testable = (e, includeSuperDrop = false) => isNormal(e) && (includeSuperDrop || !sdShown(e));
+const costOf = (e) => (isCase(e) ? e.casePrice : e.stake);
+const retOf = (e) => (isCase(e) ? e.item.price : e.returned);
+const sum = (a) => a.reduce((x, y) => x + y, 0);
+function normalCdf(x) {
+  const t = 1 / (1 + 0.3275911 * Math.abs(x) / Math.SQRT2);
+  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-(x * x) / 2);
+  return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
+}
+function wilson(k, n, z = 1.96) {
+  if (!n) return null;
+  const p = k / n, d = 1 + z * z / n, c = (p + z * z / (2 * n)) / d, m = (z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / d;
+  return [Math.max(0, c - m), Math.min(1, c + m)];
+}
+function holm(ps, alpha = 0.05) {
+  const idx = ps.map((p, i) => [p, i]).filter(([p]) => Number.isFinite(p)).sort((a, b) => a[0] - b[0]);
+  const out = ps.map(() => false);
+  for (let j = 0; j < idx.length; j++) { if (idx[j][0] <= alpha / (idx.length - j)) out[idx[j][1]] = true; else break; }
+  return out;
+}
+function chiSf(x, df) { // Wilson-Hilferty approximation
+  if (df <= 0) return NaN;
+  const z = (Math.cbrt(x / df) - (1 - 2 / (9 * df))) / Math.sqrt(2 / (9 * df));
+  return 1 - normalCdf(z);
+}
+const twoSided = (z) => 2 * (1 - normalCdf(Math.abs(z)));
+function moneyMetrics(list) {
+  const cost = sum(list.map(costOf)), returned = sum(list.map(retOf));
+  const m = { n: list.length, cost, returned, net: returned - cost, roi: cost ? (returned - cost) / cost : null, roiCI: null };
+  const r = list.filter((e) => costOf(e) > 0).map((e) => retOf(e) / costOf(e));
+  if (r.length >= 2) {
+    const mean = sum(r) / r.length, sd = Math.sqrt(sum(r.map((x) => (x - mean) ** 2)) / (r.length - 1)), se = sd / Math.sqrt(r.length);
+    m.roiCI = [mean - 1.96 * se - 1, mean + 1.96 * se - 1];
+  }
+  return m;
+}
+/** Win stats vs a per-event probability (default: shown chance). */
+function winStats(list, probOf = (e) => e.chanceShown / 100) {
+  const n = list.length, wins = list.filter((e) => e.won).length;
+  const exp = sum(list.map(probOf)), v = sum(list.map((e) => probOf(e) * (1 - probOf(e))));
+  const z = v > 0 ? (wins - exp) / Math.sqrt(v) : 0;
+  return { wins, winRate: n ? wins / n : null, winRateCI: wilson(wins, n), expectedRate: n ? exp / n : null, expectedWins: exp, z, p: n ? twoSided(z) : NaN };
+}
+function metrics(list, opts = {}) {
+  const m = moneyMetrics(list);
+  if (list.length && list.every(isUp)) {
+    const t = list.filter((e) => testable(e, opts.includeSuperDrop));
+    Object.assign(m, winStats(t));
+  }
+  return m;
+}
+function markHolm(rows, pKey = 'p', out = 'significant') { const s = holm(rows.map((r) => (r.n >= 10 ? r[pKey] : NaN))); rows.forEach((r, i) => (r[out] = s[i])); return rows; }
+function buckets(list, edges, get) {
+  return edges.slice(0, -1).map((lo, i) => {
+    const hi = edges[i + 1], last = i === edges.length - 2;
+    const rows = list.filter((e) => typeof get(e) === 'number' && get(e) >= lo && (last ? get(e) <= hi : get(e) < hi));
+    return { lo, hi, label: hi === Infinity ? `${lo}+` : `${lo}–${hi}`, rows };
+  });
+}
+function sessions(events, gap = 30) {
+  const ev = events.filter((e) => isCase(e) || isUp(e)).sort((a, b) => a.ts - b.ts);
+  const out = [];
+  for (const e of ev) {
+    let s = out[out.length - 1];
+    if (!s || e.ts - s.end > gap * 6e4) { s = { start: e.ts, end: e.ts, n: 0, cost: 0, returned: 0, net: 0, kinds: { case: 0, upgrade: 0 }, list: [] }; out.push(s); }
+    s.end = e.ts; s.n++; s.cost += costOf(e); s.returned += retOf(e); s.net = s.returned - s.cost; s.kinds[e.kind]++; s.list.push(e);
+  }
+  return out;
+}
+const CURVE_EDGES = [0, 10, 15, 20, 30, 50, 75, 100];
+function calibrationCurve(events, edges = CURVE_EDGES, opts = {}) {
+  const list = events.filter((e) => testable(e, opts.includeSuperDrop));
+  const rows = buckets(list, edges, (e) => e.chanceShown).map((b) => {
+    const w = winStats(b.rows);
+    const cost = sum(b.rows.map(costOf));
+    return { label: b.label + '%', lo: b.lo, hi: b.hi, n: b.rows.length, wins: w.wins, expectedRate: w.expectedRate, winRate: w.winRate, winRateCI: w.winRateCI, z: w.z, p: w.p,
+      realRtp: cost ? sum(b.rows.map(retOf)) / cost : null };
+  });
+  return markHolm(rows);
+}
+const DAYPART = (h) => (h < 6 ? 'night' : h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening');
+const WD = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+function factorValue(key, e, ctx) {
+  const d = new Date(e.ts);
+  switch (key) {
+    case 'hour': return [d.getHours(), String(d.getHours()).padStart(2, '0') + ':00'];
+    case 'weekday': { const w = (d.getDay() + 6) % 7; return [w, WD[w]]; }
+    case 'daypart': return [DAYPART(d.getHours()), DAYPART(d.getHours())];
+    case 'mode': return [e.mystery ? 'mystery' : 'normal', e.mystery ? 'mystery' : 'normal'];
+    case 'gameMode': return [e.gameMode, e.gameMode];
+    case 'site': return [e.site, e.site];
+    case 'free': return [e.free, e.free ? 'free' : 'paid'];
+    case 'itemCount': return [e.betItems.length, String(e.betItems.length)];
+    case 'addedBalance': return [e.addedBalance > 0, e.addedBalance > 0 ? 'some' : 'none'];
+    case 'multiplier': { const m = e.target.price / e.stake; const l = m < 2 ? 'x1.1–2' : m < 5 ? 'x2–5' : m < 10 ? 'x5–10' : 'x10+'; return [l, l]; }
+    case 'balanceBand': { const b = e.balanceBefore ?? 0; const l = b < 1000 ? '<1k' : b < 5000 ? '1k–5k' : '5k+'; return [l, l]; }
+    case 'sessionPosition': { const p = ctx.pos.get(e); const l = p <= 5 ? '1st–5th' : p <= 20 ? '6th–20th' : '21st+'; return [l, l]; }
+    case 'sessionMinute': { const m = ctx.min.get(e); const l = m < 15 ? '0–15' : m < 60 ? '15–60' : '60+'; return [l, l]; }
+    case 'afterLossStreak': { const s = ctx.streak.get(e); const l = s >= 5 ? '5+' : s >= 3 ? '3–4' : String(s); return [l, l]; }
+    case 'afterWin': { const v = ctx.prev.get(e); return [v, v]; }
+    case 'superDrop': return [sdShown(e) ? 1 : 0, sdShown(e) ? 'shown' : 'not shown'];
+    case 'sinceDeposit': {
+      const dep = ctx.lastDep(e.ts); if (dep === null) return ['z', 'no deposit yet'];
+      const m = (e.ts - dep) / 6e4;
+      const l = m < 5 ? '0–5m' : m < 15 ? '5–15m' : m < 60 ? '15–60m' : m < 360 ? '1–6h' : '6h+';
+      return [['0–5m', '5–15m', '15–60m', '1–6h', '6h+'].indexOf(l), l];
+    }
+    case 'afterDepositOrder': {
+      const k = ctx.order.get(e); if (k == null) return [9, 'no deposit yet'];
+      const l = k === 1 ? '1st' : k <= 5 ? '2nd–5th' : k <= 20 ? '6th–20th' : '21st+'; return [['1st', '2nd–5th', '6th–20th', '21st+'].indexOf(l), l];
+    }
+    case 'sinceWithdrawal': {
+      const w = ctx.lastWd(e.ts); if (w === null) return [9, 'none'];
+      const h = (e.ts - w) / 36e5; const l = h < 1 ? '<1h' : h < 24 ? '1–24h' : '24h+'; return [['<1h', '1–24h', '24h+'].indexOf(l), l];
+    }
+    default: return [null, null];
+  }
+}
+function lastBefore(sortedTs) {
+  return (ts) => { let r = null; for (const t of sortedTs) { if (t <= ts) r = t; else break; } return r; };
+}
+function factor(events, key, opts = {}) {
+  const deps = events.filter((e) => e.kind === 'deposit' && e.status === 'completed').map((e) => e.ts).sort((a, b) => a - b);
+  const wds = events.filter((e) => e.kind === 'withdrawal').map((e) => e.ts).sort((a, b) => a - b);
+  const ctx = { pos: new Map(), min: new Map(), streak: new Map(), prev: new Map(), order: new Map(), lastDep: lastBefore(deps), lastWd: lastBefore(wds) };
+  for (const s of sessions(events)) s.list.forEach((e, i) => { ctx.pos.set(e, i + 1); ctx.min.set(e, (e.ts - s.start) / 6e4); });
+  let streak = 0, prev = 'none', order = 0, lastDep = null;
+  for (const e of events.filter(isUp).sort((a, b) => a.ts - b.ts)) {
+    ctx.streak.set(e, streak); ctx.prev.set(e, prev); streak = e.won ? 0 : streak + 1; prev = e.won ? 'won' : 'lost';
+    const d = ctx.lastDep(e.ts); if (d !== lastDep) { lastDep = d; order = 0; } if (d !== null) ctx.order.set(e, ++order);
+  }
+  const includeSuperDrop = key === 'superDrop' || opts.includeSuperDrop;
+  const list = events.filter((e) => (opts.kind === 'case' ? isCase(e) : opts.kind === 'upgrade' ? isUp(e) : isCase(e) || isUp(e)));
+  const groups = new Map();
+  for (const e of list) { const [v, l] = factorValue(key, e, ctx); if (v === null || v === undefined) continue; if (!groups.has(v)) groups.set(v, { v, l, rows: [] }); groups.get(v).rows.push(e); }
+  // Real-odds curve over all events in scope, for the adjusted test.
+  const curve = calibrationCurve(list, CURVE_EDGES, { includeSuperDrop });
+  const realOf = (e) => { const r = curve.find((c, i) => e.chanceShown >= c.lo && (e.chanceShown < c.hi || i === curve.length - 1)); return r && r.n ? r.winRate : e.chanceShown / 100; };
+  const rows = [...groups.values()].sort((a, b) => (a.v > b.v ? 1 : -1)).map((g) => {
+    const m = metrics(g.rows, { includeSuperDrop });
+    if (opts.kind === 'upgrade') {
+      const t = g.rows.filter((e) => testable(e, includeSuperDrop));
+      const adj = winStats(t, realOf);
+      Object.assign(m, { zAdj: adj.z, pAdj: adj.p });
+    }
+    return { ...m, value: g.v, label: g.l };
+  });
+  let statistic = 0, df = 0, statisticAdj = 0;
+  if (opts.kind === 'upgrade') {
+    for (const r of rows) if (r.n && Number.isFinite(r.z)) { statistic += r.z * r.z; statisticAdj += (r.zAdj || 0) ** 2; df++; }
+    markHolm(rows); markHolm(rows, 'pAdj', 'significantAdj');
+  } else {
+    const all = list.filter((e) => costOf(e) > 0).map((e) => retOf(e) / costOf(e));
+    const mean = sum(all) / (all.length || 1);
+    const v = sum(all.map((b) => (b - mean) ** 2)) / Math.max(1, all.length - 1);
+    for (const r of rows) { const rr = groups.get(r.value).rows.filter((e) => costOf(e) > 0).map((e) => retOf(e) / costOf(e)); if (!rr.length) continue; const m = sum(rr) / rr.length; statistic += (rr.length * (m - mean) ** 2) / (v || 1); df++; }
+    df = Math.max(0, df - 1);
+    for (const r of rows) r.significant = false;
+  }
+  const p = df ? chiSf(statistic, df) : NaN;
+  const test = { statistic, df, p, significant: p < 0.05 };
+  if (opts.kind === 'upgrade') Object.assign(test, { statisticAdj, pAdj: df ? chiSf(statisticAdj, df) : NaN });
+  return { key, rows, test };
+}
+const DEF_CHANCE = [0, 2, 5, 10, 20, 30, 50, 75, 100];
+const DEF_STAKE = [0, 100, 500, 1000, 5000, 20000, Infinity];
+const stats = {
+  wilson, normalCdf, holm, sessions, factor, calibrationCurve,
+  summarize(events) {
+    const c = events.filter(isCase), u = events.filter(isUp), all = [...c, ...u];
+    return { cases: metrics(c), upgrades: moneyMetrics(u), total: moneyMetrics(all), firstTs: Math.min(...all.map((e) => e.ts)), lastTs: Math.max(...all.map((e) => e.ts)) };
+  },
+  caseRoi(events) {
+    const g = new Map();
+    for (const e of events.filter(isCase)) { if (!g.has(e.caseSlug)) g.set(e.caseSlug, []); g.get(e.caseSlug).push(e); }
+    return [...g.values()].map((list) => {
+      const prices = list.map((e) => e.item.price).sort((a, b) => a - b);
+      const best = list.reduce((a, e) => (!a || e.item.price > a.price ? e.item : a), null);
+      return { ...metrics(list), caseSlug: list[0].caseSlug, caseName: list[0].caseName, casePrice: list[0].casePrice, best, median: prices[Math.floor(prices.length / 2)],
+        hitRate: list.filter((e) => e.item.price >= e.casePrice).length / list.length };
+    }).sort((a, b) => b.n - a.n);
+  },
+  upgradeByChance(events, edges = DEF_CHANCE) { return markHolm(buckets(events.filter(isNormal), edges, (e) => e.chanceShown).map((b) => ({ ...metrics(b.rows), lo: b.lo, hi: b.hi, label: b.label }))); },
+  upgradeByStake(events, edges = DEF_STAKE) { return markHolm(buckets(events.filter(isNormal), edges, (e) => e.stake).map((b) => ({ ...metrics(b.rows), lo: b.lo, hi: b.hi, label: b.label }))); },
+  calibration(events) {
+    const t = events.filter((e) => testable(e));
+    if (!t.length) return { n: 0, wins: 0, expectedWins: 0, z: null, p: null, verdict: 'consistent', impliedRtp: null };
+    const w = winStats(t), mm = moneyMetrics(events.filter(isUp));
+    return { n: t.length, wins: w.wins, expectedWins: w.expectedWins, z: w.z, p: w.p, verdict: w.p >= 0.05 ? 'consistent' : w.z < 0 ? 'below' : 'above', impliedRtp: mm.cost ? mm.returned / mm.cost : null };
+  },
+  edgeMap(events, edges = DEF_CHANCE) {
+    return buckets(events.filter((e) => testable(e)), edges, (e) => e.chanceShown).map((b) => {
+      const m = moneyMetrics(b.rows);
+      const shownRtp = b.rows.length ? sum(b.rows.map((e) => (e.chanceShown / 100) * e.target.price / e.stake)) / b.rows.length : null;
+      return { label: b.label, lo: b.lo, hi: b.hi, n: m.n, shownRtp, realRtp: m.cost ? m.returned / m.cost : null, realRtpCI: m.roiCI ? [m.roiCI[0] + 1, m.roiCI[1] + 1] : null, mode: 'normal' };
+    });
+  },
+  superDropStats(events) {
+    const all = events.filter(isNormal), shown = all.filter(sdShown), notShown = all.filter((e) => !sdShown(e));
+    const side = (l) => { const w = winStats(l), m = moneyMetrics(l); return { n: l.length, wins: w.wins, winRate: w.winRate, expectedRate: w.expectedRate, z: w.z, p: w.p, rtp: m.cost ? m.returned / m.cost : null }; };
+    const hits = all.filter((e) => e.superDrop && e.superDrop.won).map((e) => e.returned / e.target.price);
+    return { n: all.length, shownN: shown.length, shownRate: all.length ? shown.length / all.length : null, shown: side(shown), notShown: side(notShown),
+      hits: { n: hits.length, avgMultiplier: hits.length ? sum(hits) / hits.length : null, minMultiplier: hits.length ? Math.min(...hits) : null, maxMultiplier: hits.length ? Math.max(...hits) : null } };
+  },
+  mysteryStats(events, stakeEdges = [0, 100, 500, 1000, 3000, Infinity]) {
+    const list = events.filter((e) => isUp(e) && e.mystery);
+    const mult = (e) => e.returned / e.stake;
+    const m = moneyMetrics(list);
+    const hits = list.filter((e) => mult(e) >= 1).length;
+    const ms = list.map(mult).sort((a, b) => a - b);
+    const binEdges = [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, Infinity];
+    const histogram = buckets(list, binEdges, mult).map((b) => ({ label: b.label, lo: b.lo, hi: b.hi, n: b.rows.length }));
+    const byStake = buckets(list, stakeEdges, (e) => e.stake).map((b) => ({ ...moneyMetrics(b.rows), lo: b.lo, hi: b.hi, label: b.label,
+      hitRate: b.rows.length ? b.rows.filter((e) => mult(e) >= 1).length / b.rows.length : null, meanMultiplier: b.rows.length ? sum(b.rows.map(mult)) / b.rows.length : null }));
+    // One-way ANOVA on per-event multiplier (F approximated through chi-square for the stub).
+    const groups = byStake.filter((r) => r.n > 1);
+    const grand = ms.length ? sum(ms) / ms.length : 0;
+    const ssb = sum(groups.map((r) => r.n * (r.meanMultiplier - grand) ** 2));
+    const ssw = sum(list.map((e) => { const r = byStake.find((g) => e.stake >= g.lo && e.stake < g.hi); return (mult(e) - (r ? r.meanMultiplier : grand)) ** 2; }));
+    const df1 = groups.length - 1, df2 = list.length - groups.length;
+    const F = df1 > 0 && df2 > 0 && ssw > 0 ? (ssb / df1) / (ssw / df2) : NaN;
+    return { ...m, hitRate: list.length ? hits / list.length : null, hitRateCI: wilson(hits, list.length), meanMultiplier: ms.length ? grand : null,
+      medianMultiplier: ms.length ? ms[Math.floor(ms.length / 2)] : null, histogram, byStake,
+      test: { method: 'ANOVA', statistic: F, df: [df1, df2], p: Number.isFinite(F) ? chiSf(F * df1, df1) : NaN } };
+  },
+  moneyFlow(events, { balance = null, inventoryValue = null } = {}) {
+    const deps = events.filter((e) => e.kind === 'deposit'), ok = deps.filter((e) => e.status === 'completed'), failed = deps.filter((e) => e.status !== 'completed');
+    const wds = events.filter((e) => e.kind === 'withdrawal');
+    const holdings = balance === null && inventoryValue === null ? null : (balance || 0) + (inventoryValue || 0);
+    const depSum = sum(ok.map((e) => e.amount)), wdSum = sum(wds.map((e) => e.value));
+    const firstTs = ok.length ? Math.min(...ok.map((e) => e.ts)) : null, lastTs = ok.length ? Math.max(...ok.map((e) => e.ts)) : null;
+    let run = 0;
+    const series = [...ok, ...wds].sort((a, b) => a.ts - b.ts).map((e) => {
+      const isW = e.kind === 'withdrawal', amount = isW ? e.value : e.amount;
+      run += isW ? amount : -amount;
+      return { ts: e.ts, kind: e.kind, amount, cumulativeNet: run };
+    });
+    const dayOf = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+    const days = new Map();
+    for (const p of series) { const k = dayOf(p.ts); if (!days.has(k)) days.set(k, { day: k, deposited: 0, withdrawn: 0 }); days.get(k)[p.kind === 'withdrawal' ? 'withdrawn' : 'deposited'] += p.amount; }
+    return {
+      deposits: { n: ok.length, sum: depSum, failedN: failed.length, failedSum: sum(failed.map((e) => e.amount)), firstTs, lastTs, perDay: firstTs ? depSum / Math.max(1, (lastTs - firstTs) / 864e5) : null },
+      withdrawals: { n: wds.length, value: wdSum, exactTimeN: wds.filter((e) => e.exactTime).length },
+      holdings, net: wdSum + (holdings ?? 0) - depSum, series, daily: [...days.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
+    };
+  },
+  upgradeQuote({ stake, targetPrice, chanceShown }, events) {
+    const cs = chanceShown ?? Math.min(100, (stake / targetPrice) * 103);
+    const ev = (cs / 100) * targetPrice - stake;
+    const bi = DEF_CHANCE.findIndex((x, i) => cs >= x && cs < (DEF_CHANCE[i + 1] ?? Infinity));
+    const lo = DEF_CHANCE[bi], hi = DEF_CHANCE[bi + 1] ?? 100;
+    const sb = DEF_STAKE.findIndex((x, i) => stake >= x && stake < DEF_STAKE[i + 1]);
+    const inBucket = events.filter((e) => testable(e) && e.chanceShown >= lo && e.chanceShown < hi);
+    const sim = inBucket.filter((e) => e.stake >= DEF_STAKE[sb] && e.stake < DEF_STAKE[sb + 1]);
+    const ret = sum(inBucket.map((e) => e.returned)), cost = sum(inBucket.map((e) => e.stake));
+    const p = cs / 100, N = 100;
+    const lf = [0]; for (let i = 1; i <= N; i++) lf[i] = lf[i - 1] + Math.log(i);
+    const pmf = [];
+    for (let k = 0; k <= N; k++) pmf.push(p >= 1 ? (k === N ? 1 : 0) : p <= 0 ? (k === 0 ? 1 : 0) : Math.exp(lf[N] - lf[k] - lf[N - k] + k * Math.log(p) + (N - k) * Math.log(1 - p)));
+    const netK = (k) => k * targetPrice - N * stake;
+    let acc = 0, p05 = null, p95 = null, prof = 0;
+    pmf.forEach((q, k) => { acc += q; if (p05 === null && acc >= 0.05) p05 = netK(k); if (p95 === null && acc >= 0.95) p95 = netK(k); if (netK(k) > 0) prof += q; });
+    const wins = sim.filter((e) => e.won).length;
+    return {
+      chanceShown: cs, chanceFair: (stake / targetPrice) * 100, multiplier: targetPrice / stake, ev, evPct: ev / stake,
+      realEdge: inBucket.length >= 30 ? ret / cost - 1 : null,
+      similar: { n: sim.length, wins, winRate: sim.length ? wins / sim.length : null, winRateCI: wilson(wins, sim.length) },
+      longRun: { tries: N, mean: N * ev, p05, p95, probProfit: prof },
+    };
+  },
+};
+
+// ---------------- mount ----------------
+// ?stats=real runs the UI against the real src/stats with the same fake events (stub fills any gap).
+let STATS = stats;
+if (new URLSearchParams(location.search).get('stats') === 'real') {
+  try { STATS = { ...stats, ...(await import('../src/stats/index.js')) }; } catch (e) { console.warn('[preview] real stats failed to load', e); }
+}
+const $ = (id) => document.getElementById(id);
+const dash = mountDashboard({
+  getEvents: async () => EVENTS.slice(),
+  stats: STATS,
+  currency: () => '₽',
+  onExport: (format) => console.log('[preview] export', format),
+  onImportFile: async () => { await new Promise((r) => setTimeout(r, 400)); return { added: 0 }; },
+  onImportHistory: async () => { await new Promise((r) => setTimeout(r, 900)); const more = makeEvents(12, Date.now() - 864e5).map((e) => ({ ...e, id: 'h' + e.id + Date.now(), source: 'import' })); EVENTS.push(...more); return { added: more.length }; },
+  onClear: async () => { EVENTS = []; },
+  getStatus: () => ({ capturing: true, lastEventTs: EVENTS.length ? Math.max(...EVENTS.map((e) => e.ts)) : null, unknownResponses: 2, version: '0.2.0-preview' }),
+  getHoldings: () => ({ balance: 1240.5, inventoryValue: 3810 }),
+});
+const overlay = mountUpgradeOverlay({
+  getSelection: () => ($('selOn').checked ? { stake: Number($('stake').value), targetPrice: Number($('target').value), chanceShown: null } : null),
+  getEvents: async () => EVENTS.slice(),
+  stats: STATS,
+  currency: () => '₽',
+});
+const refreshAll = () => { dash.refresh(); overlay.refresh(); };
+$('addEv').onclick = () => { const e = makeEvents(1, Date.now())[0]; e.ts = Date.now(); e.id = 'live' + Date.now(); EVENTS.push(e); refreshAll(); };
+$('loadFull').onclick = () => { EVENTS = makeEvents(FAKE_COUNT); refreshAll(); };
+$('loadEmpty').onclick = () => { EVENTS = []; refreshAll(); };
+window.__preview = { dash, overlay, stats, get events() { return EVENTS; } };
+</script>
+</body>
+</html>

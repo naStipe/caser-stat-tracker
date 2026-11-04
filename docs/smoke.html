@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- Smoke test for the built userscript: fakes the site API, loads dist/caser-tracker.user.js, fires requests like the site would. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Userscript smoke test</title>
+<style>body { margin: 0; background: #0b0d10; color: #c9cdd3; font: 14px/1.5 system-ui, sans-serif; padding: 16px; }</style>
+<script>
+  const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'content-type': 'application/json', date: new Date().toUTCString() } });
+  const routes = {
+    'GET /api/users/me': () => json({ id: 42, nickname: 'tester', balance: '1000.00' }),
+    'GET /api/game/cases': () => json({ cases: [{ id: '5', slug: 'eclipse', title: 'Eclipse', price: '79.000', type: 'paid' }] }),
+    'POST /api/game/cases/eclipse/open': () => json({ items: [{ id: '4709', marketName: 'AK-47 | Slate', price: '120.50', is_free: false, price_paid: '79.000' }], user_balance: '921.00', free_opens: {} }),
+    'POST /api/game/upgrade/bet': () => json({ bet: { id: 'b77', status: 'lost', betItems: [{ id: 501, name: 'AK-47 | Slate', price: '120.50' }], addedBalance: 0, targetItem: { id: 9, name: 'Knife', price: '1205' } }, compensationItems: [] }),
+  };
+  window.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
+    const r = routes[`${(init.method || 'GET').toUpperCase()} ${url.pathname}`];
+    return r ? r() : new Response('not found', { status: 404 });
+  };
+</script>
+<script src="../dist/caser-tracker.user.js"></script>
+</head>
+<body>
+<p id="out">running…</p>
+<script type="module">
+  const t = window.__caserTracker;
+  await t.store.clearEvents();
+  await fetch('/api/users/me');
+  await fetch('/api/game/cases');
+  await fetch('/api/game/cases/eclipse/open', { method: 'POST', body: JSON.stringify({ count: 1, gameMode: 'normal' }), headers: { Authorization: 'Bearer test' } });
+  await fetch('/api/game/upgrade/bet', { method: 'POST', body: JSON.stringify({ betInventoryItemIds: [501], addedBalance: 0, isMystery: false, gameMode: 'normal', targetItemId: 9 }) });
+  await new Promise((r) => setTimeout(r, 500));
+  const events = await t.store.allEvents();
+  window.__smoke = { events, summary: t.stats.summarize(events) };
+  document.getElementById('out').textContent = `events: ${events.length}`;
+</script>
+</body>
+</html>

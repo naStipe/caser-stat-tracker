@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- Integration check: real src/ui + real src/stats + seeded fixture events. Serve the project root over HTTP (see ui-preview.html). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Integration check</title>
+<style>body { margin: 0; background: #0b0d10; color: #c9cdd3; font: 14px/1.5 system-ui, sans-serif; padding: 16px; }</style>
+</head>
+<body>
+<p>Real stats + real UI. Selection: stake 100, target 1000. <span id="err"></span></p>
+<script type="module">
+import * as stats from '../src/stats/index.js';
+import { mountDashboard, mountUpgradeOverlay } from '../src/ui/index.js';
+import { generateEvents } from '../test/fixtures.js';
+
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message)));
+window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason)));
+const events = generateEvents({ seed: 3, cases: 400, upgrades: 500 });
+const dash = mountDashboard({
+  getEvents: async () => events.slice(),
+  stats,
+  currency: () => '₽',
+  onExport: () => {},
+  onImportFile: async () => ({ added: 0 }),
+  onImportHistory: async () => ({ added: 0 }),
+  onClear: async () => {},
+  getStatus: () => ({ capturing: true, lastEventTs: Date.now(), unknownResponses: 0, version: 'integration' }),
+});
+const overlay = mountUpgradeOverlay({ getSelection: () => ({ stake: 100, targetPrice: 1000, chanceShown: null }), getEvents: async () => events.slice(), stats, currency: () => '₽' });
+window.__int = { dash, overlay, stats, events, errors };
+</script>
+</body>
+</html>

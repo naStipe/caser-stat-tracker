@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["-e", "const h=require('http'),f=require('fs'),p=require('path');const types={'.js':'text/javascript','.html':'text/html; charset=utf-8','.json':'application/json'};h.createServer((q,r)=>{const x=p.join(process.cwd(),decodeURIComponent(q.url.split('?')[0]));f.readFile(x,(e,d)=>{r.writeHead(e?404:200,{'content-type':types[p.extname(x)]||'text/plain','access-control-allow-origin':'*','access-control-allow-private-network':'true'});r.end(d)})}).listen(8080,'127.0.0.1')"],
+      "port": 8080
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "caser-stat-tracker",
+  "version": "0.4.4",
+  "private": true,
+  "description": "Userscript that records case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2"
+  }
+}
