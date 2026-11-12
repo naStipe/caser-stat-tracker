@@ -82,3 +82,27 @@ test('context learns the account name and forgets the old inventory on a switch'
   assert.equal(ctx.inventoryValue, null);
   assert.equal(ctx.balance, 3);
 });
+
+test('an owned copy fills in the account of an event stored without one', async () => {
+  const { shouldReplace, mergeEvent } = await import('../src/store/db.js');
+  const { eventRank } = await import('../src/store/cloud.js');
+  const live = { id: 'upgrade:1', kind: 'upgrade', ts: 10, source: 'live', status: 'won', userId: null, balanceBefore: 5 };
+  const imp = { id: 'upgrade:1', kind: 'upgrade', ts: 12, source: 'import', status: 'won', userId: '7', balanceBefore: null };
+  assert.equal(shouldReplace(live, imp), true);
+  const m = mergeEvent(live, imp);
+  assert.deepEqual([m.userId, m.ts, m.source, m.balanceBefore], ['7', 10, 'live', 5]);
+  assert.ok(eventRank(m) > eventRank(live) && eventRank(m) > eventRank(imp));
+  // A copy without an account never removes one.
+  assert.equal(mergeEvent(m, { ...live, userId: null }).userId, '7');
+  assert.equal(shouldReplace(m, imp), false);
+});
+
+test('import gives a live case drop without an account the owner of its imported twin', async () => {
+  const { dropLiveTwins } = await import('../src/capture/parsers.js');
+  const live = { id: 'case:l', kind: 'case', source: 'live', ts: 1000, userId: null, matchKey: 'box|AK', caseSlug: 'box', item: { name: 'AK' } };
+  const imp = { id: 'case:i', kind: 'case', source: 'import', ts: 1500, userId: '7', caseSlug: 'box', item: { name: 'AK' } };
+  const pairs = [];
+  const kept = dropLiveTwins([imp], [live], (l, i) => pairs.push([l.id, i.id]));
+  assert.deepEqual(kept, []);
+  assert.deepEqual(pairs, [['case:l', 'case:i']]);
+});

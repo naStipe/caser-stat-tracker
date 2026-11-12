@@ -10,7 +10,7 @@ import { createPriceClient } from './prices/csfloat.js';
 import { Store, shouldReplace, mergeEvent } from './store/db.js';
 import { toJson, toCsv, fromJson } from './store/export.js';
 import { createSharedStore, gmStorage } from './store/shared.js';
-import { createCloud, isSyncKey, newSyncKey } from './store/cloud.js';
+import { createCloud, isSyncKey, newSyncKey, eventRank } from './store/cloud.js';
 import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
 import * as stats from './stats/index.js';
 import { mountDashboard, mountUpgradeOverlay, mountCasePanel, mountExchangePanel } from './ui/index.js';
@@ -65,8 +65,40 @@ function getEvents() {
 
 // ---- Accounts (see store/accounts.js) ----
 // Every event keeps the userId of the account that made it. The panels show the account picked in
-// the dashboard: "current" (default) follows whoever is signed in on the page.
-const ACCOUNT_SEL_KEY = 'cst.ui.account';
+// the dashboard. The pick is not stored: every page load, and every switch to another account,
+// starts again at "current", which follows whoever is signed in on the page.
+let accountSel = 'current';
+
+// The site does not always ask for /users/me itself, so the tracker asks when it does not know who
+// is signed in, or when the login token changed (a new login may be another account).
+let userAuth = null; // token the current ctx.userId was learned with
+let userCheck = null;
+
+/** Who is signed in. Asks the site's /users/me at most once per login token. */
+function ensureUser() {
+  const auth = getAuth();
+  if (!auth || (ctx.userId != null && auth === userAuth)) return Promise.resolve(ctx.userId);
+  if (!userCheck) {
+    userCheck = (async () => {
+      try {
+        const res = await origFetch('/api/users/me', { headers: { Accept: 'application/json', Authorization: auth } });
+        if (res.ok) {
+          const before = ctx.userId;
+          const nameBefore = ctx.userName;
+          ctx.learn({ method: 'GET', path: '/users/me', status: 200, resBody: await res.json() });
+          userAuth = auth;
+          if (ctx.userId !== before || ctx.userName !== nameBefore) onAccountSeen(before);
+        }
+      } catch (err) {
+        console.warn('[caser-tracker] could not read the signed-in account', err);
+      } finally {
+        userCheck = null;
+      }
+      return ctx.userId;
+    })();
+  }
+  return userCheck;
+}
 
 function knownAccounts() {
   const v = browserPrefs.get('accounts');
@@ -101,11 +133,12 @@ function fixLegacyOwner() {
 
 /** The account the panels show: an id, 'all', or null when no account is known yet. */
 function selectedAccount() {
-  return resolveSelection(uiStore.get(ACCOUNT_SEL_KEY, 'current'), ctx.userId, legacyOwner());
+  return resolveSelection(accountSel, ctx.userId, legacyOwner());
 }
 
 /** Events of the selected account. Sync, export and clear keep working on all events. */
 async function getViewEvents() {
+  await ensureUser();
   const all = await getEvents();
   return filterByAccount(all, selectedAccount(), legacyOwner());
 }
@@ -120,7 +153,7 @@ function accountsState() {
 }
 
 function selectAccount(sel) {
-  uiStore.set(ACCOUNT_SEL_KEY, sel);
+  accountSel = sel;
   dashboard?.refresh();
   overlay?.refresh();
 }
@@ -129,6 +162,7 @@ function selectAccount(sel) {
 function onAccountSeen(previous) {
   rememberAccount();
   if (ctx.userId === previous) return;
+  accountSel = 'current';
   dashboard?.refresh();
   overlay?.refresh();
   // A newly signed-in account gets its own history sync when it is due.
@@ -402,6 +436,13 @@ function cloudSync() {
       let added = 0;
       for (let i = 0; i < res.events.length; i += 2000) added += await saveEvents(res.events.slice(i, i + 2000), { cloud: false });
       if (res.cursor) await store.setMeta('cloudCursor', { key, ...res.cursor });
+      // Where the local copy merged into something better than the cloud's (for example a live
+      // event that got its owner from an imported copy), send it back.
+      if (res.events.length) {
+        const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+        const better = res.events.map((e) => byId.get(e.id)).filter((m, i) => m && eventRank(m) > eventRank(res.events[i]));
+        queueCloud(better);
+      }
       if (added) await removeTwins();
 
       // First sync of this domain under this key: send its whole history once.
@@ -568,11 +609,15 @@ const { origFetch } = installHook(pageWindow, async (ex) => {
   const userBefore = ctx.userId;
   const nameBefore = ctx.userName;
   ctx.learn(ex);
+  if (ex.path.split('?')[0] === '/users/me' && ex.status < 400 && ctx.userId != null) userAuth = getAuth();
   if (ctx.userId !== userBefore || ctx.userName !== nameBefore) onAccountSeen(userBefore);
   if (!recognized && !events.length) return;
 
   try {
     if (events.length) {
+      // Events belong to whoever is signed in now; parsing may have run before that was known.
+      const uid = await ensureUser();
+      if (uid != null) for (const e of events) e.userId = uid;
       await saveEvents(events);
       lastEventTs = Date.now();
       refreshAfterLive();
@@ -659,7 +704,7 @@ function mount() {
       await clearLocal();
       if (shared) await store.setMeta('sharedClearSeen', shared.clear());
       if (cloudKey()) browserPrefs.set('cloud:clearSeen', await cloud.clear());
-      uiStore.set(ACCOUNT_SEL_KEY, 'current');
+      accountSel = 'current';
       dashboard.refresh();
     },
     getStatus: () => ({
@@ -765,7 +810,9 @@ function sync() {
           return added;
         },
         // Only the signed-in account's events: they decide where an unfinished walk resumes.
-        getStored: async () => filterByAccount(await getEvents(), ctx.userId, legacyOwner()),
+        // Live events stored before the account was known (no userId) are included so the import
+        // can give them their owner.
+        getStored: async () => (await getEvents()).filter((e) => e.userId == null || String(e.userId) === ctx.userId),
         onProgress: (msg) => {
           syncProgress = msg;
           refreshSoon();
@@ -812,8 +859,9 @@ async function startAutoSync() {
 }
 
 /** Sync the signed-in account's site history unless that ran in the last 15 minutes. */
-function maybeAutoSync() {
+async function maybeAutoSync() {
   if (!getAuth()) return;
+  await ensureUser();
   const last = lastSyncFor(ctx.userId);
   if (last && Date.now() - last < AUTO_SYNC_AFTER_MS) return;
   sync().catch((err) => console.warn('[caser-tracker] sync failed', err));

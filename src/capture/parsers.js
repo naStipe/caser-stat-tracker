@@ -42,7 +42,7 @@ export class Context {
           this.inventoryValue = null;
         }
         this.userId = id;
-        const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.steamName ?? u.personaName;
+        const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.login ?? u.steamName ?? u.personaName ?? u.personaname ?? obj(u.steam)?.personaname ?? obj(u.profile)?.name;
         this.userName = typeof name === 'string' && name.trim() ? name.trim().slice(0, 64) : null;
       }
       this.setBalance(u.balance);
@@ -207,19 +207,20 @@ export const caseMatchKey = (slug, name) => `${slug}|${name}`;
  * Drops imported from history that were already captured live: same case and skin, within 60 s.
  * Returns the import events that are new.
  */
-export function dropLiveTwins(imported, stored) {
+export function dropLiveTwins(imported, stored, onMatch) {
   const live = new Map();
   for (const e of stored) {
     if (e.kind !== 'case' || e.source !== 'live' || !e.matchKey) continue;
     if (!live.has(e.matchKey)) live.set(e.matchKey, []);
-    live.get(e.matchKey).push(e.ts);
+    live.get(e.matchKey).push(e);
   }
   return imported.filter((e) => {
-    const times = live.get(caseMatchKey(e.caseSlug, e.item.name));
-    if (!times) return true;
-    const i = times.findIndex((t) => Math.abs(t - e.ts) < 60_000);
+    const drops = live.get(caseMatchKey(e.caseSlug, e.item.name));
+    if (!drops) return true;
+    const i = drops.findIndex((l) => Math.abs(l.ts - e.ts) < 60_000);
     if (i < 0) return true;
-    times.splice(i, 1); // one live drop matches one imported drop
+    onMatch?.(drops[i], e);
+    drops.splice(i, 1); // one live drop matches one imported drop
     return false;
   });
 }

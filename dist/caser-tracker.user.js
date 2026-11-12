@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.9.0
+// @version      0.9.1
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -190,7 +190,7 @@
             this.inventoryValue = null;
           }
           this.userId = id;
-          const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.steamName ?? u.personaName;
+          const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.login ?? u.steamName ?? u.personaName ?? u.personaname ?? obj(u.steam)?.personaname ?? obj(u.profile)?.name;
           this.userName = typeof name === "string" && name.trim() ? name.trim().slice(0, 64) : null;
         }
         this.setBalance(u.balance);
@@ -313,19 +313,20 @@
     });
   }
   var caseMatchKey = (slug, name) => `${slug}|${name}`;
-  function dropLiveTwins(imported, stored) {
+  function dropLiveTwins(imported, stored, onMatch) {
     const live = /* @__PURE__ */ new Map();
     for (const e of stored) {
       if (e.kind !== "case" || e.source !== "live" || !e.matchKey) continue;
       if (!live.has(e.matchKey)) live.set(e.matchKey, []);
-      live.get(e.matchKey).push(e.ts);
+      live.get(e.matchKey).push(e);
     }
     return imported.filter((e) => {
-      const times = live.get(caseMatchKey(e.caseSlug, e.item.name));
-      if (!times) return true;
-      const i = times.findIndex((t) => Math.abs(t - e.ts) < 6e4);
+      const drops = live.get(caseMatchKey(e.caseSlug, e.item.name));
+      if (!drops) return true;
+      const i = drops.findIndex((l) => Math.abs(l.ts - e.ts) < 6e4);
       if (i < 0) return true;
-      times.splice(i, 1);
+      onMatch?.(drops[i], e);
+      drops.splice(i, 1);
       return false;
     });
   }
@@ -571,7 +572,11 @@
       }
       const parsed = drops.map((r) => caseFromInventoryRecord(r, ctx2, site2)).filter(Boolean);
       skipped += drops.length - parsed.length;
-      const events = dropLiveTwins(parsed, stored);
+      const owned = [];
+      const events = dropLiveTwins(parsed, stored, (live, imp) => {
+        if (live.userId == null && imp.userId != null) owned.push({ ...live, userId: imp.userId });
+      });
+      if (owned.length) await save(owned);
       const parsedWithdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx2, site2)).filter((w) => w && !knownWithdrawals.has(w.id));
       const twins = withdrawalTwinIds([...knownWithdrawals.values(), ...parsedWithdrawals]);
       const withdrawals = parsedWithdrawals.filter((w) => !twins.has(w.id));
@@ -1094,6 +1099,7 @@
       if (old.completedTs == null && incoming.completedTs != null) return true;
     }
     if (old.source === "import" && incoming.source === "live") return true;
+    if (old.userId == null && incoming.userId != null) return true;
     return false;
   }
   function mergeEvent(old, incoming) {
@@ -1103,6 +1109,7 @@
       ...incoming,
       ts: live.ts,
       source: live.source,
+      userId: incoming.userId ?? old.userId ?? null,
       balanceBefore: live.balanceBefore ?? old.balanceBefore ?? incoming.balanceBefore,
       balanceAfter: live.balanceAfter ?? old.balanceAfter ?? incoming.balanceAfter
     };
@@ -1293,6 +1300,7 @@
     if (e.kind === "upgrade" && e.status && e.status !== "pending") r += 2;
     if (e.kind === "deposit" && e.status === "completed") r += 2;
     if (e.kind === "deposit" && e.completedTs != null) r += 4;
+    if (e.userId != null) r += 8;
     return r;
   }
   var KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
@@ -6619,7 +6627,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.9.0" : "dev";
+  var VERSION = true ? "0.9.1" : "dev";
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
   var ctx = new Context();
@@ -6650,7 +6658,33 @@ Click for the sales chart.` : r.name;
     }
     return memLoad.then((list) => list.slice());
   }
-  var ACCOUNT_SEL_KEY = "cst.ui.account";
+  var accountSel = "current";
+  var userAuth = null;
+  var userCheck = null;
+  function ensureUser() {
+    const auth = getAuth();
+    if (!auth || ctx.userId != null && auth === userAuth) return Promise.resolve(ctx.userId);
+    if (!userCheck) {
+      userCheck = (async () => {
+        try {
+          const res = await origFetch("/api/users/me", { headers: { Accept: "application/json", Authorization: auth } });
+          if (res.ok) {
+            const before = ctx.userId;
+            const nameBefore = ctx.userName;
+            ctx.learn({ method: "GET", path: "/users/me", status: 200, resBody: await res.json() });
+            userAuth = auth;
+            if (ctx.userId !== before || ctx.userName !== nameBefore) onAccountSeen(before);
+          }
+        } catch (err) {
+          console.warn("[caser-tracker] could not read the signed-in account", err);
+        } finally {
+          userCheck = null;
+        }
+        return ctx.userId;
+      })();
+    }
+    return userCheck;
+  }
   function knownAccounts() {
     const v = browserPrefs.get("accounts");
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
@@ -6674,9 +6708,10 @@ Click for the sales chart.` : r.name;
     if (pick) browserPrefs.set("acct:legacy", pick);
   }
   function selectedAccount() {
-    return resolveSelection(store.get(ACCOUNT_SEL_KEY, "current"), ctx.userId, legacyOwner());
+    return resolveSelection(accountSel, ctx.userId, legacyOwner());
   }
   async function getViewEvents() {
+    await ensureUser();
     const all = await getEvents();
     return filterByAccount(all, selectedAccount(), legacyOwner());
   }
@@ -6689,13 +6724,14 @@ Click for the sales chart.` : r.name;
     };
   }
   function selectAccount(sel) {
-    store.set(ACCOUNT_SEL_KEY, sel);
+    accountSel = sel;
     dashboard?.refresh();
     overlay?.refresh();
   }
   function onAccountSeen(previous) {
     rememberAccount();
     if (ctx.userId === previous) return;
+    accountSel = "current";
     dashboard?.refresh();
     overlay?.refresh();
     if (mounted && previous != null) setTimeout(maybeAutoSync, 3e3);
@@ -6912,6 +6948,11 @@ Click for the sales chart.` : r.name;
         let added = 0;
         for (let i = 0; i < res.events.length; i += 2e3) added += await saveEvents(res.events.slice(i, i + 2e3), { cloud: false });
         if (res.cursor) await store2.setMeta("cloudCursor", { key, ...res.cursor });
+        if (res.events.length) {
+          const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+          const better = res.events.map((e) => byId.get(e.id)).filter((m, i) => m && eventRank(m) > eventRank(res.events[i]));
+          queueCloud(better);
+        }
         if (added) await removeTwins();
         if (await store2.getMeta("cloudPushedKey") !== key) {
           await cloud.push(await getEvents(), (done, total) => {
@@ -7049,10 +7090,13 @@ Click for the sales chart.` : r.name;
     const userBefore = ctx.userId;
     const nameBefore = ctx.userName;
     ctx.learn(ex);
+    if (ex.path.split("?")[0] === "/users/me" && ex.status < 400 && ctx.userId != null) userAuth = getAuth();
     if (ctx.userId !== userBefore || ctx.userName !== nameBefore) onAccountSeen(userBefore);
     if (!recognized && !events.length) return;
     try {
       if (events.length) {
+        const uid = await ensureUser();
+        if (uid != null) for (const e of events) e.userId = uid;
         await saveEvents(events);
         lastEventTs = Date.now();
         refreshAfterLive();
@@ -7128,7 +7172,7 @@ Click for the sales chart.` : r.name;
         await clearLocal();
         if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
         if (cloudKey()) browserPrefs.set("cloud:clearSeen", await cloud.clear());
-        store.set(ACCOUNT_SEL_KEY, "current");
+        accountSel = "current";
         dashboard.refresh();
       },
       getStatus: () => ({
@@ -7221,7 +7265,9 @@ Click for the sales chart.` : r.name;
             return added;
           },
           // Only the signed-in account's events: they decide where an unfinished walk resumes.
-          getStored: async () => filterByAccount(await getEvents(), ctx.userId, legacyOwner()),
+          // Live events stored before the account was known (no userId) are included so the import
+          // can give them their owner.
+          getStored: async () => (await getEvents()).filter((e) => e.userId == null || String(e.userId) === ctx.userId),
           onProgress: (msg) => {
             syncProgress = msg;
             refreshSoon();
@@ -7264,8 +7310,9 @@ Click for the sales chart.` : r.name;
     }
     setTimeout(maybeAutoSync, 5e3);
   }
-  function maybeAutoSync() {
+  async function maybeAutoSync() {
     if (!getAuth()) return;
+    await ensureUser();
     const last = lastSyncFor(ctx.userId);
     if (last && Date.now() - last < AUTO_SYNC_AFTER_MS) return;
     sync().catch((err) => console.warn("[caser-tracker] sync failed", err));

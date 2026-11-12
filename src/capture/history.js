@@ -76,7 +76,12 @@ export async function importHistory({ fetch, ctx, site, getAuth, save, getStored
     }
     const parsed = drops.map((r) => caseFromInventoryRecord(r, ctx, site)).filter(Boolean);
     skipped += drops.length - parsed.length;
-    const events = dropLiveTwins(parsed, stored);
+    // A live drop stored before the tracker knew the signed-in account takes the owner from its twin.
+    const owned = [];
+    const events = dropLiveTwins(parsed, stored, (live, imp) => {
+      if (live.userId == null && imp.userId != null) owned.push({ ...live, userId: imp.userId });
+    });
+    if (owned.length) await save(owned);
     // A withdrawal captured live comes back here under another id; keep only the live one.
     const parsedWithdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx, site)).filter((w) => w && !knownWithdrawals.has(w.id));
     const twins = withdrawalTwinIds([...knownWithdrawals.values(), ...parsedWithdrawals]);

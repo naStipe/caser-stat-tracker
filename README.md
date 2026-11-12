@@ -68,8 +68,10 @@ The script header has `@updateURL` / `@downloadURL` pointing at the raw file abo
 
 ### Several site accounts
 
-Every event keeps the id of the site account that made it. The panel shows the signed-in account by default;
-once a second account has events, a picker under the title switches between accounts or shows all of them.
+Every event keeps the id of the site account that made it. The panel always opens on the signed-in account (also after
+logging into another one); once a second account has events, a picker under the title switches to another
+account or to all of them until the next page load. When the site does not report who is signed in, the
+tracker asks `/api/users/me` itself, once per login token.
 Site sync, its "read to the end" flags and the 15-minute auto-sync run per account. Export and "Clear all" cover
 every account. Events recorded before 0.9.0 without an account id count for the account with the most events.
 
@@ -86,6 +88,7 @@ Previews (serve the project root, for example with the `preview` entry in `.clau
 - `docs/ui-preview.html`: UI with stub stats.
 - `docs/integration.html`: real UI + real stats on generated data.
 - `docs/smoke.html`: the built userscript against a fake site API.
+- `docs/smoke-accounts.html`: the built userscript tags live events with the signed-in account, also after a login switch.
 - `docs/exchange-smoke.html`: the exchange panel against a fake replacement modal and fake CSFloat prices.
 
 Module boundaries and the event schema are in `docs/CONTRACT.md`.

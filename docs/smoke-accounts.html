@@ -1,0 +1,50 @@
+<!doctype html>
+<!-- Smoke test for multi-account capture: the fake site never asks for /users/me itself, so the built
+     userscript must ask (with the login token) and tag live events with the signed-in account.
+     A token change then means another account signed in. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Account smoke test</title>
+<style>body { margin: 0; background: #0b0d10; color: #c9cdd3; font: 14px/1.5 system-ui, sans-serif; padding: 16px; }</style>
+<script>
+  const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'content-type': 'application/json', date: new Date().toUTCString() } });
+  const users = { 'Bearer tok-a': { id: 111, username: 'alpha', balance: '50.00' }, 'Bearer tok-b': { id: 222, username: 'beta', balance: '9.00' } };
+  window.__meCalls = 0;
+  localStorage.setItem('auth_token', 'tok-a');
+  const routes = {
+    'GET /api/users/me': (init) => {
+      window.__meCalls++;
+      const h = init.headers || {};
+      const u = users[h.Authorization || h.authorization];
+      return u ? json(u) : new Response('unauthorized', { status: 401 });
+    },
+    'POST /api/game/upgrade/bet': () => json({ bet: { id: `b${Date.now()}${Math.random()}`, status: 'lost', betItems: [{ id: 501, name: 'AK-47 | Slate', price: '120.50' }], addedBalance: 0, targetItem: { id: 9, name: 'Knife', price: '1205' } }, compensationItems: [] }),
+  };
+  window.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
+    const r = routes[`${(init.method || 'GET').toUpperCase()} ${url.pathname}`];
+    return r ? r(init) : new Response('not found', { status: 404 });
+  };
+</script>
+<script src="../dist/caser-tracker.user.js"></script>
+</head>
+<body>
+<p id="out">running…</p>
+<script type="module">
+  const t = window.__caserTracker;
+  await t.store.clearEvents();
+  const bet = () => fetch('/api/game/upgrade/bet', { method: 'POST', body: JSON.stringify({ betInventoryItemIds: [501], addedBalance: 0, isMystery: false, gameMode: 'normal', targetItemId: 9 }) });
+  await bet();
+  await new Promise((r) => setTimeout(r, 400));
+  await bet();
+  await new Promise((r) => setTimeout(r, 400));
+  localStorage.setItem('auth_token', 'tok-b'); // another account signs in, without a page reload
+  await bet();
+  await new Promise((r) => setTimeout(r, 600));
+  const events = await t.store.allEvents();
+  const owners = events.map((e) => e.userId);
+  const ok = owners.length === 3 && owners.filter((o) => o === '111').length === 2 && owners.filter((o) => o === '222').length === 1 && window.__meCalls === 2;
+  window.__smoke = { ok, owners, meCalls: window.__meCalls, ctxUser: t.ctx.userId, ctxName: t.ctx.userName };
+  document.getElementById('out').textContent = `${ok ? 'PASS' : 'FAIL'} ${JSON.stringify(window.__smoke)}`;
+</script>
+</body>
+</html>

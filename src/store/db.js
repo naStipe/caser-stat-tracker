@@ -123,6 +123,8 @@ export function shouldReplace(old, incoming) {
     if (old.completedTs == null && incoming.completedTs != null) return true;
   }
   if (old.source === 'import' && incoming.source === 'live') return true;
+  // An event captured before the tracker knew the signed-in account gets its owner from a later copy.
+  if (old.userId == null && incoming.userId != null) return true;
   return false;
 }
 
@@ -134,6 +136,7 @@ export function mergeEvent(old, incoming) {
     ...incoming,
     ts: live.ts,
     source: live.source,
+    userId: incoming.userId ?? old.userId ?? null,
     balanceBefore: live.balanceBefore ?? old.balanceBefore ?? incoming.balanceBefore,
     balanceAfter: live.balanceAfter ?? old.balanceAfter ?? incoming.balanceAfter,
   };

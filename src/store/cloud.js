@@ -22,6 +22,7 @@ export function eventRank(e) {
   if (e.kind === 'upgrade' && e.status && e.status !== 'pending') r += 2;
   if (e.kind === 'deposit' && e.status === 'completed') r += 2;
   if (e.kind === 'deposit' && e.completedTs != null) r += 4;
+  if (e.userId != null) r += 8;
   return r;
 }
 
