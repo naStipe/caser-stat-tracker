@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.9.2
+// @version      0.9.3
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -1305,6 +1305,9 @@
     if (e.userId != null) r += 8;
     return r;
   }
+  function planUpload(events, cloudRanks) {
+    return events.filter((e) => !(cloudRanks.get(e.id) >= eventRank(e))).map((e) => e.id);
+  }
   var KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
   function isSyncKey(k) {
     return typeof k === "string" && KEY_RE.test(k);
@@ -1372,6 +1375,24 @@
           if (rows.length < PULL_PAGE) break;
         }
         return { events, deletedIds, cursor: last };
+      },
+      /**
+       * id -> rank of every row under this key (deleted rows as Infinity, since the cloud ignores
+       * pushes to them). Only ids and ranks are read, so this is far lighter than a pull.
+       */
+      async ranks(onProgress) {
+        const out = /* @__PURE__ */ new Map();
+        let last = null;
+        for (; ; ) {
+          const after = last == null ? "" : `&id=gt.${encodeURIComponent(last)}`;
+          const rows = await call("GET", `/rest/v1/sync_events?select=id,rank,deleted&order=id.asc&limit=${PULL_PAGE}${after}`);
+          if (!Array.isArray(rows)) throw new Error("Cloud answered with no rows list");
+          for (const r of rows) out.set(r.id, r.deleted ? Infinity : Number(r.rank) || 0);
+          onProgress?.(out.size);
+          if (rows.length < PULL_PAGE) break;
+          last = rows[rows.length - 1].id;
+        }
+        return out;
       },
       async remove(ids) {
         if (!ids.length) return 0;
@@ -6704,7 +6725,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.9.2" : "dev";
+  var VERSION = true ? "0.9.3" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
@@ -7002,6 +7023,34 @@ Click for the sales chart.` : r.name;
       throw err;
     }
   }
+  var UPLOAD_BATCH = 500;
+  async function firstUpload(key) {
+    let plan = await store2.getMeta("cloudPushPlan");
+    if (!plan || plan.key !== key || !Array.isArray(plan.ids)) {
+      cloudStatus = { ...cloudStatus, progress: "Comparing with the cloud" };
+      dashboard?.refresh();
+      const ranks = await cloud.ranks((n) => {
+        cloudStatus = { ...cloudStatus, progress: `Comparing with the cloud (${n})` };
+        refreshSoon();
+      });
+      plan = { key, ids: planUpload(await getEvents(), ranks) };
+      await store2.setMeta("cloudPushPlan", plan);
+      await store2.setMeta("cloudPushDone", 0);
+    }
+    let done = Number(await store2.getMeta("cloudPushDone")) || 0;
+    const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+    while (done < plan.ids.length) {
+      const batch = plan.ids.slice(done, done + UPLOAD_BATCH).map((id) => byId.get(id)).filter(Boolean);
+      if (batch.length) await cloud.push(batch);
+      done = Math.min(done + UPLOAD_BATCH, plan.ids.length);
+      await store2.setMeta("cloudPushDone", done);
+      cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${plan.ids.length} (one time)` };
+      refreshSoon();
+    }
+    await store2.setMeta("cloudPushedKey", key);
+    await store2.setMeta("cloudPushPlan", null);
+    await store2.setMeta("cloudPushDone", null);
+  }
   function cloudSync() {
     const key = cloudKey();
     if (!key) return Promise.resolve(null);
@@ -7032,13 +7081,7 @@ Click for the sales chart.` : r.name;
           queueCloud(better);
         }
         if (added) await removeTwins();
-        if (await store2.getMeta("cloudPushedKey") !== key) {
-          await cloud.push(await getEvents(), (done, total) => {
-            cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${total}` };
-            refreshSoon();
-          });
-          await store2.setMeta("cloudPushedKey", key);
-        }
+        if (await store2.getMeta("cloudPushedKey") !== key) await firstUpload(key);
         await flushCloud();
         for (const s2 of account.complete) if (isStreamFlag(s2, HISTORY_STREAMS)) markBrowserComplete(s2);
         for (const s2 of browserComplete()) {

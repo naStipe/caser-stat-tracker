@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { eventRank, isSyncKey, newSyncKey, createCloud } from '../src/store/cloud.js';
+import { eventRank, isSyncKey, newSyncKey, createCloud, planUpload } from '../src/store/cloud.js';
 import { shouldReplace, mergeEvent } from '../src/store/db.js';
 
 test('rank grows whenever the local store would replace an event', () => {
@@ -49,6 +49,13 @@ function fakeServer() {
       }
       return { status: 200, json: n };
     }
+    if (u.pathname === '/rest/v1/sync_events' && u.searchParams.get('select') === 'id,rank,deleted') {
+      const limit = Number(u.searchParams.get('limit'));
+      const gt = u.searchParams.get('id');
+      let list = [...rows.values()].sort((a, b) => a.id.localeCompare(b.id));
+      if (gt) list = list.filter((r) => r.id > gt.slice(3));
+      return { status: 200, json: list.slice(0, limit).map((r) => ({ id: r.id, rank: r.rank, deleted: r.deleted })) };
+    }
     if (u.pathname === '/rest/v1/sync_events') {
       const limit = Number(u.searchParams.get('limit'));
       const gte = u.searchParams.get('updated_at');
@@ -89,4 +96,21 @@ test('without a key nothing is sent', async () => {
   const cloud = createCloud({ request: srv.request, getKey: () => null, url: 'https://x.test', apiKey: 'pk' });
   await assert.rejects(cloud.push([{ id: 'a', ts: 1 }]), /off/);
   assert.equal(srv.calls.length, 0);
+});
+
+test('first upload sends only what the cloud lacks or holds a worse copy of', async () => {
+  const srv = fakeServer();
+  const cloud = createCloud({ request: srv.request, getKey: () => 'k'.repeat(32), url: 'https://x.test', apiKey: 'pk' });
+  const events = Array.from({ length: 2300 }, (_, i) => ({ id: `upgrade:${String(i).padStart(5, '0')}`, kind: 'upgrade', ts: i, status: 'won', userId: '1' }));
+  await cloud.push(events.slice(0, 2000));
+  srv.rows.get('upgrade:00005').deleted = true;
+  const ranks = await cloud.ranks();
+  assert.equal(ranks.size, 2000);
+  assert.equal(ranks.get('upgrade:00005'), Infinity);
+  // A local copy that improved (now live) must go up again; deleted rows never do.
+  const local = events.map((e, i) => (i === 7 ? { ...e, source: 'live' } : e));
+  const ids = planUpload(local, ranks);
+  assert.equal(ids.length, 301);
+  assert.equal(ids[0], 'upgrade:00007');
+  assert.ok(!ids.includes('upgrade:00005'));
 });

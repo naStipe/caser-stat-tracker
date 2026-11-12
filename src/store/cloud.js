@@ -26,6 +26,15 @@ export function eventRank(e) {
   return r;
 }
 
+/**
+ * Ids of the local events the cloud lacks or holds a lower-ranked copy of, oldest first.
+ * @param {any[]} events  local events
+ * @param {Map<string, number>} cloudRanks  id -> rank in the cloud (Infinity for deleted rows)
+ */
+export function planUpload(events, cloudRanks) {
+  return events.filter((e) => !(cloudRanks.get(e.id) >= eventRank(e))).map((e) => e.id);
+}
+
 const KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
 
 export function isSyncKey(k) {
@@ -108,6 +117,25 @@ export function createCloud({ request, getKey, url = CLOUD_URL, apiKey = CLOUD_K
         if (rows.length < PULL_PAGE) break;
       }
       return { events, deletedIds, cursor: last };
+    },
+
+    /**
+     * id -> rank of every row under this key (deleted rows as Infinity, since the cloud ignores
+     * pushes to them). Only ids and ranks are read, so this is far lighter than a pull.
+     */
+    async ranks(onProgress) {
+      const out = new Map();
+      let last = null;
+      for (;;) {
+        const after = last == null ? '' : `&id=gt.${encodeURIComponent(last)}`;
+        const rows = await call('GET', `/rest/v1/sync_events?select=id,rank,deleted&order=id.asc&limit=${PULL_PAGE}${after}`);
+        if (!Array.isArray(rows)) throw new Error('Cloud answered with no rows list');
+        for (const r of rows) out.set(r.id, r.deleted ? Infinity : Number(r.rank) || 0);
+        onProgress?.(out.size);
+        if (rows.length < PULL_PAGE) break;
+        last = rows[rows.length - 1].id;
+      }
+      return out;
     },
 
     async remove(ids) {

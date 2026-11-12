@@ -10,7 +10,7 @@ import { createPriceClient } from './prices/csfloat.js';
 import { Store, shouldReplace, mergeEvent } from './store/db.js';
 import { toJson, toCsv, fromJson } from './store/export.js';
 import { createSharedStore, gmStorage } from './store/shared.js';
-import { createCloud, isSyncKey, newSyncKey, eventRank } from './store/cloud.js';
+import { createCloud, isSyncKey, newSyncKey, eventRank, planUpload } from './store/cloud.js';
 import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
 import * as stats from './stats/index.js';
 import { checkForUpdate, compareVersions } from './update.js';
@@ -370,7 +370,9 @@ async function syncShared() {
 // ---- Cloud sync between browsers (see store/cloud.js) ----
 // The sync key lives in this browser's script storage, so both domains use the same one.
 // Per domain, IndexedDB meta keeps how far the cloud was read ("cloudCursor") and whether this
-// domain's own history was sent once ("cloudPushedKey").
+// domain's own history was sent once ("cloudPushedKey"). That first upload sends only what the cloud
+// lacks ("cloudPushPlan", worked out once) and remembers how far it got ("cloudPushDone"), so a page
+// reload in the middle continues instead of starting over.
 const CLOUD_PULL_EVERY_MS = 60 * 1000;
 const cloud = createCloud({ request: gmRequest, getKey: () => cloudKey() });
 let cloudStatus = { state: 'idle', lastPull: null, error: null, progress: null };
@@ -411,6 +413,37 @@ async function flushCloud() {
   }
 }
 
+const UPLOAD_BATCH = 500;
+
+async function firstUpload(key) {
+  let plan = await store.getMeta('cloudPushPlan');
+  if (!plan || plan.key !== key || !Array.isArray(plan.ids)) {
+    cloudStatus = { ...cloudStatus, progress: 'Comparing with the cloud' };
+    dashboard?.refresh();
+    const ranks = await cloud.ranks((n) => {
+      cloudStatus = { ...cloudStatus, progress: `Comparing with the cloud (${n})` };
+      refreshSoon();
+    });
+    plan = { key, ids: planUpload(await getEvents(), ranks) };
+    await store.setMeta('cloudPushPlan', plan);
+    await store.setMeta('cloudPushDone', 0);
+  }
+  let done = Number(await store.getMeta('cloudPushDone')) || 0;
+  // Events can change or go away while an upload waits for the next page load; send the stored copy.
+  const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+  while (done < plan.ids.length) {
+    const batch = plan.ids.slice(done, done + UPLOAD_BATCH).map((id) => byId.get(id)).filter(Boolean);
+    if (batch.length) await cloud.push(batch);
+    done = Math.min(done + UPLOAD_BATCH, plan.ids.length);
+    await store.setMeta('cloudPushDone', done);
+    cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${plan.ids.length} (one time)` };
+    refreshSoon();
+  }
+  await store.setMeta('cloudPushedKey', key);
+  await store.setMeta('cloudPushPlan', null);
+  await store.setMeta('cloudPushDone', null);
+}
+
 /** Pull what other browsers sent, then send what this domain has that the cloud may lack. */
 function cloudSync() {
   const key = cloudKey();
@@ -448,14 +481,8 @@ function cloudSync() {
       }
       if (added) await removeTwins();
 
-      // First sync of this domain under this key: send its whole history once.
-      if ((await store.getMeta('cloudPushedKey')) !== key) {
-        await cloud.push(await getEvents(), (done, total) => {
-          cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${total}` };
-          refreshSoon();
-        });
-        await store.setMeta('cloudPushedKey', key);
-      }
+      // First sync of this domain under this key: send what the cloud lacks, once.
+      if ((await store.getMeta('cloudPushedKey')) !== key) await firstUpload(key);
       await flushCloud();
 
       // Exchange "history read to the end" flags, now that the events behind them are here.
