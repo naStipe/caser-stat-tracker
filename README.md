@@ -76,6 +76,16 @@ tracker asks `/api/users/me` itself, once per login token.
 Site sync, its "read to the end" flags and the 15-minute auto-sync run per account. Export and "Clear all" cover
 every account. Events recorded before 0.9.0 without an account id count for the account with the most events.
 
+### Owner lock
+
+By default the tracker is in guest view: it shows only the signed-in account, exports only that account, and hides
+"Clear all" and cloud sync (the sync key opens every account). Enter the owner password in Data → Owner lock (or the
+"Unlock" button under the title) to see every account. It locks again on page reload or when another account signs
+in, unless "Stay unlocked while … is signed in" is ticked; "Lock now" undoes that for the signed-in account. The
+password is built in and stored only as a salted PBKDF2 hash (`OWNER_LOCK` in `src/store/lock.js`). The lock only
+hides data in the tracker's panels: the events are not encrypted, and anyone with the browser's developer tools can
+still read them.
+
 ## Develop
 
 ```bash

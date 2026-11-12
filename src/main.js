@@ -11,7 +11,8 @@ import { Store, shouldReplace, mergeEvent } from './store/db.js';
 import { toJson, toCsv, fromJson } from './store/export.js';
 import { createSharedStore, gmStorage } from './store/shared.js';
 import { createCloud, isSyncKey, newSyncKey, eventRank, planUpload } from './store/cloud.js';
-import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
+import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accountName, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
+import { OWNER_LOCK, checkPassword, isGuest } from './store/lock.js';
 import * as stats from './stats/index.js';
 import { checkForUpdate, compareVersions } from './update.js';
 import { mountDashboard, mountUpgradeOverlay, mountCasePanel, mountExchangePanel } from './ui/index.js';
@@ -134,8 +135,73 @@ function fixLegacyOwner() {
   if (pick) browserPrefs.set('acct:legacy', pick);
 }
 
+// ---- Owner lock (see store/lock.js) ----
+// A guest sees only the signed-in account. The owner password unlocks every account until the page
+// reloads or another account signs in. The owner can also trust an account: while it is signed in
+// on this browser, the tracker stays unlocked without asking.
+// Matches no account, so a guest with no signed-in account sees no events.
+const NO_ACCOUNT = '\u0000none';
+let unlocked = false;
+
+function lockRecord() {
+  return OWNER_LOCK;
+}
+
+function trustedAccounts() {
+  const v = browserPrefs.get('lock:trusted');
+  return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+}
+
+function guest() {
+  return isGuest(lockRecord(), unlocked, trustedAccounts(), ctx.userId);
+}
+
+function requireOwner() {
+  if (guest()) throw new Error('Locked. Enter the owner password in Data → Owner lock first.');
+}
+
+function lockState() {
+  const rec = lockRecord();
+  return {
+    set: !!rec,
+    guest: guest(),
+    trusted: ctx.userId != null && trustedAccounts().includes(ctx.userId),
+    accountName: ctx.userId != null ? accountName(ctx.userId, knownAccounts()) : null,
+  };
+}
+
+function lockChanged() {
+  if (guest()) accountSel = 'current';
+  dashboard?.refresh();
+  overlay?.refresh();
+}
+
+async function unlockWith(password, remember) {
+  const rec = lockRecord();
+  if (!rec) return true;
+  if (!(await checkPassword(rec, password))) {
+    // Slows down guessing from the panel.
+    await new Promise((r) => setTimeout(r, 800));
+    throw new Error('Wrong password.');
+  }
+  unlocked = true;
+  if (remember && ctx.userId != null && !trustedAccounts().includes(ctx.userId)) {
+    browserPrefs.set('lock:trusted', [...trustedAccounts(), ctx.userId]);
+  }
+  lockChanged();
+  return true;
+}
+
+/** Back to guest view now. The signed-in account stops being trusted, or it would unlock again at once. */
+function lockNow() {
+  unlocked = false;
+  if (ctx.userId != null) browserPrefs.set('lock:trusted', trustedAccounts().filter((x) => x !== ctx.userId));
+  lockChanged();
+}
+
 /** The account the panels show: an id, 'all', or null when no account is known yet. */
 function selectedAccount() {
+  if (guest()) return ctx.userId ?? NO_ACCOUNT;
   return resolveSelection(accountSel, ctx.userId, legacyOwner());
 }
 
@@ -148,14 +214,21 @@ async function getViewEvents() {
 
 function accountsState() {
   const all = memEvents ?? [];
+  if (guest()) {
+    const own = filterByAccount(all, selectedAccount(), legacyOwner());
+    const list = listAccounts(own, knownAccounts(), legacyOwner(), ctx.userId).filter((a) => a.current);
+    return { list, selected: selectedAccount(), total: own.length, guest: true };
+  }
   return {
     list: listAccounts(all, knownAccounts(), legacyOwner(), ctx.userId),
     selected: selectedAccount(),
     total: all.length,
+    guest: false,
   };
 }
 
 function selectAccount(sel) {
+  if (guest()) return;
   accountSel = sel;
   dashboard?.refresh();
   overlay?.refresh();
@@ -166,6 +239,8 @@ function onAccountSeen(previous) {
   rememberAccount();
   if (ctx.userId === previous) return;
   accountSel = 'current';
+  // Another login may be someone else: the password has to be entered again.
+  if (previous != null) unlocked = false;
   dashboard?.refresh();
   overlay?.refresh();
   // A newly signed-in account gets its own history sync when it is due.
@@ -776,7 +851,8 @@ function mount() {
     stats,
     currency: currencyLabel,
     onExport: async (format) => {
-      const events = await getEvents();
+      // A guest exports only the signed-in account.
+      const events = guest() ? await getViewEvents() : await getEvents();
       const stamp = new Date().toISOString().slice(0, 10);
       if (format === 'csv') download(`caser-tracker-${stamp}.csv`, toCsv(events), 'text/csv');
       else download(`caser-tracker-${stamp}.json`, toJson(events), 'application/json');
@@ -789,6 +865,7 @@ function mount() {
     },
     onImportHistory: () => sync(),
     onClear: async () => {
+      requireOwner();
       sharedQueue = [];
       await clearLocal();
       if (shared) await store.setMeta('sharedClearSeen', shared.clear());
@@ -804,15 +881,19 @@ function mount() {
       lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
       syncing: syncProgress,
       storagePersisted,
-      cloud: { key: cloudKey(), ...cloudStatus },
+      // The sync key opens every account's history, so a guest does not get it.
+      cloud: guest() ? null : { key: cloudKey(), ...cloudStatus },
       update: updateState(),
+      lock: lockState(),
     }),
     onCheckUpdate: () => checkUpdate(),
     onOpenUpdate: () => openUpdate(),
-    onCloudStart: () => setCloudKey(newSyncKey()),
-    onCloudJoin: (key) => setCloudKey(String(key ?? '').trim()),
-    onCloudStop: () => setCloudKey(null),
-    onCloudSync: () => cloudSync(),
+    onCloudStart: () => (requireOwner(), setCloudKey(newSyncKey())),
+    onCloudJoin: (key) => (requireOwner(), setCloudKey(String(key ?? '').trim())),
+    onCloudStop: () => (requireOwner(), setCloudKey(null)),
+    onCloudSync: () => (requireOwner(), cloudSync()),
+    onUnlock: (password, remember) => unlockWith(password, remember),
+    onLock: () => lockNow(),
     copyText: (text) => {
       // eslint-disable-next-line no-undef
       if (typeof GM_setClipboard !== 'function') return false;

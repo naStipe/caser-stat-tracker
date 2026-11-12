@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.9.3
+// @version      0.9.4
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -1488,6 +1488,38 @@
     return streams.includes(stream) && (i < 0 || /^[A-Za-z0-9_-]{1,64}$/.test(s2.slice(i + 1)));
   }
 
+  // src/store/lock.js
+  var OWNER_LOCK = Object.freeze({
+    v: 1,
+    salt: "pN1lTa3Gp2pKpFwxD3aHbg==",
+    hash: "OPT/QrrDLKAvx4SJY6e9Kn7633HFamB3FU+tj96T6Wg=",
+    iter: 2e5
+  });
+  function fromB64(s2) {
+    return Uint8Array.from(atob(s2), (c) => c.charCodeAt(0));
+  }
+  async function derive(password, salt, iterations) {
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256);
+    return new Uint8Array(bits);
+  }
+  function isLock(rec) {
+    return !!rec && rec.v === 1 && typeof rec.salt === "string" && typeof rec.hash === "string" && Number.isInteger(rec.iter) && rec.iter > 0;
+  }
+  async function checkPassword(rec, password) {
+    if (!isLock(rec) || typeof password !== "string") return false;
+    const want = fromB64(rec.hash);
+    const got = await derive(password, fromB64(rec.salt), rec.iter);
+    if (got.length !== want.length) return false;
+    let diff = 0;
+    for (let i = 0; i < got.length; i++) diff |= got[i] ^ want[i];
+    return diff === 0;
+  }
+  function isGuest(rec, unlocked2, trusted, userId) {
+    if (!isLock(rec) || unlocked2) return false;
+    return !(userId != null && Array.isArray(trusted) && trusted.includes(userId));
+  }
+
   // src/stats/index.js
   var stats_exports = {};
   __export(stats_exports, {
@@ -2899,6 +2931,7 @@ button { cursor: pointer; }
 .acct { margin-top: 8px; }
 .acct[hidden] { display: none; }
 .acct select { height: 28px; font-size: 12px; padding-left: 8px; max-width: 100%; }
+.acct-guest { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 
 .tabs {
   display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border);
@@ -4729,6 +4762,30 @@ option { background: var(--surface); color: var(--text); }
     }
     function renderAccounts() {
       const a = state.accounts;
+      if (a && a.guest) {
+        if (acctShown === "guest") return;
+        acctShown = "guest";
+        acctEl.hidden = false;
+        acctEl.replaceChildren(
+          h(
+            "div",
+            { class: "acct-guest" },
+            h("span", { text: "Guest view: signed-in account only" }),
+            h("button", {
+              type: "button",
+              class: "btn sm",
+              text: "Unlock",
+              on: {
+                click: () => {
+                  state.pendingFocus = "lock-pass";
+                  selectTab("data", false);
+                }
+              }
+            })
+          )
+        );
+        return;
+      }
       const list = a && Array.isArray(a.list) ? a.list : [];
       const show = list.length > 1;
       const value = a && a.selected != null ? String(a.selected) : "all";
@@ -5483,6 +5540,7 @@ option { background: var(--surface); color: var(--text); }
     async function run(name, fn, okText) {
       if (state.busy) return;
       state.busy = name;
+      state.lastRun = name;
       state.msg = { text: "Working\u2026", tone: "muted" };
       state.pendingFocus = name;
       render();
@@ -5571,6 +5629,7 @@ option { background: var(--surface); color: var(--text); }
           btn("cloud-copy", "Copy key", "primary", () => {
             const done = (text, tone) => {
               state.msg = { text, tone };
+              state.lastRun = null;
               state.pendingFocus = "cloud-copy";
               render();
             };
@@ -5606,6 +5665,71 @@ option { background: var(--surface); color: var(--text); }
       );
       return sec;
     }
+    function lockSection(lk, btn) {
+      const sec = h("section", null, h("h3", { text: "Owner lock" }));
+      const name = lk.accountName || "this account";
+      if (!lk.guest) {
+        sec.append(
+          h("p", {
+            class: "hint",
+            text: lk.trusted ? `Unlocked: every account is shown. It stays unlocked while ${name} is signed in on this browser.` : "Unlocked: every account is shown. It locks again when the page reloads or another account signs in."
+          }),
+          h("div", { class: "btns" }, btn("lock-now", "Lock now", "", () => run("lock-now", () => o.onLock(), () => "Locked. Only the signed-in account is shown.")))
+        );
+        return sec;
+      }
+      const unlock = () => {
+        const pass = state.lockDraft || "";
+        state.lockDraft = "";
+        run("lock-unlock", () => o.onUnlock(pass, !!state.lockRemember), () => {
+          state.lockRemember = false;
+          return "Unlocked. Every account is shown.";
+        });
+      };
+      sec.append(
+        h("p", {
+          class: "hint",
+          text: lk.accountName ? `Guest view: only ${name} is shown. Enter the owner password to see every account.` : "Guest view: sign in on the site to see your account. Enter the owner password to see every account."
+        }),
+        h(
+          "div",
+          { class: "btns key-row" },
+          h("input", {
+            type: "password",
+            class: "key-input",
+            placeholder: "Owner password",
+            autocomplete: "off",
+            "aria-label": "Owner password",
+            "data-fk": "lock-pass",
+            value: state.lockDraft || "",
+            on: {
+              input: (e) => state.lockDraft = e.target.value,
+              keydown: (e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  unlock();
+                }
+              }
+            }
+          }),
+          btn("lock-unlock", "Unlock", "primary", unlock, { busyLabel: "Checking\u2026" })
+        ),
+        lk.accountName ? h(
+          "label",
+          { class: "switch", style: { marginTop: "8px" } },
+          h("input", {
+            type: "checkbox",
+            checked: !!state.lockRemember,
+            "data-fk": "lock-remember",
+            on: { change: (e) => state.lockRemember = e.target.checked }
+          }),
+          h("span", { text: `Stay unlocked while ${name} is signed in on this browser` })
+        ) : null
+      );
+      return sec;
+    }
+    const lockRun = () => typeof state.lastRun === "string" && state.lastRun.startsWith("lock-");
+    const msgLine = () => h("p", { class: ["msg", state.msg && state.msg.tone], role: "status", "aria-live": "polite", text: state.msg ? state.msg.text : "" });
     function viewData() {
       const ev = state.events;
       const c = cur();
@@ -5645,6 +5769,13 @@ option { background: var(--surface); color: var(--text); }
         );
       }
       if (state.loadError) out.push(h("section", null, errorBox(state.loadError, "Could not read stored events")));
+      const lk = st.lock && st.lock.set && typeof o.onUnlock === "function" ? st.lock : null;
+      const isGuest2 = !!(lk && lk.guest);
+      if (lk) {
+        const sec = lockSection(lk, btn);
+        if (lockRun()) sec.append(msgLine());
+        out.push(sec);
+      }
       out.push(
         h(
           "section",
@@ -5756,6 +5887,7 @@ option { background: var(--surface); color: var(--text); }
         );
       }
       const exp = (format) => {
+        state.lastRun = null;
         try {
           if (typeof o.onExport !== "function") throw new Error("not available");
           o.onExport(format);
@@ -5777,9 +5909,13 @@ option { background: var(--surface); color: var(--text); }
             btn("export-json", "Export JSON", "", () => exp("json"), { disabled: !totalEvents }),
             btn("export-csv", "Export CSV", "", () => exp("csv"), { disabled: !totalEvents })
           ),
-          nAccounts > 1 ? h("p", { class: "hint", text: "Exports hold the events of every account. Each event keeps its account id." }) : null
+          isGuest2 ? h("p", { class: "hint", text: "Exports hold only the signed-in account." }) : nAccounts > 1 ? h("p", { class: "hint", text: "Exports hold the events of every account. Each event keeps its account id." }) : null
         )
       );
+      if (isGuest2) {
+        if (!lockRun()) out.push(msgLine());
+        return out;
+      }
       const clearSection = h(
         "section",
         null,
@@ -5822,7 +5958,7 @@ option { background: var(--surface); color: var(--text); }
         );
       }
       out.push(clearSection);
-      out.push(h("p", { class: ["msg", state.msg && state.msg.tone], role: "status", "aria-live": "polite", text: state.msg ? state.msg.text : "" }));
+      if (!lockRun()) out.push(msgLine());
       return out;
     }
     doRefresh();
@@ -6725,7 +6861,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.9.3" : "dev";
+  var VERSION = true ? "0.9.4" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
@@ -6806,7 +6942,56 @@ Click for the sales chart.` : r.name;
     const pick = memEvents ? pickLegacyOwner(memEvents) : null;
     if (pick) browserPrefs.set("acct:legacy", pick);
   }
+  var NO_ACCOUNT = "\0none";
+  var unlocked = false;
+  function lockRecord() {
+    return OWNER_LOCK;
+  }
+  function trustedAccounts() {
+    const v = browserPrefs.get("lock:trusted");
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  }
+  function guest() {
+    return isGuest(lockRecord(), unlocked, trustedAccounts(), ctx.userId);
+  }
+  function requireOwner() {
+    if (guest()) throw new Error("Locked. Enter the owner password in Data \u2192 Owner lock first.");
+  }
+  function lockState() {
+    const rec = lockRecord();
+    return {
+      set: !!rec,
+      guest: guest(),
+      trusted: ctx.userId != null && trustedAccounts().includes(ctx.userId),
+      accountName: ctx.userId != null ? accountName(ctx.userId, knownAccounts()) : null
+    };
+  }
+  function lockChanged() {
+    if (guest()) accountSel = "current";
+    dashboard?.refresh();
+    overlay?.refresh();
+  }
+  async function unlockWith(password, remember) {
+    const rec = lockRecord();
+    if (!rec) return true;
+    if (!await checkPassword(rec, password)) {
+      await new Promise((r) => setTimeout(r, 800));
+      throw new Error("Wrong password.");
+    }
+    unlocked = true;
+    if (remember && ctx.userId != null && !trustedAccounts().includes(ctx.userId)) {
+      browserPrefs.set("lock:trusted", [...trustedAccounts(), ctx.userId]);
+    }
+    lockChanged();
+    return true;
+  }
+  function lockNow() {
+    unlocked = false;
+    if (ctx.userId != null) browserPrefs.set("lock:trusted", trustedAccounts().filter((x) => x !== ctx.userId));
+    lockChanged();
+  }
   function selectedAccount() {
+    if (guest()) return ctx.userId ?? NO_ACCOUNT;
     return resolveSelection(accountSel, ctx.userId, legacyOwner());
   }
   async function getViewEvents() {
@@ -6816,13 +7001,20 @@ Click for the sales chart.` : r.name;
   }
   function accountsState() {
     const all = memEvents ?? [];
+    if (guest()) {
+      const own = filterByAccount(all, selectedAccount(), legacyOwner());
+      const list = listAccounts(own, knownAccounts(), legacyOwner(), ctx.userId).filter((a) => a.current);
+      return { list, selected: selectedAccount(), total: own.length, guest: true };
+    }
     return {
       list: listAccounts(all, knownAccounts(), legacyOwner(), ctx.userId),
       selected: selectedAccount(),
-      total: all.length
+      total: all.length,
+      guest: false
     };
   }
   function selectAccount(sel) {
+    if (guest()) return;
     accountSel = sel;
     dashboard?.refresh();
     overlay?.refresh();
@@ -6831,6 +7023,7 @@ Click for the sales chart.` : r.name;
     rememberAccount();
     if (ctx.userId === previous) return;
     accountSel = "current";
+    if (previous != null) unlocked = false;
     dashboard?.refresh();
     overlay?.refresh();
     if (mounted && previous != null) setTimeout(maybeAutoSync, 3e3);
@@ -7325,7 +7518,7 @@ Click for the sales chart.` : r.name;
       stats: stats_exports,
       currency: currencyLabel,
       onExport: async (format) => {
-        const events = await getEvents();
+        const events = guest() ? await getViewEvents() : await getEvents();
         const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
         if (format === "csv") download(`caser-tracker-${stamp}.csv`, toCsv(events), "text/csv");
         else download(`caser-tracker-${stamp}.json`, toJson(events), "application/json");
@@ -7338,6 +7531,7 @@ Click for the sales chart.` : r.name;
       },
       onImportHistory: () => sync(),
       onClear: async () => {
+        requireOwner();
         sharedQueue = [];
         await clearLocal();
         if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
@@ -7353,15 +7547,19 @@ Click for the sales chart.` : r.name;
         lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
         syncing: syncProgress,
         storagePersisted,
-        cloud: { key: cloudKey(), ...cloudStatus },
-        update: updateState()
+        // The sync key opens every account's history, so a guest does not get it.
+        cloud: guest() ? null : { key: cloudKey(), ...cloudStatus },
+        update: updateState(),
+        lock: lockState()
       }),
       onCheckUpdate: () => checkUpdate(),
       onOpenUpdate: () => openUpdate(),
-      onCloudStart: () => setCloudKey(newSyncKey()),
-      onCloudJoin: (key) => setCloudKey(String(key ?? "").trim()),
-      onCloudStop: () => setCloudKey(null),
-      onCloudSync: () => cloudSync(),
+      onCloudStart: () => (requireOwner(), setCloudKey(newSyncKey())),
+      onCloudJoin: (key) => (requireOwner(), setCloudKey(String(key ?? "").trim())),
+      onCloudStop: () => (requireOwner(), setCloudKey(null)),
+      onCloudSync: () => (requireOwner(), cloudSync()),
+      onUnlock: (password, remember) => unlockWith(password, remember),
+      onLock: () => lockNow(),
       copyText: (text) => {
         if (typeof GM_setClipboard !== "function") return false;
         GM_setClipboard(text, "text");

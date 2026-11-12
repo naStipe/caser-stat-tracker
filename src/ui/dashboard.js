@@ -437,6 +437,31 @@ export function mountDashboard(opts = {}) {
   // Rebuilt only when the choices change, so an open dropdown keeps its focus across refreshes.
   function renderAccounts() {
     const a = state.accounts;
+    // Guest view: only the signed-in account, and a way to the owner password.
+    if (a && a.guest) {
+      if (acctShown === 'guest') return;
+      acctShown = 'guest';
+      acctEl.hidden = false;
+      acctEl.replaceChildren(
+        h(
+          'div',
+          { class: 'acct-guest' },
+          h('span', { text: 'Guest view: signed-in account only' }),
+          h('button', {
+            type: 'button',
+            class: 'btn sm',
+            text: 'Unlock',
+            on: {
+              click: () => {
+                state.pendingFocus = 'lock-pass';
+                selectTab('data', false);
+              },
+            },
+          }),
+        ),
+      );
+      return;
+    }
     const list = a && Array.isArray(a.list) ? a.list : [];
     const show = list.length > 1;
     const value = a && a.selected != null ? String(a.selected) : 'all';
@@ -1256,6 +1281,7 @@ export function mountDashboard(opts = {}) {
   async function run(name, fn, okText) {
     if (state.busy) return;
     state.busy = name;
+    state.lastRun = name;
     state.msg = { text: 'Working…', tone: 'muted' };
     state.pendingFocus = name;
     render();
@@ -1351,6 +1377,7 @@ export function mountDashboard(opts = {}) {
         btn('cloud-copy', 'Copy key', 'primary', () => {
           const done = (text, tone) => {
             state.msg = { text, tone };
+            state.lastRun = null;
             state.pendingFocus = 'cloud-copy';
             render();
           };
@@ -1387,6 +1414,81 @@ export function mountDashboard(opts = {}) {
     );
     return sec;
   }
+
+  // Owner lock: a guest sees only the signed-in account until the owner password is entered.
+  function lockSection(lk, btn) {
+    const sec = h('section', null, h('h3', { text: 'Owner lock' }));
+    const name = lk.accountName || 'this account';
+    if (!lk.guest) {
+      sec.append(
+        h('p', {
+          class: 'hint',
+          text: lk.trusted
+            ? `Unlocked: every account is shown. It stays unlocked while ${name} is signed in on this browser.`
+            : 'Unlocked: every account is shown. It locks again when the page reloads or another account signs in.',
+        }),
+        h('div', { class: 'btns' }, btn('lock-now', 'Lock now', '', () => run('lock-now', () => o.onLock(), () => 'Locked. Only the signed-in account is shown.'))),
+      );
+      return sec;
+    }
+    const unlock = () => {
+      const pass = state.lockDraft || '';
+      state.lockDraft = '';
+      run('lock-unlock', () => o.onUnlock(pass, !!state.lockRemember), () => {
+        state.lockRemember = false;
+        return 'Unlocked. Every account is shown.';
+      });
+    };
+    sec.append(
+      h('p', {
+        class: 'hint',
+        text: lk.accountName
+          ? `Guest view: only ${name} is shown. Enter the owner password to see every account.`
+          : 'Guest view: sign in on the site to see your account. Enter the owner password to see every account.',
+      }),
+      h(
+        'div',
+        { class: 'btns key-row' },
+        h('input', {
+          type: 'password',
+          class: 'key-input',
+          placeholder: 'Owner password',
+          autocomplete: 'off',
+          'aria-label': 'Owner password',
+          'data-fk': 'lock-pass',
+          value: state.lockDraft || '',
+          on: {
+            input: (e) => (state.lockDraft = e.target.value),
+            keydown: (e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                unlock();
+              }
+            },
+          },
+        }),
+        btn('lock-unlock', 'Unlock', 'primary', unlock, { busyLabel: 'Checking…' }),
+      ),
+      lk.accountName
+        ? h(
+            'label',
+            { class: 'switch', style: { marginTop: '8px' } },
+            h('input', {
+              type: 'checkbox',
+              checked: !!state.lockRemember,
+              'data-fk': 'lock-remember',
+              on: { change: (e) => (state.lockRemember = e.target.checked) },
+            }),
+            h('span', { text: `Stay unlocked while ${name} is signed in on this browser` }),
+          )
+        : null,
+    );
+    return sec;
+  }
+
+  // Result line of the last Data action. Lock actions show it under the lock, the rest at the bottom.
+  const lockRun = () => typeof state.lastRun === 'string' && state.lastRun.startsWith('lock-');
+  const msgLine = () => h('p', { class: ['msg', state.msg && state.msg.tone], role: 'status', 'aria-live': 'polite', text: state.msg ? state.msg.text : '' });
 
   function viewData() {
     const ev = state.events;
@@ -1431,6 +1533,13 @@ export function mountDashboard(opts = {}) {
       );
     }
     if (state.loadError) out.push(h('section', null, errorBox(state.loadError, 'Could not read stored events')));
+    const lk = st.lock && st.lock.set && typeof o.onUnlock === 'function' ? st.lock : null;
+    const isGuest = !!(lk && lk.guest);
+    if (lk) {
+      const sec = lockSection(lk, btn);
+      if (lockRun()) sec.append(msgLine());
+      out.push(sec);
+    }
 
     out.push(
       h(
@@ -1550,6 +1659,7 @@ export function mountDashboard(opts = {}) {
     }
 
     const exp = (format) => {
+      state.lastRun = null;
       try {
         if (typeof o.onExport !== 'function') throw new Error('not available');
         o.onExport(format);
@@ -1571,9 +1681,18 @@ export function mountDashboard(opts = {}) {
           btn('export-json', 'Export JSON', '', () => exp('json'), { disabled: !totalEvents }),
           btn('export-csv', 'Export CSV', '', () => exp('csv'), { disabled: !totalEvents }),
         ),
-        nAccounts > 1 ? h('p', { class: 'hint', text: 'Exports hold the events of every account. Each event keeps its account id.' }) : null,
+        isGuest
+          ? h('p', { class: 'hint', text: 'Exports hold only the signed-in account.' })
+          : nAccounts > 1
+            ? h('p', { class: 'hint', text: 'Exports hold the events of every account. Each event keeps its account id.' })
+            : null,
       ),
     );
+    // Deleting is for the owner only.
+    if (isGuest) {
+      if (!lockRun()) out.push(msgLine());
+      return out;
+    }
 
     const clearSection = h(
       'section',
@@ -1617,7 +1736,7 @@ export function mountDashboard(opts = {}) {
       );
     }
     out.push(clearSection);
-    out.push(h('p', { class: ['msg', state.msg && state.msg.tone], role: 'status', 'aria-live': 'polite', text: state.msg ? state.msg.text : '' }));
+    if (!lockRun()) out.push(msgLine());
     return out;
   }
 

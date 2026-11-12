@@ -94,6 +94,7 @@ export const DASHBOARD_CSS = `
 .acct { margin-top: 8px; }
 .acct[hidden] { display: none; }
 .acct select { height: 28px; font-size: 12px; padding-left: 8px; max-width: 100%; }
+.acct-guest { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 
 .tabs {
   display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border);
