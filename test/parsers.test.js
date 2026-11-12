@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context, parseExchange, upgradeFromRecord, historyRows, upgradeHistoryRows, caseFromInventoryRecord, depositFromPayment, withdrawalFromInventoryRecord, dropLiveTwins } from '../src/capture/parsers.js';
+import { Context, parseExchange, upgradeFromRecord, historyRows, upgradeHistoryRows, caseFromInventoryRecord, depositFromPayment, withdrawalFromInventoryRecord, dropLiveTwins, withdrawalTwinIds, caseTwinIds } from '../src/capture/parsers.js';
 import { apiPath } from '../src/capture/hook.js';
+import { importHistory, _setPause } from '../src/capture/history.js';
 import { shouldReplace, mergeEvent } from '../src/store/db.js';
 import { toCsv, fromJson, toJson } from '../src/store/export.js';
 import { shownChance, numOrNull } from '../src/schema.js';
@@ -183,6 +184,55 @@ test('live withdrawal request is priced from the learned inventory', () => {
   assert.equal(evs[0].exactTime, true);
 });
 
+const MIN = 60_000;
+const wd = (id, source, ts, name = 'AWP | Asiimov (Field-Tested)', value = 100) =>
+  ({ id: `withdrawal:${id}`, kind: 'withdrawal', ts, source, item: { id: String(id), name, price: value }, value, exactTime: source === 'live' });
+
+test('an imported withdrawal that repeats a live one is paired by item name', () => {
+  const t = Date.parse('2026-11-06T19:55:49Z');
+  const events = [
+    wd(709221312, 'live', t),
+    wd(1422913316, 'import', t - 8 * MIN), // arrived 8 min before the withdrawal: same withdrawal
+    wd(1422900000, 'import', t - 20 * MIN, 'Other skin'), // different item: kept
+    wd(1300000000, 'import', t - 30 * 24 * 60 * MIN), // same skin a month earlier, no live capture: kept
+  ];
+  assert.deepEqual([...withdrawalTwinIds(events)], ['withdrawal:1422913316']);
+});
+
+test('each live withdrawal removes at most one imported copy, the closest earlier one', () => {
+  const t = 1_800_000_000_000;
+  const events = [
+    wd(1, 'live', t),
+    wd(2, 'live', t + 60 * MIN),
+    wd(10, 'import', t - 5 * MIN),
+    wd(11, 'import', t + 55 * MIN),
+    wd(12, 'import', t - 3 * 60 * MIN), // a third copy with no live capture
+    wd(13, 'import', t + 3 * 60 * MIN), // arrived after both live withdrawals: not theirs
+  ];
+  assert.deepEqual([...withdrawalTwinIds(events)].sort(), ['withdrawal:10', 'withdrawal:11']);
+  assert.equal(withdrawalTwinIds(events.filter((e) => e.source === 'import')).size, 0);
+});
+
+test('history import skips withdrawals already captured live', async () => {
+  _setPause(0);
+  const t = Date.parse('2026-11-08T00:15:54Z');
+  const live = wd(723212423, 'live', t, 'AK-47 | Redline (Field-Tested)', 274.74);
+  const rows = [
+    { id: '1451160316', status: 'withdrawn', price: '274.740', item: { marketName: 'AK-47 | Redline (Field-Tested)' }, createdAt: '2026-11-08T00:13:41+00:00' },
+    { id: '1277634214', status: 'withdrawn', price: '3537.300', item: { marketName: 'AWP | Wildfire (Battle-Scarred)' }, createdAt: '2026-11-01T18:42:35+00:00' },
+  ];
+  const bodies = { '/api/users/me': { id: 'u1' }, '/api/users/u1/inventory/history': { items: rows, hasMore: false } };
+  const fetch = async (url) => {
+    const body = bodies[url.split('?')[0]] ?? { items: [], hasMore: false };
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => body };
+  };
+  const saved = [];
+  const ctx = new Context();
+  ctx.cases.set('x', { id: 'x', price: 1 }); // skip the case-list requests
+  await importHistory({ fetch, ctx, site: 'caser.gg', getAuth: () => 'Bearer t', getStored: async () => [live], save: async (evs) => (saved.push(...evs), evs.length) });
+  assert.deepEqual(saved.filter((e) => e.kind === 'withdrawal').map((e) => e.id), ['withdrawal:1277634214']);
+});
+
 test('inventory balance endpoint is inventory value, not cash balance', () => {
   const ctx = new Context();
   ctx.learn(ex({ path: '/users/me', resBody: { id: '1', balance: 19.06 } }));
@@ -238,6 +288,14 @@ test('export round trip and csv escaping', () => {
   const evs = [{ id: 'case:1', kind: 'case', ts: 1, site: 'caser.gg', source: 'live', casePrice: 10, caseName: 'A, "B"', item: { name: 'X', price: 5 }, free: false, gameMode: 'normal', balanceBefore: null, balanceAfter: null }];
   assert.deepEqual(fromJson(toJson(evs)), evs);
   assert.match(toCsv(evs), /"A, ""B"""/);
+  const w = { id: 'withdrawal:1', kind: 'withdrawal', ts: 1, site: 'caser.gg', source: 'live', item: { name: 'AWP', price: 50 }, value: 50 };
+  const d = { id: 'deposit:1', kind: 'deposit', ts: 2, site: 'caser.gg', source: 'import', amount: 300, status: 'completed' };
+  const [head, wRow, dRow] = toCsv([w, d]).split('\n').map((l) => l.split(','));
+  const col = (row, name) => row[head.indexOf(name)];
+  assert.equal(col(wRow, 'amount'), '50');
+  assert.equal(col(wRow, 'item'), 'AWP');
+  assert.equal(col(dRow, 'amount'), '300');
+  assert.equal(col(dRow, 'status'), 'completed');
   assert.throws(() => fromJson('nope'), /valid JSON/);
 });
 
@@ -247,4 +305,21 @@ test('selection price parsing handles site formats', async () => {
   assert.equal(parsePrice('1 234,56'), 1234.56);
   assert.equal(parsePrice('1\u00a0234,5'), 1234.5);
   assert.equal(parsePrice('78.50'), 78.5);
+});
+
+test('imported case drops stored next to the same live drops are found afterwards', () => {
+  const t = 1_800_000_000_000;
+  const live = (id, ts, name) => ({ id, kind: 'case', ts, source: 'live', caseSlug: 'oasis', item: { name, price: 1 }, matchKey: `oasis|${name}` });
+  const imp = (id, ts, name, slug = 'oasis') => ({ id, kind: 'case', ts, source: 'import', caseSlug: slug, item: { name, price: 1 } });
+  const events = [
+    live('case:live:b1:0', t, 'AK-47 | Redline'),
+    live('case:live:b1:1', t, 'AK-47 | Redline'),
+    imp('case:1', t + 2000, 'AK-47 | Redline'),
+    imp('case:2', t + 2000, 'AK-47 | Redline'),
+    imp('case:3', t + 2000, 'AK-47 | Redline'), // a third drop with no live capture
+    imp('case:4', t + 2000, 'AK-47 | Redline', 'other-case'),
+    imp('case:5', t + 10 * 60_000, 'AK-47 | Redline'), // ten minutes later: another opening
+  ];
+  assert.deepEqual([...caseTwinIds(events)].sort(), ['case:1', 'case:2']);
+  assert.equal(caseTwinIds(events.filter((e) => e.source === 'import')).size, 0);
 });

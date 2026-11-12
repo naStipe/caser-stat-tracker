@@ -1,0 +1,87 @@
+<!doctype html>
+<!-- Smoke test for the exchange panel: fakes the site API, the replacement modal and CSFloat (GM_xmlhttpRequest). -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Exchange panel smoke test</title>
+<style>
+  body { margin: 0; background: #0b0d10; color: #c9cdd3; font: 14px/1.5 system-ui, sans-serif; padding: 16px; }
+  .modal { position: fixed; left: 50%; top: 40px; transform: translateX(-50%); width: 520px; background: #272727; padding: 16px; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .cards div { background: #333; padding: 8px; font-size: 12px; cursor: pointer; }
+  .cards div.sel { outline: 2px solid #7ea6f6; }
+</style>
+<script>
+  const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'content-type': 'application/json', date: new Date().toUTCString() } });
+  const cands = [
+    ['StatTrak™ XM1014 | Incinegator (Minimal Wear)', 8281.34], ['StatTrak™ M4A4 | Buzz Kill (Field-Tested)', 8279.69],
+    ['★ Gut Knife | Lore (Well-Worn)', 8273.89], ['★ Nomad Knife | Forest DDPAT (Minimal Wear)', 8266.45],
+    ['Sticker | NiKo (Foil) | Boston 2018', 8260.65], ['★ Sport Gloves | Crème Pinstripe (Field-Tested)', 8258.17],
+    ['MAC-10 | Stalker (Factory New)', 8258.17], ['★ StatTrak™ Bowie Knife | Freehand (Minimal Wear)', 8257.34],
+  ];
+  const routes = {
+    'GET /api/items/inventory': () => json({ items: [{ id: 900, price: '8281.34', item: { id: 1, marketName: 'StatTrak™ M4A4 | Buzz Kill (Battle-Scarred)', price: '8281.34' } }] }),
+    'GET /api/inventory/items/900/replacements': () => json({ success: true, data: cands.map(([n, p], i) => ({ id: 'c' + i, item: { id: String(100 + i), marketName: n, price: String(p) }, price: String(p), refund: (8281.34 - p).toFixed(2) })) }),
+  };
+  window.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
+    const r = routes[`${(init.method || 'GET').toUpperCase()} ${url.pathname}`];
+    return r ? r() : new Response('not found', { status: 404 });
+  };
+  // Fake CSFloat: deterministic prices and sales counts per name.
+  window.GM_xmlhttpRequest = (o) => {
+    const name = decodeURIComponent(o.url.split('/history/')[1].split('/sales')[0]);
+    let h = 7; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    const base = 6500 + (h % 3000), n = h % 25;
+    // Sales spread over ~60 days with float, some noise, a drift and one outlier.
+    const rows = Array.from({ length: n }, (_, i) => {
+      const noise = ((h >>> (i % 24)) % 400) - 200;
+      const drift = i * 6;
+      return {
+        created_at: new Date(Date.now() - i * 2.4 * 86400000 - (h % 9) * 3600000).toISOString(),
+        price: i === 4 ? base * 2 : base - 100 + noise - drift,
+        state: 'sold',
+        item: { float_value: 0.07 + ((h >>> i) % 800) / 10000 },
+        reference: { base_price: base, quantity: (h >>> 3) % 40 },
+      };
+    });
+    // A liquid item with two price groups: 40 sales in the last day, about 60% near $100 and 40% near $135.
+    if (name.includes('Gut Knife')) {
+      rows.length = 0;
+      for (let i = 0; i < 40; i++) {
+        rows.push({
+          created_at: new Date(Date.now() - i * 0.6 * 3600000).toISOString(),
+          price: i % 5 < 3 ? 9800 + (i % 7) * 100 : 12000 + (i % 9) * 300,
+          state: 'sold',
+          item: { float_value: 0.15 + (i % 11) / 100 },
+          reference: { base_price: 10123, quantity: 55 },
+        });
+      }
+    }
+    setTimeout(() => (name.includes('Stalker') ? o.onload({ status: 500, responseText: '' }) : o.onload({ status: 200, responseText: JSON.stringify(rows) })), 30);
+  };
+</script>
+<script src="../dist/caser-tracker.user.js"></script>
+</head>
+<body>
+<p id="out">running…</p>
+<script type="module">
+  localStorage.removeItem('cst.csfloat.v3');
+  await fetch('/api/items/inventory');
+  const res = await (await fetch('/api/inventory/items/900/replacements?limit=50&offset=0')).json();
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.dataset.testid = 'replace-item-modal';
+  const grid = document.createElement('div');
+  grid.className = 'cards';
+  for (const c of res.data) {
+    const d = document.createElement('div');
+    d.dataset.testid = `replace-item-modal-candidate-${c.id}`;
+    d.textContent = `${c.item.marketName} · ${c.price}`;
+    d.onclick = () => { grid.querySelectorAll('.sel').forEach((x) => x.classList.remove('sel')); d.classList.add('sel'); window.__selected = c.id; };
+    grid.append(d);
+  }
+  modal.append(grid);
+  document.body.append(modal);
+  document.getElementById('out').textContent = 'modal open';
+</script>
+</body>
+</html>

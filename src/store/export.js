@@ -23,11 +23,14 @@ const CSV_COLUMNS = [
   ['target', (e) => (e.kind === 'upgrade' ? e.target?.name ?? '' : '')],
   ['target_price', (e) => (e.kind === 'upgrade' ? e.target?.price ?? '' : '')],
   ['chance_shown', (e) => (e.kind === 'upgrade' ? e.chanceShown : '')],
-  ['status', (e) => (e.kind === 'upgrade' ? e.status : '')],
+  ['status', (e) => (e.kind === 'upgrade' || e.kind === 'deposit' ? e.status : '')],
   ['mystery', (e) => (e.kind === 'upgrade' ? e.mystery : '')],
   ['game_mode', (e) => e.gameMode],
   ['balance_before', (e) => e.balanceBefore ?? ''],
   ['balance_after', (e) => e.balanceAfter ?? ''],
+  // Money flow: deposit amount or withdrawn item value, and the withdrawn item.
+  ['amount', (e) => (e.kind === 'deposit' ? e.amount : e.kind === 'withdrawal' ? e.value : '')],
+  ['item', (e) => (e.kind === 'withdrawal' ? e.item?.name ?? '' : '')],
 ];
 
 export function toCsv(events) {
@@ -50,7 +53,7 @@ export function fromJson(text) {
   }
   const events = Array.isArray(data) ? data : data?.events;
   if (!Array.isArray(events)) throw new Error('File has no events list.');
-  const valid = events.filter((e) => e && typeof e.id === 'string' && (e.kind === 'case' || e.kind === 'upgrade') && Number.isFinite(e.ts));
+  const valid = events.filter((e) => e && typeof e.id === 'string' && ['case', 'upgrade', 'withdrawal', 'deposit'].includes(e.kind) && Number.isFinite(e.ts));
   if (!valid.length && events.length) throw new Error('No valid events in file.');
   return valid;
 }

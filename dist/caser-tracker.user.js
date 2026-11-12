@@ -1,15 +1,27 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.4.4
-// @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser.
+// @version      0.9.0
+// @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
 // @match        https://caser.one/*
 // @match        https://www.caser.one/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_addValueChangeListener
+// @grant        GM_setClipboard
+// @connect      csfloat.com
+// @connect      hafnhxumrqyaljmciqqq.supabase.co
 // @noframes
+// @homepageURL  https://github.com/naStipe/caser-stat-tracker
+// @updateURL    https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js
 // ==/UserScript==
 
 (() => {
@@ -156,6 +168,7 @@
       this.cases = /* @__PURE__ */ new Map();
       this.items = /* @__PURE__ */ new Map();
       this.userId = null;
+      this.userName = null;
       this.balance = null;
       this.inventoryValue = null;
     }
@@ -170,7 +183,16 @@
         this.addCase(obj(body.case) ?? body);
       } else if (p === "/users/me") {
         const u = obj(body.user) ?? body;
-        if (u.id != null) this.userId = String(u.id);
+        if (u.id != null) {
+          const id = String(u.id);
+          if (this.userId != null && this.userId !== id) {
+            this.items.clear();
+            this.inventoryValue = null;
+          }
+          this.userId = id;
+          const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.steamName ?? u.personaName;
+          this.userName = typeof name === "string" && name.trim() ? name.trim().slice(0, 64) : null;
+        }
         this.setBalance(u.balance);
       } else if (p === "/items/inventory/balance") {
         this.inventoryValue = numOrNull(body.amount);
@@ -245,6 +267,37 @@
     item.id = String(r.id);
     return { id: `withdrawal:${r.id}`, kind: "withdrawal", ts, site: site2, userId: ctx2.userId, source: "import", balanceBefore: null, balanceAfter: null, item, value: item.price, exactTime: false };
   }
+  var WITHDRAWAL_TWIN_WINDOW_MS = 7 * 24 * 60 * 60 * 1e3;
+  var WITHDRAWAL_TWIN_SLACK_MS = 5 * 60 * 1e3;
+  function withdrawalTwinIds(events) {
+    const imported = /* @__PURE__ */ new Map();
+    const live = [];
+    for (const e of events) {
+      if (!e || e.kind !== "withdrawal") continue;
+      if (e.source === "live") live.push(e);
+      else if (e.source === "import") {
+        const name = e.item?.name;
+        if (!imported.has(name)) imported.set(name, []);
+        imported.get(name).push(e);
+      }
+    }
+    for (const list of imported.values()) list.sort((a, b) => a.ts - b.ts);
+    live.sort((a, b) => a.ts - b.ts);
+    const twins = /* @__PURE__ */ new Set();
+    for (const l of live) {
+      const list = imported.get(l.item?.name);
+      if (!list) continue;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const imp = list[i];
+        if (imp.ts > l.ts + WITHDRAWAL_TWIN_SLACK_MS) continue;
+        if (l.ts - imp.ts > WITHDRAWAL_TWIN_WINDOW_MS) break;
+        twins.add(imp.id);
+        list.splice(i, 1);
+        break;
+      }
+    }
+    return twins;
+  }
   function parseWithdrawalRequest(ex, ctx2, site2) {
     if (ex.status >= 400) return [];
     const req2 = obj(ex.reqBody) ?? {};
@@ -275,6 +328,12 @@
       times.splice(i, 1);
       return false;
     });
+  }
+  function caseTwinIds(events) {
+    const imported = events.filter((e) => e && e.kind === "case" && e.source === "import" && e.item);
+    if (!imported.length) return /* @__PURE__ */ new Set();
+    const kept = new Set(dropLiveTwins(imported, events));
+    return new Set(imported.filter((e) => !kept.has(e)).map((e) => e.id));
   }
   function parseCaseOpen(ex, ctx2, site2) {
     if (ex.status >= 400) return [];
@@ -494,6 +553,7 @@
     const triedSlugs = /* @__PURE__ */ new Set();
     let cases = 0;
     let withdrawn = 0;
+    const knownWithdrawals = new Map(stored.filter((e) => e.kind === "withdrawal").map((e) => [e.id, e]));
     let skipped = 0;
     await paginate(get, `/api/users/${uid}/inventory/history`, async (body, page) => {
       onProgress?.(`Case drops: page ${page}`);
@@ -512,7 +572,10 @@
       const parsed = drops.map((r) => caseFromInventoryRecord(r, ctx2, site2)).filter(Boolean);
       skipped += drops.length - parsed.length;
       const events = dropLiveTwins(parsed, stored);
-      const withdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx2, site2)).filter(Boolean);
+      const parsedWithdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx2, site2)).filter((w) => w && !knownWithdrawals.has(w.id));
+      const twins = withdrawalTwinIds([...knownWithdrawals.values(), ...parsedWithdrawals]);
+      const withdrawals = parsedWithdrawals.filter((w) => !twins.has(w.id));
+      for (const w of withdrawals) knownWithdrawals.set(w.id, w);
       const added = await save(events);
       cases += added;
       withdrawn += await save(withdrawals);
@@ -566,6 +629,7 @@
   }
   async function fetchMe(get, ctx2) {
     const body = await get("/api/users/me");
+    ctx2.learn({ method: "GET", path: "/users/me", status: 200, resBody: body });
     const u = body?.user ?? body?.data ?? body;
     if (u?.id != null) ctx2.userId = String(u.id);
     return ctx2.userId;
@@ -652,6 +716,274 @@
     return { stake, targetPrice, chanceShown };
   }
 
+  // src/capture/caseinfo.js
+  var obj2 = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  var arr2 = (v) => Array.isArray(v) ? v : [];
+  var unwrap2 = (body) => obj2(body)?.data && typeof body.data === "object" ? body.data : body;
+  function caseSlugFromPath(pathname) {
+    const m = String(pathname || "").match(/^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?cases\/([^/?#]+)\/?$/i);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function caseDetailPath(path) {
+    const m = String(path || "").split("?")[0].match(/^\/game\/(custom-)?cases\/([^/]+)$/);
+    return m ? { slug: decodeURIComponent(m[2]), custom: !!m[1] } : null;
+  }
+  function toCaseItem(raw) {
+    const o = obj2(raw) ?? {};
+    const it = obj2(o.item) ?? o;
+    return {
+      id: it.id != null ? String(it.id) : null,
+      name: String(it.marketName ?? it.market_name ?? it.name ?? "Unknown item"),
+      price: num(it.price),
+      image: typeof it.image === "string" ? it.image : null,
+      rarity: it.rarity != null ? String(it.rarity) : null,
+      chance: numOrNull(o.chancePercent ?? o.chance ?? it.chance ?? null)
+    };
+  }
+  function caseInfoFromResponse(body, hint = {}) {
+    const d = obj2(unwrap2(body));
+    if (!d) return null;
+    const c = obj2(d.case) ?? d;
+    const items = arr2(d.items ?? c.items).map(toCaseItem).filter((i) => i.price > 0 || i.chance !== null);
+    if (!items.length) return null;
+    const slug = String(c.slug ?? hint.slug ?? "");
+    if (!slug) return null;
+    return {
+      slug,
+      title: String(c.title ?? c.name ?? slug),
+      price: num(c.price),
+      custom: !!hint.custom || !obj2(d.case),
+      items
+    };
+  }
+  async function fetchCaseInfo(fetchFn, slug) {
+    const enc = encodeURIComponent(slug);
+    for (const [path, custom] of [[`/api/game/cases/${enc}`, false], [`/api/game/custom-cases/${enc}`, true]]) {
+      const res = await fetchFn(path, { credentials: "include", headers: { accept: "application/json" } });
+      if (res.status === 404) continue;
+      if (!res.ok) throw new Error(`case info: HTTP ${res.status}`);
+      const info = caseInfoFromResponse(await res.json(), { slug, custom });
+      if (info) return info;
+    }
+    return null;
+  }
+
+  // src/capture/replacements.js
+  var obj3 = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  var unwrap3 = (body) => obj3(body)?.data && typeof body.data === "object" ? body.data : body;
+  var numOrNull2 = (v) => {
+    const n = typeof v === "string" ? parseFloat(v) : v;
+    return typeof n === "number" && Number.isFinite(n) ? n : null;
+  };
+  function replacementItemId(path) {
+    const m = String(path || "").split("?")[0].match(/^\/inventory\/items\/([^/]+)\/replacements$/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function candidatesFromResponse(body) {
+    const d = unwrap3(body);
+    const list = Array.isArray(d) ? d : Array.isArray(d?.items) ? d.items : Array.isArray(d?.candidates) ? d.candidates : [];
+    const out = [];
+    list.forEach((raw, i) => {
+      const e = obj3(raw);
+      if (!e) return;
+      const it = obj3(e.item) ?? {};
+      const name = String(it.marketName ?? e.marketName ?? e.market_name ?? "").trim();
+      const price = numOrNull2(e.price ?? it.price);
+      if (!name || price === null) return;
+      out.push({
+        id: String(e.id ?? it.id ?? i),
+        itemId: String(it.id ?? e.id ?? ""),
+        name,
+        price,
+        refund: numOrNull2(e.refund),
+        image: typeof (it.image ?? e.image) === "string" ? it.image ?? e.image : null
+      });
+    });
+    return out;
+  }
+
+  // src/prices/csfloat.js
+  var CSFLOAT_ORIGIN = "https://csfloat.com";
+  var CSFLOAT_SELLER_FEE = 0.02;
+  var DAY = 864e5;
+  function salesUrl(name) {
+    return `${CSFLOAT_ORIGIN}/api/v1/history/${encodeURIComponent(name)}/sales`;
+  }
+  function marketUrl(name) {
+    return `${CSFLOAT_ORIGIN}/search?market_hash_name=${encodeURIComponent(name)}&sort_by=lowest_price`;
+  }
+  var ok = (v) => typeof v === "number" && Number.isFinite(v);
+  var cents = (v) => ok(Number(v)) && Number(v) > 0 ? Number(v) / 100 : null;
+  function quantile(sorted, q) {
+    if (!sorted.length) return null;
+    const pos = (sorted.length - 1) * q;
+    const lo = Math.floor(pos);
+    const hi = Math.ceil(pos);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+  }
+  var median = (xs) => quantile([...xs].sort((a, b) => a - b), 0.5);
+  function expandPoints(pts) {
+    return (Array.isArray(pts) ? pts : []).map((p) => ({ ts: p[0] * 6e4, price: p[1] / 100, float: p[2] === null || p[2] === void 0 ? null : p[2] / 1e4 }));
+  }
+  var HISTORY_PAGE = 40;
+  function findSplit(prices2) {
+    const p = [...prices2].sort((a, b) => a - b);
+    const n = p.length;
+    if (n < 8) return null;
+    const m = quantile(p, 0.5);
+    const side = Math.max(3, Math.ceil(n * 0.2));
+    let best = -1;
+    let at = -1;
+    for (let i = side; i <= n - side; i++) {
+      const gap = p[i] - p[i - 1];
+      if (gap > best) [best, at] = [gap, i];
+    }
+    if (at < 0 || best < m * 0.08) return null;
+    const high = p.slice(at);
+    return { cut: (p[at - 1] + p[at]) / 2, lowMin: p[0], lowMax: p[at - 1], highMin: p[at], highMax: p[n - 1], upper: quantile(high, 0.5), lowShare: at / n };
+  }
+  function summarizeSales(rows, now = Date.now()) {
+    const list = (Array.isArray(rows) ? rows : []).filter((r) => r && typeof r === "object" && (r.state === void 0 || r.state === "sold")).map((r) => {
+      const raw = r.item?.float_value;
+      const fv = raw === null || raw === void 0 ? NaN : Number(raw);
+      return {
+        ts: Date.parse(r.sold_at ?? r.created_at ?? ""),
+        price: cents(r.price),
+        float: ok(fv) ? fv : null,
+        ref: r.reference && typeof r.reference === "object" ? r.reference : null
+      };
+    }).filter((r) => ok(r.ts) && r.price !== null).sort((a, b) => b.ts - a.ts);
+    const within = (ms) => list.filter((r) => now - r.ts <= ms);
+    const recent = within(30 * DAY);
+    const ref = list.find((r) => r.ref)?.ref ?? null;
+    const basePrice = ref ? cents(ref.base_price) : null;
+    const listings = ref && ok(Number(ref.quantity)) ? Number(ref.quantity) : null;
+    const lastPrice = list.length ? list[0].price : null;
+    let windowDays = 30;
+    let win = recent.slice(0, 20);
+    if (win.length < 3) [windowDays, win] = [90, within(90 * DAY).slice(0, 10)];
+    const m0 = median(win.map((r) => r.price));
+    const clean = (p) => p >= m0 * 0.5 && p <= m0 * 1.5;
+    let kept = win.length >= 3 ? win.map((r) => r.price).filter(clean).sort((a, b) => a - b) : [];
+    const split = kept.length >= 3 ? findSplit(within(windowDays * DAY).map((r) => r.price).filter(clean)) : null;
+    if (split) {
+      const lower = kept.filter((p) => p < split.cut);
+      if (lower.length >= 3) kept = lower;
+    }
+    let value = null;
+    let quick = null;
+    let source = null;
+    let spread = null;
+    if (kept.length >= 3) {
+      value = quantile(kept, 0.5);
+      quick = quantile(kept, 0.25);
+      spread = (quantile(kept, 0.75) - quick) / value;
+      source = "sales";
+    } else if (basePrice !== null) [value, quick, source] = [basePrice, basePrice, "reference"];
+    else if (lastPrice !== null) [value, quick, source] = [lastPrice, lastPrice, "last"];
+    if (source !== "sales") windowDays = null;
+    const newer = list.filter((r) => now - r.ts <= 14 * DAY).map((r) => r.price);
+    const older = list.filter((r) => now - r.ts > 14 * DAY && now - r.ts <= 90 * DAY).map((r) => r.price);
+    const trend = newer.length >= 3 && older.length >= 3 ? median(newer) / median(older) - 1 : null;
+    const fee = (v) => v === null ? null : v * (1 - CSFLOAT_SELLER_FEE);
+    return {
+      value,
+      quick,
+      net: fee(value),
+      quickNet: fee(quick),
+      source,
+      windowDays,
+      used: source === "sales" ? kept.length : 0,
+      low: source === "sales" ? kept[0] : null,
+      high: source === "sales" ? kept[kept.length - 1] : null,
+      spread,
+      trend,
+      basePrice,
+      lastPrice,
+      lastSaleTs: list.length ? list[0].ts : null,
+      split: source === "sales" && split && kept[kept.length - 1] < split.cut ? split : null,
+      sales7d: within(7 * DAY).length,
+      sales30d: recent.length,
+      // CSFloat returns at most ~40 sales. When all of them are inside 30 days, the real count is higher.
+      salesCapped: list.length >= HISTORY_PAGE && recent.length === list.length,
+      listings,
+      n: list.length,
+      pts: list.map((r) => [Math.round(r.ts / 6e4), Math.round(r.price * 100), r.float === null ? null : Math.round(r.float * 1e4)])
+    };
+  }
+  function createPriceClient(o) {
+    const now = o.now ?? (() => Date.now());
+    const ttlMs = o.ttlMs ?? 6 * 36e5;
+    const gapMs = o.gapMs ?? 350;
+    const maxEntries = o.maxEntries ?? 300;
+    const KEY = "cst.csfloat.v3";
+    let cache = {};
+    try {
+      const c = o.storage?.get(KEY, {});
+      if (c && typeof c === "object") cache = c;
+    } catch {
+    }
+    try {
+      for (const old of ["cst.csfloat.v1", "cst.csfloat.v2"]) o.storage?.remove?.(old);
+    } catch {
+    }
+    const inflight = /* @__PURE__ */ new Map();
+    let queue = Promise.resolve();
+    let pausedUntil = 0;
+    function save() {
+      const keys = Object.keys(cache);
+      if (keys.length > maxEntries) {
+        keys.sort((a, b) => cache[a].ts - cache[b].ts);
+        for (const k of keys.slice(0, keys.length - maxEntries)) delete cache[k];
+      }
+      try {
+        o.storage?.set(KEY, cache);
+      } catch {
+      }
+    }
+    function cached(name) {
+      const c = cache[name];
+      return c && now() - c.ts < ttlMs ? c.s : null;
+    }
+    function get(name) {
+      const hit = cached(name);
+      if (hit) return Promise.resolve(hit);
+      if (inflight.has(name)) return inflight.get(name);
+      const p = queue = queue.catch(() => {
+      }).then(async () => {
+        const again = cached(name);
+        if (again) return again;
+        const wait = Math.max(0, pausedUntil - now());
+        if (wait) await sleep2(wait);
+        const res = await o.request(salesUrl(name));
+        if (res.status === 429) {
+          pausedUntil = now() + 3e4;
+          throw new Error("CSFloat rate limit, retry in 30 s");
+        }
+        if (res.status === 404) {
+          const s3 = summarizeSales([], now());
+          cache[name] = { ts: now(), s: s3 };
+          save();
+          return s3;
+        }
+        if (res.status < 200 || res.status >= 300) throw new Error(`CSFloat HTTP ${res.status}`);
+        const s2 = summarizeSales(res.json, now());
+        cache[name] = { ts: now(), s: s2 };
+        save();
+        await sleep2(gapMs);
+        return s2;
+      });
+      inflight.set(name, p);
+      p.finally(() => inflight.delete(name)).catch(() => {
+      });
+      return p;
+    }
+    return { get, cached };
+  }
+  function sleep2(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
   // src/store/db.js
   var DB_NAME = "caser-tracker";
   var DB_VERSION = 1;
@@ -717,6 +1049,14 @@
     async allEvents() {
       const list = await this.tx(["events"], "readonly", (t) => req(t.objectStore("events").getAll()));
       return list.sort((a, b) => a.ts - b.ts);
+    }
+    /** Delete events by id. */
+    async deleteEvents(ids) {
+      if (!ids.length) return;
+      await this.tx(["events"], "readwrite", (t) => {
+        const s2 = t.objectStore("events");
+        for (const id of ids) s2.delete(id);
+      });
     }
     async clearEvents() {
       await this.tx(["events", "raw"], "readwrite", (t) => {
@@ -795,11 +1135,14 @@
     ["target", (e) => e.kind === "upgrade" ? e.target?.name ?? "" : ""],
     ["target_price", (e) => e.kind === "upgrade" ? e.target?.price ?? "" : ""],
     ["chance_shown", (e) => e.kind === "upgrade" ? e.chanceShown : ""],
-    ["status", (e) => e.kind === "upgrade" ? e.status : ""],
+    ["status", (e) => e.kind === "upgrade" || e.kind === "deposit" ? e.status : ""],
     ["mystery", (e) => e.kind === "upgrade" ? e.mystery : ""],
     ["game_mode", (e) => e.gameMode],
     ["balance_before", (e) => e.balanceBefore ?? ""],
-    ["balance_after", (e) => e.balanceAfter ?? ""]
+    ["balance_after", (e) => e.balanceAfter ?? ""],
+    // Money flow: deposit amount or withdrawn item value, and the withdrawn item.
+    ["amount", (e) => e.kind === "deposit" ? e.amount : e.kind === "withdrawal" ? e.value : ""],
+    ["item", (e) => e.kind === "withdrawal" ? e.item?.name ?? "" : ""]
   ];
   function toCsv(events) {
     const esc = (v) => {
@@ -819,9 +1162,299 @@
     }
     const events = Array.isArray(data) ? data : data?.events;
     if (!Array.isArray(events)) throw new Error("File has no events list.");
-    const valid = events.filter((e) => e && typeof e.id === "string" && (e.kind === "case" || e.kind === "upgrade") && Number.isFinite(e.ts));
+    const valid = events.filter((e) => e && typeof e.id === "string" && ["case", "upgrade", "withdrawal", "deposit"].includes(e.kind) && Number.isFinite(e.ts));
     if (!valid.length && events.length) throw new Error("No valid events in file.");
     return valid;
+  }
+
+  // src/store/shared.js
+  var DAY_PREFIX = "ev:d:";
+  var REV_KEY = "ev:rev";
+  var CLEARED_KEY = "ev:clearedAt";
+  function dayKey(ts) {
+    const d = new Date(Number.isFinite(ts) ? ts : 0);
+    return DAY_PREFIX + (Number.isNaN(d.getTime()) ? "1970-01-01" : d.toISOString().slice(0, 10));
+  }
+  function createSharedStore(gm) {
+    const readDay = (key) => {
+      const v = gm.get(key, null);
+      return Array.isArray(v) ? v : [];
+    };
+    const dayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
+    function bumpRev(days) {
+      gm.set(REV_KEY, { at: Date.now(), days, nonce: Math.random().toString(36).slice(2) });
+    }
+    return {
+      /** Every shared event, oldest first. */
+      readAll() {
+        const out = [];
+        for (const k of dayKeys()) out.push(...readDay(k));
+        return out.sort((a, b) => a.ts - b.ts);
+      },
+      /** Events of the given day keys (as sent in a rev change). */
+      readDays(keys) {
+        const out = [];
+        for (const k of keys ?? []) if (typeof k === "string" && k.startsWith(DAY_PREFIX)) out.push(...readDay(k));
+        return out;
+      },
+      /**
+       * Merge events into the shared copy with the same rules as the local store.
+       * Only days that actually change are written. Returns the changed day keys.
+       */
+      merge(events) {
+        const byDay = /* @__PURE__ */ new Map();
+        for (const ev of events) {
+          if (!ev || typeof ev.id !== "string") continue;
+          const k = dayKey(ev.ts);
+          if (!byDay.has(k)) byDay.set(k, []);
+          byDay.get(k).push(ev);
+        }
+        const changed = [];
+        for (const [k, incoming] of byDay) {
+          const list = readDay(k);
+          const index = new Map(list.map((e, i) => [e.id, i]));
+          let dirty = false;
+          for (const ev of incoming) {
+            const i = index.get(ev.id);
+            if (i === void 0) {
+              index.set(ev.id, list.length);
+              list.push(ev);
+              dirty = true;
+            } else if (shouldReplace(list[i], ev)) {
+              list[i] = mergeEvent(list[i], ev);
+              dirty = true;
+            }
+          }
+          if (dirty) {
+            gm.set(k, list);
+            changed.push(k);
+          }
+        }
+        if (changed.length) bumpRev(changed);
+        return changed;
+      },
+      /** Remove events by id from every day. */
+      remove(ids) {
+        const drop = new Set(ids);
+        if (!drop.size) return;
+        const changed = [];
+        for (const k of dayKeys()) {
+          const list = readDay(k);
+          const kept = list.filter((e) => !drop.has(e.id));
+          if (kept.length === list.length) continue;
+          if (kept.length) gm.set(k, kept);
+          else gm.del(k);
+          changed.push(k);
+        }
+        if (changed.length) bumpRev(changed);
+      },
+      /** Delete every shared event and tell the other domains to drop theirs. Returns the clear time. */
+      clear() {
+        for (const k of dayKeys()) gm.del(k);
+        const at = Date.now();
+        gm.set(CLEARED_KEY, at);
+        bumpRev([]);
+        return at;
+      },
+      clearedAt() {
+        const v = gm.get(CLEARED_KEY, null);
+        return Number.isFinite(v) ? v : null;
+      },
+      /** Calls back with the changed events when another tab (any domain) writes. */
+      onRemoteChange(cb) {
+        gm.listen?.(REV_KEY, (value, remote) => {
+          if (remote) cb(value);
+        });
+      }
+    };
+  }
+  function gmStorage() {
+    if (typeof GM_getValue !== "function" || typeof GM_setValue !== "function" || typeof GM_listValues !== "function") return null;
+    return {
+      get: (k, d) => GM_getValue(k, d),
+      set: (k, v) => GM_setValue(k, v),
+      del: (k) => typeof GM_deleteValue === "function" ? GM_deleteValue(k) : GM_setValue(k, null),
+      list: () => GM_listValues(),
+      listen: typeof GM_addValueChangeListener === "function" ? (k, cb) => GM_addValueChangeListener(k, (_name, _old, value, remote) => cb(value, remote)) : void 0
+    };
+  }
+
+  // src/store/cloud-config.js
+  var CLOUD_URL = "https://hafnhxumrqyaljmciqqq.supabase.co";
+  var CLOUD_KEY = "sb_publishable_YufMC_UuweoYKj6PG-vAZA_9ZkYR6nD";
+
+  // src/store/cloud.js
+  var PUSH_BATCH = 500;
+  var PULL_PAGE = 1e3;
+  var PULL_OVERLAP_MS = 15e3;
+  function eventRank(e) {
+    let r = 0;
+    if (e.source === "live") r += 1;
+    if (e.kind === "upgrade" && e.status && e.status !== "pending") r += 2;
+    if (e.kind === "deposit" && e.status === "completed") r += 2;
+    if (e.kind === "deposit" && e.completedTs != null) r += 4;
+    return r;
+  }
+  var KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
+  function isSyncKey(k) {
+    return typeof k === "string" && KEY_RE.test(k);
+  }
+  function newSyncKey() {
+    const b = new Uint8Array(24);
+    crypto.getRandomValues(b);
+    return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_");
+  }
+  function createCloud({ request, getKey, url = CLOUD_URL, apiKey = CLOUD_KEY }) {
+    async function call(method, path, body) {
+      const key = getKey();
+      if (!isSyncKey(key)) throw new Error("Cloud sync is off");
+      const res = await request({
+        method,
+        url: url + path,
+        headers: { apikey: apiKey, "x-sync-key": key, "content-type": "application/json", accept: "application/json" },
+        body: body === void 0 ? void 0 : JSON.stringify(body)
+      });
+      if (res.status < 200 || res.status >= 300) {
+        const msg = res.json && (res.json.message || res.json.error);
+        throw new Error(`Cloud answered ${res.status}${msg ? `: ${msg}` : ""}`);
+      }
+      return res.json;
+    }
+    return {
+      /** Send events; the database keeps whichever copy ranks higher. Returns rows changed. */
+      async push(events, onProgress) {
+        let changed = 0;
+        for (let i = 0; i < events.length; i += PUSH_BATCH) {
+          const rows = events.slice(i, i + PUSH_BATCH).map((e) => ({ id: e.id, rank: eventRank(e), data: e }));
+          changed += Number(await call("POST", "/rest/v1/rpc/sync_push", { rows })) || 0;
+          onProgress?.(Math.min(i + PUSH_BATCH, events.length), events.length);
+        }
+        return changed;
+      },
+      /**
+       * Everything changed since the cursor ({at, id} or null for all), oldest change first.
+       * Returns {events, deletedIds, cursor}; pass the cursor to the next pull.
+       */
+      async pull(cursor) {
+        const events = [];
+        const deletedIds = [];
+        let at = cursor?.at ? new Date(Date.parse(cursor.at) - PULL_OVERLAP_MS).toISOString() : null;
+        let id = "";
+        let last = cursor ?? null;
+        for (; ; ) {
+          let filter = "";
+          if (at) {
+            const a = encodeURIComponent(at);
+            filter = id ? `&or=(updated_at.gt.${a},and(updated_at.eq.${a},id.gt.${encodeURIComponent(JSON.stringify(id))}))` : `&updated_at=gte.${a}`;
+          }
+          const rows = await call("GET", `/rest/v1/sync_events?select=id,deleted,data,updated_at${filter}&order=updated_at.asc,id.asc&limit=${PULL_PAGE}`);
+          if (!Array.isArray(rows)) throw new Error("Cloud answered with no rows list");
+          for (const r of rows) {
+            if (r.deleted) deletedIds.push(r.id);
+            else if (r.data && typeof r.data.id === "string") events.push(r.data);
+          }
+          if (rows.length) {
+            const tail = rows[rows.length - 1];
+            at = tail.updated_at;
+            id = tail.id;
+            last = { at, id };
+          }
+          if (rows.length < PULL_PAGE) break;
+        }
+        return { events, deletedIds, cursor: last };
+      },
+      async remove(ids) {
+        if (!ids.length) return 0;
+        return Number(await call("POST", "/rest/v1/rpc/sync_delete", { ids })) || 0;
+      },
+      /** Deletes every event under this key. Returns the clear time (ms). */
+      async clear() {
+        return Date.parse(await call("POST", "/rest/v1/rpc/sync_clear", {}));
+      },
+      /**
+       * Facts about the whole history under this key: when "clear all" last ran (ms or null) and
+       * which site-history streams some browser has read to the end.
+       */
+      async account() {
+        const rows = await call("GET", "/rest/v1/sync_accounts?select=cleared_at,history_complete");
+        const row = Array.isArray(rows) && rows[0] ? rows[0] : {};
+        const at = row.cleared_at ? Date.parse(row.cleared_at) : NaN;
+        return {
+          clearedAt: Number.isFinite(at) ? at : null,
+          complete: Array.isArray(row.history_complete) ? row.history_complete.filter((s2) => typeof s2 === "string") : []
+        };
+      },
+      /** Record that a site-history stream was read to the end. */
+      async markComplete(stream) {
+        return call("POST", "/rest/v1/rpc/sync_mark_complete", { stream });
+      }
+    };
+  }
+
+  // src/store/accounts.js
+  function accountOf(e, legacy) {
+    return e?.userId != null && e.userId !== "" ? String(e.userId) : legacy ?? null;
+  }
+  function pickLegacyOwner(events) {
+    const counts = /* @__PURE__ */ new Map();
+    for (const e of events) {
+      if (e?.userId == null || e.userId === "") continue;
+      const id = String(e.userId);
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    let best = null;
+    let bestN = 0;
+    for (const [id, n] of counts) {
+      if (n > bestN) {
+        best = id;
+        bestN = n;
+      }
+    }
+    return best;
+  }
+  function filterByAccount(events, id, legacy) {
+    if (id == null || id === "all") return events;
+    return events.filter((e) => accountOf(e, legacy) === id);
+  }
+  function resolveSelection(selection, currentId, legacy) {
+    if (selection === "all") return "all";
+    if (selection && selection !== "current") return String(selection);
+    return currentId ?? legacy ?? null;
+  }
+  function listAccounts(events, known, legacy, currentId) {
+    const counts = /* @__PURE__ */ new Map();
+    for (const e of events) {
+      const id = accountOf(e, legacy);
+      if (id != null) counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    if (currentId != null && !counts.has(currentId)) counts.set(currentId, 0);
+    const list = [...counts].map(([id, n]) => ({
+      id,
+      name: accountName(id, known),
+      events: n,
+      current: id === currentId
+    }));
+    return list.sort((a, b) => b.current - a.current || b.events - a.events || a.id.localeCompare(b.id));
+  }
+  function accountName(id, known) {
+    const name = known?.[id]?.name;
+    return typeof name === "string" && name.trim() ? name.trim() : `Account ${id}`;
+  }
+  function streamFlag(stream, userId) {
+    return `${stream}:${userId}`;
+  }
+  function flagComplete(flags, stream, userId, legacy) {
+    if (!Array.isArray(flags) || userId == null) return false;
+    return flags.includes(streamFlag(stream, userId)) || userId === legacy && flags.includes(stream);
+  }
+  function progressKey(stream, userId) {
+    return `sync:${userId}:${stream}`;
+  }
+  function isStreamFlag(s2, streams) {
+    if (typeof s2 !== "string") return false;
+    const i = s2.indexOf(":");
+    const stream = i < 0 ? s2 : s2.slice(0, i);
+    return streams.includes(stream) && (i < 0 || /^[A-Za-z0-9_-]{1,64}$/.test(s2.slice(i + 1)));
   }
 
   // src/stats/index.js
@@ -831,6 +1464,7 @@
     OUTLOOK_WINDOWS: () => OUTLOOK_WINDOWS,
     calibration: () => calibration,
     calibrationCurve: () => calibrationCurve,
+    caseOdds: () => caseOdds,
     caseRoi: () => caseRoi,
     chiSquareSf: () => chiSquareSf,
     edgeMap: () => edgeMap,
@@ -841,6 +1475,8 @@
     mysteryStats: () => mysteryStats,
     normalCdf: () => normalCdf,
     outlookModel: () => outlookModel,
+    rankCandidates: () => rankCandidates,
+    sellValue: () => sellValue,
     sessions: () => sessions,
     summarize: () => summarize,
     superDropStats: () => superDropStats,
@@ -1024,7 +1660,7 @@
     const m = mean(xs);
     return Math.sqrt(xs.reduce((s2, x) => s2 + (x - m) ** 2, 0) / (xs.length - 1));
   }
-  function median(xs) {
+  function median2(xs) {
     if (!xs.length) return 0;
     const s2 = [...xs].sort((a, b) => a - b);
     const mid = s2.length >> 1;
@@ -1222,14 +1858,14 @@
     const rows = [];
     for (const [caseSlug, evs] of groups) {
       const latest = evs[evs.length - 1];
-      const prices = evs.map((e) => num(e.item && e.item.price));
+      const prices2 = evs.map((e) => num(e.item && e.item.price));
       rows.push({
         ...baseMetrics(evs),
         caseSlug,
         caseName: latest.caseName,
         casePrice: num(latest.casePrice),
         best: bestDrop(evs),
-        median: median(prices),
+        median: median2(prices2),
         hitRate: evs.filter((e) => num(e.item && e.item.price) >= num(e.casePrice)).length / evs.length
       });
     }
@@ -1884,7 +2520,7 @@
       hitRate: mults.length ? hits / mults.length : null,
       hitRateCI: mults.length ? wilson(hits, mults.length) : null,
       meanMultiplier: mean(mults),
-      medianMultiplier: mults.length ? median(mults) : null
+      medianMultiplier: mults.length ? median2(mults) : null
     };
   }
   function mysteryStats(events, stakeEdges = DEFAULT_MYSTERY_STAKE_EDGES) {
@@ -1915,7 +2551,7 @@
   // src/stats/money.js
   var DAY_MS = 864e5;
   var pad22 = (n) => String(n).padStart(2, "0");
-  var dayKey = (ts) => {
+  var dayKey2 = (ts) => {
     const d = new Date(ts);
     return `${d.getFullYear()}-${pad22(d.getMonth() + 1)}-${pad22(d.getDate())}`;
   };
@@ -1932,7 +2568,7 @@
     const lastTs = doneTs.length ? Math.max(...doneTs) : null;
     const withdrawn = withdrawals.reduce((s2, w) => s2 + valueOf(w), 0);
     const known = balance !== null && balance !== void 0 || inventoryValue !== null && inventoryValue !== void 0;
-    const holdings = known ? num(balance) + num(inventoryValue) : null;
+    const holdings2 = known ? num(balance) + num(inventoryValue) : null;
     const moves = [
       ...done.map((e) => ({ ts: num(e.ts), kind: "deposit", amount: num(e.amount) })),
       ...withdrawals.map((w) => ({ ts: num(w.ts), kind: "withdrawal", amount: valueOf(w) }))
@@ -1944,7 +2580,7 @@
     });
     const days = /* @__PURE__ */ new Map();
     for (const m of moves) {
-      const key = dayKey(m.ts);
+      const key = dayKey2(m.ts);
       const row = days.get(key) ?? { day: key, deposited: 0, withdrawn: 0 };
       if (m.kind === "deposit") row.deposited += m.amount;
       else row.withdrawn += m.amount;
@@ -1961,11 +2597,70 @@
         perDay: done.length ? sum / Math.max(1, (lastTs - firstTs) / DAY_MS) : null
       },
       withdrawals: { n: withdrawals.length, value: withdrawn, exactTimeN: withdrawals.filter((w) => w.exactTime === true).length },
-      holdings,
-      net: withdrawn + (holdings ?? 0) - sum,
+      holdings: holdings2,
+      net: withdrawn + (holdings2 ?? 0) - sum,
       series,
       daily: [...days.values()].sort((a, b) => a.day < b.day ? -1 : 1)
     };
+  }
+
+  // src/stats/caseodds.js
+  function caseOdds(info) {
+    const items = Array.isArray(info?.items) ? info.items : [];
+    const casePrice = Number(info?.price) > 0 ? Number(info.price) : 0;
+    const sorted = items.map((i) => ({ ...i, mult: casePrice > 0 ? i.price / casePrice : null })).sort((a, b) => b.price - a.price || String(a.name).localeCompare(String(b.name)));
+    const withChance = sorted.filter((i) => typeof i.chance === "number" && Number.isFinite(i.chance));
+    const chanceSum = withChance.length ? withChance.reduce((s2, i) => s2 + i.chance, 0) : null;
+    const hasChances = sorted.length > 0 && withChance.length === sorted.length && Math.abs(chanceSum - 100) < 0.5;
+    const ev = hasChances ? sorted.reduce((s2, i) => s2 + i.price * (i.chance / chanceSum), 0) : null;
+    const pick = (i) => i ? { name: i.name, price: i.price } : null;
+    return {
+      n: sorted.length,
+      casePrice,
+      min: pick(sorted[sorted.length - 1]),
+      max: pick(sorted[0]),
+      hasChances,
+      chanceSum,
+      ev,
+      evRatio: ev !== null && casePrice > 0 ? ev / casePrice : null,
+      items: sorted
+    };
+  }
+
+  // src/stats/exchange.js
+  function sellValue(m, basis = "typical") {
+    if (!m) return null;
+    const v = basis === "fast" ? m.quickNet : m.net;
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  function rankCandidates(candidates, lookup, opts = {}) {
+    const minSales = opts.minSales ?? 3;
+    const sort = opts.sort ?? "value";
+    const basis = opts.basis === "fast" ? "fast" : "typical";
+    const cur = typeof opts.currentValue === "number" && Number.isFinite(opts.currentValue) ? opts.currentValue : null;
+    const rows = (Array.isArray(candidates) ? candidates : []).map((c) => {
+      const l = lookup(c.name) || {};
+      const market = l.summary ?? null;
+      const sell = sellValue(market, basis);
+      return {
+        ...c,
+        market,
+        error: l.error ?? null,
+        sell,
+        liquid: !!market && sell !== null && market.sales30d >= minSales,
+        delta: sell !== null && cur !== null ? sell - cur : null,
+        // USD received per 1000 site coins: how much real money the site price buys.
+        perK: sell !== null && c.price > 0 ? sell / c.price * 1e3 : null
+      };
+    });
+    const v = (r) => r.sell ?? -Infinity;
+    const sales = (r) => r.market?.sales30d ?? -1;
+    rows.sort((a, b) => {
+      if (a.liquid !== b.liquid) return a.liquid ? -1 : 1;
+      const d = sort === "sales" ? sales(b) - sales(a) || v(b) - v(a) : v(b) - v(a) || sales(b) - sales(a);
+      return d || b.price - a.price;
+    });
+    return rows;
   }
 
   // src/ui/dom.js
@@ -2130,8 +2825,7 @@ button { cursor: pointer; }
 }
 .launcher:hover { background: var(--surface-2); }
 .launcher .mark { width: 8px; height: 8px; border-radius: 2px; background: var(--accent); flex: none; }
-.launcher .label { color: var(--muted); font-weight: 550; }
-.launcher .net { font-weight: 650; }
+.launcher .label { font-weight: 550; }
 
 .panel {
   position: fixed; top: 0; right: 0; bottom: 0;
@@ -2145,6 +2839,9 @@ button { cursor: pointer; }
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 12px; }
 .title { font-size: 15px; font-weight: 650; margin: 0; }
 .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.acct { margin-top: 8px; }
+.acct[hidden] { display: none; }
+.acct select { height: 28px; font-size: 12px; padding-left: 8px; max-width: 100%; }
 
 .tabs {
   display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border);
@@ -2291,6 +2988,10 @@ option { background: var(--surface); color: var(--text); }
 .btn.danger-solid:hover:not(:disabled) { background: #f38383; border-color: #f38383; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.key-row { margin-top: 8px; }
+.key-row .key-input { flex: 1 1 220px; min-width: 0; }
+.key-text { word-break: break-all; }
+.key-shown { width: 100%; font-family: ui-monospace, Consolas, monospace; user-select: text; -webkit-user-select: text; }
 
 .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
 .controls select { flex: 1 1 200px; min-width: 0; }
@@ -2308,6 +3009,8 @@ option { background: var(--surface); color: var(--text); }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; background: var(--faint); }
 .dot.on { background: var(--pos); }
 .dot.off { background: var(--neg); }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.switch input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 
 .confirm { margin-top: 12px; background: var(--surface); border: 1px solid #52302f; border-radius: var(--radius); padding: 12px 14px; animation: cst-fade 120ms ease-out; }
 .confirm p { margin-bottom: 10px; }
@@ -2317,6 +3020,48 @@ option { background: var(--surface); color: var(--text); }
 .empty .et { font-size: 15px; font-weight: 600; }
 .empty .ed { color: var(--muted); margin: 6px auto 16px; max-width: 340px; }
 .error { color: var(--neg); background: #1f1517; border: 1px solid #4a2a2c; border-radius: 6px; padding: 10px 12px; font-size: 12px; }
+`;
+  var CASE_PANEL_CSS = `
+.cpanel {
+  position: fixed; top: 100px; right: 16px; width: 320px; max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 116px); max-height: calc(100dvh - 116px);
+  display: flex; flex-direction: column;
+  background: var(--bg); border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden;
+}
+.cpanel:not([hidden]) { animation: cst-fade 120ms ease-out; }
+.bar { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex: none; }
+.cpanel.collapsed .bar { border-bottom: 0; }
+.bar .ttl { flex: 1; min-width: 0; font-size: 12px; font-weight: 650; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar .iconbtn { width: 28px; height: 28px; }
+.content { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.pad { padding: 12px 14px; font-size: 12px; }
+.error { color: var(--neg); }
+.sum { padding: 10px 12px 12px; border-bottom: 1px solid var(--border); flex: none; }
+.meta { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.meta b { color: var(--text); font-weight: 600; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+.box.wide { grid-column: 1 / -1; }
+.box .k { color: var(--muted); font-size: 11px; }
+.box .v { font-size: 14px; font-weight: 650; margin-top: 1px; }
+.box .v.muted { font-size: 13px; font-weight: 550; }
+.box .x { font-size: 11.5px; font-weight: 600; margin-left: 6px; }
+.box .s { color: var(--faint); font-size: 11px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.box .s.wrap { white-space: normal; }
+.lhead { display: flex; justify-content: space-between; gap: 8px; padding: 7px 12px; font-size: 11px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); flex: none; }
+.items {
+  list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 120px; flex: 1; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent;
+}
+.item { display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.item:last-child { border-bottom: 0; }
+.item:hover { background: var(--surface); }
+.item img, .item .noimg { width: 40px; height: 30px; object-fit: contain; flex: none; display: block; }
+.item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.item .r { display: flex; flex-direction: column; align-items: flex-end; flex: none; }
+.item .price { font-weight: 600; }
+.item .second { color: var(--muted); font-size: 11px; }
+@media (max-width: 640px) { .cpanel { top: auto; bottom: 64px; right: 16px; max-height: 60vh; } }
 `;
   var OVERLAY_CSS = `
 .card {
@@ -2365,18 +3110,99 @@ option { background: var(--surface); color: var(--text); }
 .ol-kelly { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11.5px; }
 .ol-kelly b { color: var(--text); font-weight: 600; }
 `;
+  var EXCHANGE_CSS = `
+.xpanel {
+  position: fixed; top: 100px; left: 16px; width: 440px; max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 164px); max-height: calc(100dvh - 164px);
+  display: flex; flex-direction: column;
+  background: var(--bg); border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden;
+}
+.xpanel:not([hidden]) { animation: cst-fade 120ms ease-out; }
+.bar { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex: none; }
+.xpanel.collapsed .bar { border-bottom: 0; }
+.bar .ttl { flex: 1; min-width: 0; font-size: 12px; font-weight: 650; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar .iconbtn { width: 28px; height: 28px; }
+.content { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.pad { padding: 12px 14px; font-size: 12px; }
+.error { color: var(--neg); }
+.sum { padding: 10px 12px 10px; border-bottom: 1px solid var(--border); flex: none; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+.box .k { color: var(--muted); font-size: 11px; }
+.box .v { font-size: 14px; font-weight: 650; margin-top: 1px; }
+.box .v .x { font-size: 11.5px; font-weight: 600; margin-left: 6px; }
+.box .s { color: var(--faint); font-size: 11px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tools { display: flex; align-items: center; gap: 6px 12px; margin-top: 8px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { background: transparent; border: 0; padding: 3px 8px; font-size: 11.5px; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--surface-3); color: var(--text); }
+.tools select { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 2px 4px; font-size: 11.5px; }
+.bar .status { color: var(--faint); font-size: 11px; flex: none; }
+.tools .tg { display: inline-flex; align-items: center; gap: 6px; }
+.lhead { display: flex; justify-content: space-between; gap: 8px; padding: 7px 12px; font-size: 11px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); flex: none; }
+.items {
+  list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 0; flex: 1; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent;
+}
+.item { display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; cursor: pointer; }
+.item:last-child { border-bottom: 0; }
+.item:hover { background: var(--surface); }
+.item.illiquid { opacity: 0.55; }
+.item.sep { border-top: 1px solid var(--border-strong); }
+.item img, .item .noimg { width: 40px; height: 30px; object-fit: contain; flex: none; display: block; }
+.item .mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.item .sub { color: var(--faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .r { display: flex; flex-direction: column; align-items: flex-end; flex: none; }
+.item .price { font-weight: 600; }
+.item .price .flag { color: var(--warn); margin-left: 1px; }
+.item .price .delta { font-size: 11px; font-weight: 600; margin-left: 5px; }
+.item .second { color: var(--muted); font-size: 11px; }
+.item .sp { width: 56px; height: 22px; flex: none; display: flex; align-items: center; }
+.item .sp svg { display: block; }
+.item.open { background: var(--surface); }
+.item.open .name { font-weight: 600; }
+.rank { width: 18px; flex: none; color: var(--faint); font-size: 11px; text-align: right; }
+.note { padding: 8px 12px; color: var(--faint); font-size: 11px; border-top: 1px solid var(--border); flex: none; }
+.box.clickable { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.box.clickable:hover:not(:disabled) { border-color: var(--border-strong); }
+.box.clickable.open { border-color: var(--accent); }
+.box.clickable:disabled { cursor: default; }
+.dwrap { list-style: none; border-bottom: 1px solid var(--border-strong); background: var(--surface); cursor: default; }
+.curdetail { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.detail { padding: 8px 12px 10px; animation: cst-fade 120ms ease-out; }
+.detail .chart { position: relative; }
+.detail .chart svg { display: block; overflow: visible; }
+.detail .chart text { font-family: var(--font); font-size: 10px; fill: var(--faint); font-variant-numeric: tabular-nums; }
+.detail .readout { min-height: 17px; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.detail .readout .strong { color: var(--text); font-weight: 600; }
+.detail .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+.detail .legend span { display: inline-flex; align-items: center; gap: 6px; }
+.detail .legend .ln { display: inline-block; width: 14px; height: 0; border-top: 1.5px solid; }
+.detail .legend .ln.dash { border-top-style: dashed; }
+.detail .legend .ln.dot { border-top-style: dotted; }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 10px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.st .k { color: var(--faint); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st .v { font-size: 12px; color: var(--text); font-weight: 600; }
+.st .tag { margin-left: 5px; font-size: 9.5px; font-weight: 600; color: var(--accent); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0 4px; vertical-align: 1px; }
+.warnline { margin: 6px 0 0; font-size: 11px; color: var(--warn); line-height: 1.4; }
+.dfoot { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 10.5px; }
+.dfoot a { color: var(--accent); text-decoration: none; white-space: nowrap; font-size: 11.5px; font-weight: 600; }
+.dfoot a:hover { text-decoration: underline; }
+@media (max-width: 640px) { .xpanel { top: auto; bottom: 64px; left: 16px; max-height: 50vh; } }
+`;
 
   // src/ui/format.js
   var THIN = "\u2009";
   var NBSP = "\xA0";
   var MINUS = "\u2212";
   var DASH = "\u2013";
-  var ok = (v) => typeof v === "number" && Number.isFinite(v);
+  var ok2 = (v) => typeof v === "number" && Number.isFinite(v);
   function group(intStr) {
     return intStr.replace(/\B(?=(\d{3})+(?!\d))/g, THIN);
   }
   function fmtNumber(v, decimals = 2, opts = {}) {
-    if (!ok(v)) return DASH;
+    if (!ok2(v)) return DASH;
     const fixed = Math.abs(v).toFixed(decimals);
     const [i, f] = fixed.split(".");
     const body = group(i) + (f ? "." + f : "");
@@ -2394,54 +3220,54 @@ option { background: var(--surface); color: var(--text); }
     return n + NBSP + currency;
   }
   function fmtPct(fraction, decimals = 1, opts = {}) {
-    if (!ok(fraction)) return DASH;
+    if (!ok2(fraction)) return DASH;
     return fmtNumber(fraction * 100, decimals, opts) + "%";
   }
   function fmtChance(pct, decimals = 2) {
-    if (!ok(pct)) return DASH;
+    if (!ok2(pct)) return DASH;
     return fmtNumber(pct, decimals) + "%";
   }
   function fmtCI(ci, decimals = 1) {
-    if (!Array.isArray(ci) || !ok(ci[0]) || !ok(ci[1])) return "";
+    if (!Array.isArray(ci) || !ok2(ci[0]) || !ok2(ci[1])) return "";
     return `${fmtNumber(ci[0] * 100, decimals)} ${DASH} ${fmtNumber(ci[1] * 100, decimals)}%`;
   }
   function fmtMult(v) {
-    return ok(v) ? "x" + fmtNumber(v, 2) : DASH;
+    return ok2(v) ? "x" + fmtNumber(v, 2) : DASH;
   }
   function fmtPEq(p) {
-    if (!ok(p)) return "p = " + DASH;
+    if (!ok2(p)) return "p = " + DASH;
     return p < 1e-3 ? "p < 0.001" : "p = " + p.toFixed(3);
   }
   function fmtZ(z) {
-    return ok(z) ? fmtNumber(z, 2) : DASH;
+    return ok2(z) ? fmtNumber(z, 2) : DASH;
   }
   function signClass(v) {
-    if (!ok(v) || Math.abs(v) < 1e-9) return "";
+    if (!ok2(v) || Math.abs(v) < 1e-9) return "";
     return v > 0 ? "pos" : "neg";
   }
   var pad = (n) => String(n).padStart(2, "0");
   var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   function fmtDate(ts) {
-    if (!ok(ts)) return DASH;
+    if (!ok2(ts)) return DASH;
     const d = new Date(ts);
     return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
   }
   function fmtDateShort(ts) {
-    if (!ok(ts)) return DASH;
+    if (!ok2(ts)) return DASH;
     const d = new Date(ts);
     return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
   }
   function fmtTime(ts) {
-    if (!ok(ts)) return DASH;
+    if (!ok2(ts)) return DASH;
     const d = new Date(ts);
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
   function fmtDateTime(ts) {
-    if (!ok(ts)) return DASH;
+    if (!ok2(ts)) return DASH;
     return `${fmtDateShort(ts)} ${fmtTime(ts)}`;
   }
   function fmtDuration(ms) {
-    if (!ok(ms) || ms < 0) return DASH;
+    if (!ok2(ms) || ms < 0) return DASH;
     const min = Math.round(ms / 6e4);
     if (min < 1) return "<" + NBSP + "1 min";
     if (min < 60) return `${min} min`;
@@ -2450,7 +3276,7 @@ option { background: var(--surface); color: var(--text); }
     return rest ? `${hours} h ${rest} min` : `${hours} h`;
   }
   function fmtAgo(ts, now = Date.now()) {
-    if (!ok(ts)) return "never";
+    if (!ok2(ts)) return "never";
     const sec = Math.max(0, Math.round((now - ts) / 1e3));
     if (sec < 60) return "just now";
     const min = Math.round(sec / 60);
@@ -2472,7 +3298,8 @@ option { background: var(--surface); color: var(--text); }
     band: "#181c22",
     diag: "#6b7480",
     deposit: "#ef6b6b",
-    withdrawal: "#45c486"
+    withdrawal: "#45c486",
+    fast: "#d8a650"
   };
   function niceStep(raw) {
     const p = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -2607,10 +3434,10 @@ option { background: var(--surface); color: var(--text); }
     const x0 = labelW + 8;
     const x1 = W - valueW;
     const H = padT + rows.length * rowH + 4;
-    const ok5 = (v) => typeof v === "number" && Number.isFinite(v);
+    const ok6 = (v) => typeof v === "number" && Number.isFinite(v);
     const vals = [0];
     if (band) vals.push(band[0], band[1]);
-    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok5(v)) vals.push(v);
+    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok6(v)) vals.push(v);
     let lo = Math.max(clamp[0], Math.min(...vals));
     let hi = Math.min(clamp[1], Math.max(...vals));
     if (hi - lo < minSpan) {
@@ -2643,7 +3470,7 @@ option { background: var(--surface); color: var(--text); }
       svg.append(
         s("text", { class: "lbl", x: 0, y: cy + 4, "text-anchor": "start", text: label.length > 16 ? label.slice(0, 15) + "\u2026" : label })
       );
-      if (!ok5(r.value) || !r.n) {
+      if (!ok6(r.value) || !r.n) {
         svg.append(s("text", { x: x1 + valueW, y: cy + 4, "text-anchor": "end", text: "no data" }));
         return;
       }
@@ -2660,7 +3487,7 @@ option { background: var(--surface); color: var(--text); }
           "fill-opacity": r.significant ? 0.95 : 0.45
         })
       );
-      if (ok5(r.lo) && ok5(r.hi)) {
+      if (ok6(r.lo) && ok6(r.hi)) {
         const wl = x(r.lo);
         const wh = x(r.hi);
         svg.append(
@@ -2676,12 +3503,14 @@ option { background: var(--surface); color: var(--text); }
   }
   function hoverLayer(svg, { x0, y0, w, h: hh, onMove, onLeave }) {
     const hit = s("rect", { x: x0, y: y0, width: w, height: hh, fill: "transparent" });
-    const toLocal = (clientX) => {
+    const move = (e) => {
       const r = svg.getBoundingClientRect();
-      return (clientX - r.left) / (r.width || 1) * Number(svg.getAttribute("width"));
+      const px = (e.clientX - r.left) / (r.width || 1) * Number(svg.getAttribute("width"));
+      const py = (e.clientY - r.top) / (r.height || 1) * Number(svg.getAttribute("height"));
+      onMove(px, py);
     };
-    hit.addEventListener("pointermove", (e) => onMove(toLocal(e.clientX)));
-    hit.addEventListener("pointerdown", (e) => onMove(toLocal(e.clientX)));
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerdown", move);
     hit.addEventListener("pointerleave", onLeave);
     svg.append(hit);
   }
@@ -2893,18 +3722,173 @@ option { background: var(--surface); color: var(--text); }
     );
     return h("div", { class: "chart" }, readout, svg, legend);
   }
+  function salesSparkline({ points, typical = null, width = 64, height = 22 }) {
+    let pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
+    const ref = okNum(typical) ? typical : [...pts].sort((a, b) => a.price - b.price)[pts.length >> 1]?.price;
+    pts = pts.filter((p) => p.price >= ref * 0.5 && p.price <= ref * 1.5);
+    if (pts.length < 2) return null;
+    const W = width;
+    const H = height;
+    const pad3 = 2;
+    const clip = (v) => Math.max(ref * 0.5, Math.min(ref * 1.5, v));
+    const vs = pts.map((p) => clip(p.price));
+    if (okNum(typical)) vs.push(typical);
+    const lo = Math.min(...vs);
+    const hi = Math.max(...vs);
+    const t0 = pts[0].ts;
+    const t1 = pts[pts.length - 1].ts;
+    const x = (t) => pad3 + (t1 === t0 ? (W - 2 * pad3) / 2 : (t - t0) / (t1 - t0) * (W - 2 * pad3));
+    const y = (v) => pad3 + (H - 2 * pad3) - (clip(v) - lo) / (hi - lo || 1) * (H - 2 * pad3);
+    const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, "aria-hidden": "true", class: "spark" });
+    if (okNum(typical)) {
+      const yy = Math.round(y(typical)) + 0.5;
+      svg.append(s("line", { x1: 0, x2: W, y1: yy, y2: yy, stroke: COLORS.zero, "stroke-width": 1 }));
+    }
+    let d = "";
+    pts.forEach((p, i) => d += `${i ? "L" : "M"}${x(p.ts).toFixed(1)},${y(p.price).toFixed(1)}`);
+    const last = pts[pts.length - 1];
+    svg.append(
+      s("path", { d, fill: "none", stroke: COLORS.line, "stroke-width": 1.25, "stroke-linejoin": "round", "stroke-linecap": "round", "stroke-opacity": 0.85 }),
+      s("circle", { cx: x(last.ts), cy: y(last.price), r: 2, fill: COLORS.marker })
+    );
+    return svg;
+  }
+  function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => "$" + fmtNumber(v, 2) }) {
+    const pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
+    if (!pts.length) return h("div", { class: "chart" }, h("p", { class: "faint", text: "No CSFloat sales to draw." }));
+    const readout = h("div", { class: "readout", "aria-live": "off" });
+    const W = Math.max(200, Math.floor(width));
+    const H = height;
+    const padL = 40;
+    const padR = 8;
+    const padT = 6;
+    const padB = 20;
+    const iw = W - padL - padR;
+    const ih = H - padT - padB;
+    const DAY2 = 864e5;
+    const ref = okNum(typical) ? typical : pts.map((p) => p.price).sort((a, b) => a - b)[pts.length >> 1];
+    const inRange = (v) => v >= ref * 0.5 && v <= ref * 1.5;
+    const ys = pts.map((p) => p.price).filter(inRange);
+    for (const v of [typical, fast, base, upper]) if (okNum(v) && inRange(v)) ys.push(v);
+    const { lo, hi, ticks } = niceTicks(Math.min(...ys), Math.max(...ys), 3);
+    const tEnd = Math.max(pts[pts.length - 1].ts, now);
+    const span = Math.max(tEnd - pts[0].ts, 36e5);
+    const t0 = pts[0].ts - span * 0.03;
+    const t1 = tEnd;
+    const x = (t) => padL + (t - t0) / (t1 - t0 || 1) * iw;
+    const short = span < 2 * DAY2;
+    const tlabel = (t) => short ? fmtDateTime(t) : fmtDateShort(t);
+    const y = (v) => padT + ih - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1) * ih;
+    const svg = s("svg", {
+      width: W,
+      height: H,
+      viewBox: `0 0 ${W} ${H}`,
+      role: "img",
+      "aria-label": `${pts.length} CSFloat sales from ${fmtDateShort(pts[0].ts)} to ${fmtDateShort(pts[pts.length - 1].ts)}${okNum(typical) ? `, typical ${fmt(typical)}` : ""}`
+    });
+    for (const t of ticks) {
+      const yy = Math.round(y(t)) + 0.5;
+      svg.append(
+        s("line", { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid, "stroke-width": 1 }),
+        s("text", { x: padL - 6, y: yy + 3.5, "text-anchor": "end", text: compact(t) })
+      );
+    }
+    const x30 = Math.round(x(now - 30 * DAY2)) + 0.5;
+    const mark30 = x30 > padL + 60 && x30 < W - padR - 60;
+    if (mark30) {
+      svg.append(
+        s("line", { x1: x30, x2: x30, y1: padT, y2: padT + ih, stroke: COLORS.zero, "stroke-width": 1, "stroke-dasharray": "2 3" }),
+        s("text", { x: x30, y: H - 6, "text-anchor": "middle", text: "30 d ago" })
+      );
+    } else {
+      const tm = (pts[0].ts + tEnd) / 2;
+      svg.append(s("text", { x: x(tm), y: H - 6, "text-anchor": "middle", text: tlabel(tm) }));
+    }
+    svg.append(
+      s("text", { x: padL, y: H - 6, "text-anchor": "start", text: tlabel(pts[0].ts) }),
+      s("text", { x: W - padR, y: H - 6, "text-anchor": "end", text: "now" })
+    );
+    const flat = (v, attrs) => {
+      if (!okNum(v)) return;
+      const yy = Math.round(y(v)) + 0.5;
+      svg.append(s("line", { x1: padL, x2: W - padR, y1: yy, y2: yy, "stroke-width": 1.25, ...attrs }));
+    };
+    flat(base, { stroke: COLORS.diag, "stroke-dasharray": "1 3" });
+    flat(upper, { stroke: COLORS.pos, "stroke-opacity": 0.4, "stroke-dasharray": "6 4" });
+    flat(fast, { stroke: COLORS.fast, "stroke-dasharray": "4 3" });
+    flat(typical, { stroke: COLORS.pos });
+    const cutoff = now - 30 * DAY2;
+    for (const p of pts) {
+      const out = !inRange(p.price);
+      svg.append(
+        s("circle", {
+          cx: x(p.ts),
+          cy: y(p.price),
+          r: 2.75,
+          fill: out ? "none" : COLORS.line,
+          stroke: out ? COLORS.line : "none",
+          "stroke-width": 1.25,
+          "fill-opacity": p.ts >= cutoff ? 0.9 : 0.4
+        })
+      );
+    }
+    const ring = s("circle", { r: 5, fill: "none", stroke: COLORS.marker, "stroke-width": 1.5, visibility: "hidden" });
+    svg.append(ring);
+    const idle = () => {
+      const last = pts[pts.length - 1];
+      readout.replaceChildren(
+        h("span", { class: "faint", text: `${pts.length} sales \xB7 last ` }),
+        h("span", { class: "num", text: fmt(last.price) }),
+        h("span", { class: "faint", text: ` on ${fmtDateTime(last.ts)} \xB7 hover a dot` })
+      );
+    };
+    hoverLayer(svg, {
+      x0: padL,
+      y0: padT,
+      w: iw,
+      h: ih,
+      onMove: (px, py) => {
+        const dist = (p) => Math.hypot(x(p.ts) - px, y(p.price) - py);
+        let best = pts[0];
+        for (const p of pts) if (dist(p) < dist(best)) best = p;
+        ring.setAttribute("cx", x(best.ts));
+        ring.setAttribute("cy", y(best.price));
+        ring.setAttribute("visibility", "visible");
+        readout.replaceChildren(
+          h("span", { class: "num", text: `${fmtDateTime(best.ts)}  ` }),
+          h("span", { class: "num strong", text: fmt(best.price) }),
+          okNum(best.float) ? h("span", { class: "faint num", text: `  float ${best.float.toFixed(4)}` }) : null,
+          okNum(typical) ? h("span", { class: ["num", signClass(best.price - typical)], text: `  ${fmtPct(best.price / typical - 1, 1, { sign: true })} vs typical` }) : null
+        );
+      },
+      onLeave: () => {
+        ring.setAttribute("visibility", "hidden");
+        idle();
+      }
+    });
+    idle();
+    const legend = h(
+      "div",
+      { class: "legend" },
+      okNum(typical) ? h("span", null, h("i", { class: "ln", style: { borderTopColor: COLORS.pos } }), `Typical ${fmt(typical)}`) : null,
+      okNum(fast) ? h("span", null, h("i", { class: "ln dash", style: { borderTopColor: COLORS.fast } }), `Fast sale ${fmt(fast)}`) : null,
+      okNum(upper) ? h("span", null, h("i", { class: "ln dash", style: { borderTopColor: COLORS.pos, opacity: 0.5 } }), `Upper group ${fmt(upper)}`) : null,
+      okNum(base) ? h("span", null, h("i", { class: "ln dot", style: { borderTopColor: COLORS.diag } }), `CSFloat base ${fmt(base)}`) : null
+    );
+    return h("div", { class: "chart" }, readout, svg, legend);
+  }
 
   // src/ui/views-v2.js
-  var ok2 = (v) => typeof v === "number" && Number.isFinite(v);
-  var numOrNull2 = (v) => v === null || v === void 0 || v === "" ? null : ok2(Number(v)) ? Number(v) : null;
+  var ok3 = (v) => typeof v === "number" && Number.isFinite(v);
+  var numOrNull3 = (v) => v === null || v === void 0 || v === "" ? null : ok3(Number(v)) ? Number(v) : null;
   var settledUpgrade = (e) => e && e.kind === "upgrade" && e.status !== "pending";
-  var rtpOf = (roi) => ok2(roi) ? 1 + roi : null;
-  var rtpCI = (ci) => Array.isArray(ci) && ok2(ci[0]) && ok2(ci[1]) ? [ci[0] + 1, ci[1] + 1] : null;
+  var rtpOf = (roi) => ok3(roi) ? 1 + roi : null;
+  var rtpCI = (ci) => Array.isArray(ci) && ok3(ci[0]) && ok3(ci[1]) ? [ci[0] + 1, ci[1] + 1] : null;
   function rtpCell(rtp, ci) {
     return h(
       "td",
       { class: "num" },
-      h("span", { class: ok2(rtp) ? signClass(rtp - 1) : "", text: fmtPct(rtp, 1) }),
+      h("span", { class: ok3(rtp) ? signClass(rtp - 1) : "", text: fmtPct(rtp, 1) }),
       ci ? h("span", { class: "ci", text: fmtCI(ci) }) : null
     );
   }
@@ -2979,7 +3963,7 @@ option { background: var(--surface); color: var(--text); }
                   h("td", { class: "num" }, fmtPct(r.winRate, 1), r.winRateCI ? h("span", { class: "ci", text: fmtCI(r.winRateCI) }) : null),
                   h("td", {
                     class: "num",
-                    text: ok2(r.winRate) && r.expectedRate > 0 ? fmtMult(r.winRate / r.expectedRate) : DASH
+                    text: ok3(r.winRate) && r.expectedRate > 0 ? fmtMult(r.winRate / r.expectedRate) : DASH
                   }),
                   rtpCell(r.realRtp, null),
                   h("td", null, sigBadge(r))
@@ -3038,7 +4022,7 @@ option { background: var(--surface); color: var(--text); }
       h(
         "div",
         { class: "v num" },
-        h("span", { class: ok2(m.winRate) && ok2(m.expectedRate) ? signClass(m.winRate - m.expectedRate) : "", text: `${fmtPct(m.winRate, 1)} won` }),
+        h("span", { class: ok3(m.winRate) && ok3(m.expectedRate) ? signClass(m.winRate - m.expectedRate) : "", text: `${fmtPct(m.winRate, 1)} won` }),
         h("span", { class: "muted", text: `  vs ${fmtPct(m.expectedRate, 1)} shown` })
       ),
       h("div", { class: "s num", text: `RTP ${fmtPct(m.rtp, 1)} \xB7 z = ${fmtZ(m.z)}, ${fmtPEq(m.p)}` })
@@ -3054,7 +4038,7 @@ option { background: var(--surface); color: var(--text); }
     const shown = sd.shown || {};
     const notShown = sd.notShown || {};
     const hits = sd.hits || {};
-    const cardWins = shown.n > 0 && ok2(shown.p) && shown.p < 0.05;
+    const cardWins = shown.n > 0 && ok3(shown.p) && shown.p < 0.05;
     const verdict = !shown.n ? "The card has not appeared on your upgrades yet." : cardWins && shown.winRate > shown.expectedRate ? `With the card shown you win more often than the shown chance (${fmtPct(shown.winRate, 0)} vs ${fmtPct(shown.expectedRate, 0)}). That is why these upgrades are left out of the odds tests.` : cardWins ? `With the card shown you win less often than the shown chance (${fmtPct(shown.winRate, 0)} vs ${fmtPct(shown.expectedRate, 0)}).` : "With the card shown, your win rate is within random noise of the shown chance.";
     return h(
       "section",
@@ -3101,7 +4085,7 @@ option { background: var(--surface); color: var(--text); }
             "div",
             null,
             h("div", { class: "cap", text: "Mystery RTP" }),
-            h("div", { class: ["big", "num", ok2(rtp) ? signClass(rtp - 1) : ""], text: fmtPct(rtp, 1) }),
+            h("div", { class: ["big", "num", ok3(rtp) ? signClass(rtp - 1) : ""], text: fmtPct(rtp, 1) }),
             ci ? h("div", { class: "cap num", text: `95% range ${fmtCI(ci)}`, style: { marginTop: "4px" } }) : null
           ),
           h(
@@ -3121,7 +4105,7 @@ option { background: var(--surface); color: var(--text); }
         ),
         h("p", {
           class: "hint",
-          text: `RTP is what you got back per unit staked. ${ok2(rtp) && rtp < 1 ? `On average a mystery upgrade returned ${fmtPct(rtp, 0)} of its stake.` : ""} Hit rate is the share that gave back at least the stake.`
+          text: `RTP is what you got back per unit staked. ${ok3(rtp) && rtp < 1 ? `On average a mystery upgrade returned ${fmtPct(rtp, 0)} of its stake.` : ""} Hit rate is the share that gave back at least the stake.`
         })
       )
     );
@@ -3167,7 +4151,7 @@ option { background: var(--surface); color: var(--text); }
     return out;
   }
   function mysteryTest(t) {
-    if (!t || !ok2(t.p)) {
+    if (!t || !ok3(t.p)) {
       return h(
         "div",
         { class: "callout neutral" },
@@ -3175,7 +4159,7 @@ option { background: var(--surface); color: var(--text); }
         h("p", { class: "detail", text: "Treat differences between stake sizes as random noise for now." })
       );
     }
-    const df = Array.isArray(t.df) ? t.df.map((d) => fmtInt(d)).join(", ") : ok2(t.df) ? fmtInt(t.df) + (ok2(t.dfWithin) ? `, ${fmtInt(t.dfWithin)}` : "") : null;
+    const df = Array.isArray(t.df) ? t.df.map((d) => fmtInt(d)).join(", ") : ok3(t.df) ? fmtInt(t.df) + (ok3(t.dfWithin) ? `, ${fmtInt(t.dfWithin)}` : "") : null;
     const method = /^anova$/i.test(String(t.method || "")) ? "ANOVA" : t.method || "Test";
     const line = `${method}: statistic = ${fmtNumber(t.statistic, 2)}${df ? `, df = ${df}` : ""}, ${fmtPEq(t.p)}`;
     if (t.p >= 0.05) {
@@ -3204,8 +4188,8 @@ option { background: var(--surface); color: var(--text); }
     const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render } = ctx2;
     const ev = state.events;
     const hv = state.holdings || {};
-    const balance = numOrNull2(hv.balance);
-    const inventoryValue = numOrNull2(hv.inventoryValue);
+    const balance = numOrNull3(hv.balance);
+    const inventoryValue = numOrNull3(hv.inventoryValue);
     const hasFlow = ev.some((e) => e && (e.kind === "deposit" || e.kind === "withdrawal"));
     if (!hasFlow) {
       const held = balance === null && inventoryValue === null ? "" : ` You hold ${fmtMoney((balance || 0) + (inventoryValue || 0), cur())} right now.`;
@@ -3222,7 +4206,7 @@ option { background: var(--surface); color: var(--text); }
     const wd = mf.withdrawals || {};
     const c = cur();
     const out = [];
-    const holdingsKnown = ok2(mf.holdings);
+    const holdingsKnown = ok3(mf.holdings);
     out.push(
       h(
         "section",
@@ -3253,12 +4237,12 @@ option { background: var(--surface); color: var(--text); }
         state.holdingsError ? errorBox(state.holdingsError, "Could not read holdings") : null,
         dep.n ? h("p", {
           class: "hint",
-          text: `Deposits from ${fmtDate(dep.firstTs)} to ${fmtDate(dep.lastTs)}${ok2(dep.perDay) ? `, about ${fmtMoney(dep.perDay, c)} per day` : ""}. Failed and expired payments are not counted as money in.`
+          text: `Deposits from ${fmtDate(dep.firstTs)} to ${fmtDate(dep.lastTs)}${ok3(dep.perDay) ? `, about ${fmtMoney(dep.perDay, c)} per day` : ""}. Failed and expired payments are not counted as money in.`
         }) : null
       )
     );
-    const series = Array.isArray(mf.series) ? mf.series.filter((p) => p && ok2(p.ts) && ok2(p.cumulativeNet)) : [];
-    const approx = wd.n > 0 && ok2(wd.exactTimeN) && wd.exactTimeN < wd.n;
+    const series = Array.isArray(mf.series) ? mf.series.filter((p) => p && ok3(p.ts) && ok3(p.cumulativeNet)) : [];
+    const approx = wd.n > 0 && ok3(wd.exactTimeN) && wd.exactTimeN < wd.n;
     if (series.length) {
       out.push(
         h(
@@ -3318,7 +4302,7 @@ option { background: var(--surface); color: var(--text); }
     return out;
   }
   function num2(v) {
-    return ok2(v) ? v : Number(v) || 0;
+    return ok3(v) ? v : Number(v) || 0;
   }
 
   // src/ui/dashboard.js
@@ -3357,10 +4341,10 @@ option { background: var(--surface); color: var(--text); }
     chance: { storeKey: "cst.ui.edges.chance", def: [0, 2, 5, 10, 20, 30, 50, 75, 100], allowInf: false },
     stake: { storeKey: "cst.ui.edges.stake", def: [0, 100, 500, 1e3, 5e3, 2e4, Infinity], allowInf: true }
   };
-  var ok3 = (v) => typeof v === "number" && Number.isFinite(v);
-  var num3 = (v) => ok3(v) ? v : Number(v) || 0;
-  function edgesToText(arr2) {
-    return arr2.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
+  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
+  var num3 = (v) => ok4(v) ? v : Number(v) || 0;
+  function edgesToText(arr3) {
+    return arr3.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
   }
   function parseEdges(text, allowInf) {
     const parts = String(text || "").split(/[,;\s]+/).filter(Boolean);
@@ -3439,7 +4423,8 @@ option { background: var(--surface); color: var(--text); }
       pendingFocus: null,
       holdings: null,
       holdingsError: null,
-      dailyAll: false
+      dailyAll: false,
+      accounts: null
     };
     for (const kind of ["chance", "stake"]) {
       const cfg = EDGE_CFG[kind];
@@ -3460,7 +4445,6 @@ option { background: var(--surface); color: var(--text); }
       if (typeof stats[name] !== "function") throw new Error(`stats.${name} is missing`);
       return stats[name](...args);
     };
-    const netEl = h("span", { class: "net num", text: DASH });
     const launcher = h(
       "button",
       {
@@ -3472,13 +4456,14 @@ option { background: var(--surface); color: var(--text); }
         on: { click: () => state.open ? close() : open() }
       },
       h("span", { class: "mark", "aria-hidden": "true" }),
-      h("span", { class: "label", text: "Stats" }),
-      netEl
+      h("span", { class: "label", text: "Stats" })
     );
     const titleEl = h("h2", { class: "title", id: "cst-title", text: "Case and upgrade stats" });
     const subEl = h("div", { class: "sub" });
+    const acctEl = h("div", { class: "acct", hidden: true });
+    let acctShown = "";
     const closeBtn = h("button", { type: "button", class: "iconbtn", "aria-label": "Close stats panel", on: { click: () => close() } }, iconClose());
-    const head = h("div", { class: "head" }, h("div", null, titleEl, subEl), closeBtn);
+    const head = h("div", { class: "head" }, h("div", null, titleEl, subEl, acctEl), closeBtn);
     const tabsEl = h("div", { class: "tabs", role: "tablist", "aria-label": "Stats sections" });
     const tabBtns = {};
     for (const [id, label] of TABS) {
@@ -3585,6 +4570,7 @@ option { background: var(--surface); color: var(--text); }
       } catch (e) {
         state.loadError = e;
       }
+      if (typeof o.getAccounts === "function") state.accounts = safe(() => o.getAccounts()).value || null;
       if (typeof o.getHoldings === "function") {
         try {
           const hv = await o.getHoldings();
@@ -3597,7 +4583,6 @@ option { background: var(--surface); color: var(--text); }
       state.loading = false;
       state.loaded = true;
       state.cache.clear();
-      updateLauncher();
       if (state.open) render();
       if (state.again) {
         state.again = false;
@@ -3605,20 +4590,6 @@ option { background: var(--surface); color: var(--text); }
       }
     }
     const refresh = debounce(doRefresh, 250);
-    function updateLauncher() {
-      const c = cur();
-      if (!state.events.length) {
-        netEl.textContent = "no data";
-        netEl.className = "net num muted";
-        launcher.setAttribute("aria-label", "Open stats panel. No events recorded yet.");
-        return;
-      }
-      const sum = memo("summary", () => call("summarize", state.events));
-      const net = sum.value && sum.value.total ? sum.value.total.net : null;
-      netEl.textContent = fmtMoney(net, c, { sign: true });
-      netEl.className = `net num ${signClass(net)}`;
-      launcher.setAttribute("aria-label", `Open stats panel. Total net ${fmtMoney(net, c, { sign: true })}.`);
-    }
     function contentWidth() {
       const cs = getComputedStyle(body);
       return body.clientWidth - parseFloat(cs.paddingLeft || "0") - parseFloat(cs.paddingRight || "0");
@@ -3639,6 +4610,7 @@ option { background: var(--surface); color: var(--text); }
         if (last === null || ts > last) last = ts;
       }
       subEl.textContent = !state.loaded ? "Loading\u2026" : n ? `${fmtInt(n)} events, ${fmtDate(first)} ${DASH} ${fmtDate(last)}` : "No events recorded yet";
+      renderAccounts();
       for (const [id] of TABS) {
         const sel = id === state.tab;
         tabBtns[id].setAttribute("aria-selected", String(sel));
@@ -3683,6 +4655,38 @@ option { background: var(--surface); color: var(--text); }
         }
       }
       state.pendingFocus = null;
+    }
+    function renderAccounts() {
+      const a = state.accounts;
+      const list = a && Array.isArray(a.list) ? a.list : [];
+      const show = list.length > 1;
+      const value = a && a.selected != null ? String(a.selected) : "all";
+      const sig = show ? JSON.stringify([value, list.map((x) => [x.id, x.name, x.events, x.current])]) : "";
+      if (sig === acctShown) return;
+      acctShown = sig;
+      acctEl.hidden = !show;
+      if (!show) {
+        acctEl.replaceChildren();
+        return;
+      }
+      const current = list.find((x) => x.current);
+      const label = (x) => `${x.name}${x.current ? " (signed in)" : ""}, ${fmtInt(x.events)} events`;
+      const select = h(
+        "select",
+        {
+          "aria-label": "Account",
+          title: "Which site account the stats are for",
+          on: {
+            change: (e) => {
+              const v = e.target.value;
+              safe(() => o.selectAccount(current && v === current.id ? "current" : v));
+            }
+          }
+        },
+        list.map((x) => h("option", { value: x.id, selected: x.id === value, text: label(x) })),
+        h("option", { value: "all", selected: value === "all", text: "All accounts" })
+      );
+      acctEl.replaceChildren(select);
     }
     function errorBox(err, prefix = "Could not compute this view") {
       return h("div", { class: "error", role: "alert", text: `${prefix}: ${err && err.message || err}` });
@@ -3862,7 +4866,7 @@ option { background: var(--surface); color: var(--text); }
           "p",
           { class: "detail" },
           `z = ${fmtZ(r.z)}, ${fmtPEq(r.p)}`,
-          ok3(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
+          ok4(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
         ),
         r.n < 30 ? h("p", { class: "detail", text: "Fewer than 30 upgrades: this check is weak for now." }) : null
       );
@@ -4145,7 +5149,7 @@ option { background: var(--surface); color: var(--text); }
             h(
               "td",
               { class: "num" },
-              h("span", { class: ok3(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
+              h("span", { class: ok4(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
               r.realRtpCI ? h("span", { class: "ci", text: fmtCI(r.realRtpCI) }) : null
             )
           )
@@ -4225,10 +5229,10 @@ option { background: var(--surface); color: var(--text); }
         return out;
       }
       const isUp = kind === "upgrade";
-      const hasAdj = isUp && rows.some((x) => ok3(x.zAdj));
+      const hasAdj = isUp && rows.some((x) => ok4(x.zAdj));
       out.push(h("section", null, testCallout(r.test, kind, fdef)));
       if (hasAdj) {
-        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok3(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
+        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok4(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
         out.push(
           h(
             "section",
@@ -4253,14 +5257,14 @@ option { background: var(--surface); color: var(--text); }
         const bars = rows.map((x) => {
           if (isUp) {
             const e = num3(x.expectedRate);
-            if (!(e > 0) || !ok3(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
+            if (!(e > 0) || !ok4(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
             const ci2 = x.winRateCI || [];
             return {
               label: x.label ?? x.value,
               n: x.n,
               value: x.winRate / e - 1,
-              lo: ok3(ci2[0]) ? ci2[0] / e - 1 : null,
-              hi: ok3(ci2[1]) ? ci2[1] / e - 1 : null,
+              lo: ok4(ci2[0]) ? ci2[0] / e - 1 : null,
+              hi: ok4(ci2[1]) ? ci2[1] / e - 1 : null,
               significant: !!x.significant
             };
           }
@@ -4329,7 +5333,7 @@ option { background: var(--surface); color: var(--text); }
       return out;
     }
     function zCell(z, significant, n) {
-      if (!ok3(z)) return h("td", { class: "num faint", text: DASH });
+      if (!ok4(z)) return h("td", { class: "num faint", text: DASH });
       let badge;
       if (!(n >= 10)) badge = h("span", { class: "badge", text: "Too few" });
       else if (significant) badge = h("span", { class: ["badge", z < 0 ? "bad" : "good"], text: z < 0 ? "Below" : "Above" });
@@ -4337,7 +5341,7 @@ option { background: var(--surface); color: var(--text); }
       return h("td", { class: "num" }, `z ${fmtNumber(z, 2, { sign: true })}`, h("span", { class: "second" }, badge));
     }
     function testCallout(t, kind, fdef) {
-      if (!t || !ok3(t.p)) {
+      if (!t || !ok4(t.p)) {
         return h(
           "div",
           { class: "callout neutral" },
@@ -4347,9 +5351,9 @@ option { background: var(--surface); color: var(--text); }
       }
       const isUp = kind === "upgrade";
       const statName = isUp ? "\u03C7\xB2" : "Test statistic";
-      const dfText = ok3(t.df) ? `, df = ${fmtInt(t.df)}` : "";
+      const dfText = ok4(t.df) ? `, df = ${fmtInt(t.df)}` : "";
       const shownLine = `${statName} = ${fmtNumber(t.statistic, 2)}${dfText}, ${fmtPEq(t.p)}`;
-      const useAdj = isUp && ok3(t.pAdj);
+      const useAdj = isUp && ok4(t.pAdj);
       const sig = useAdj ? typeof t.significantAdj === "boolean" ? t.significantAdj : t.pAdj < 0.05 : !!t.significant;
       const lines = useAdj ? [
         `Adjusted for the real odds curve: ${statName} = ${fmtNumber(t.statisticAdj, 2)}${dfText}, ${fmtPEq(t.pAdj)}.`,
@@ -4414,6 +5418,114 @@ option { background: var(--surface); color: var(--text); }
       render();
       doRefresh();
     }
+    function cloudSection(cl, btn) {
+      const on = !!cl.key;
+      const sec = h("section", null, h("h3", { text: "Sync between browsers" }));
+      if (!on) {
+        const keyInput = h("input", {
+          type: "text",
+          class: "key-input",
+          placeholder: "Paste the sync key from your other browser",
+          autocomplete: "off",
+          spellcheck: "false",
+          "aria-label": "Sync key",
+          "data-fk": "cloud-key-input",
+          value: state.cloudKeyDraft || "",
+          on: { input: (e) => state.cloudKeyDraft = e.target.value }
+        });
+        sec.append(
+          h("p", {
+            class: "hint",
+            text: "Keeps one history in every browser you use (Brave, Chrome, another PC). Your events are stored in the tracker's cloud database under a secret key. Start in one browser, then paste the key in the others."
+          }),
+          h(
+            "div",
+            { class: "btns" },
+            btn(
+              "cloud-start",
+              "Start cloud sync",
+              "primary",
+              () => run("cloud-start", () => o.onCloudStart(), () => "Cloud sync is on. Copy the key into your other browsers.")
+            )
+          ),
+          h(
+            "div",
+            { class: "btns key-row" },
+            keyInput,
+            btn(
+              "cloud-join",
+              "Use key",
+              "",
+              () => run("cloud-join", () => o.onCloudJoin(state.cloudKeyDraft), (r) => {
+                state.cloudKeyDraft = "";
+                return `Cloud sync is on. ${fmtInt(num3(r && r.added))} events came from your other browsers.`;
+              })
+            )
+          )
+        );
+        return sec;
+      }
+      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok4(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
+      const shown = state.cloudKeyShown ? h("input", {
+        type: "text",
+        readonly: true,
+        class: "key-input key-shown",
+        value: cl.key,
+        "aria-label": "Sync key",
+        "data-fk": "cloud-key-shown",
+        spellcheck: "false",
+        on: { focus: (e) => e.target.select(), click: (e) => e.target.select() }
+      }) : `${cl.key.slice(0, 4)}${"\u2022".repeat(12)}`;
+      sec.append(
+        h(
+          "dl",
+          { class: "status" },
+          h("dt", { text: "Cloud" }),
+          h("dd", { class: cl.state === "error" ? "neg" : null }, h("span", { class: ["dot", cl.state === "error" ? "off" : "on"], "aria-hidden": "true" }), stateText),
+          h("dt", { text: "Sync key" }),
+          h("dd", { class: "num key-text" }, shown)
+        ),
+        h(
+          "div",
+          { class: "btns" },
+          btn("cloud-copy", "Copy key", "primary", () => {
+            const done = (text, tone) => {
+              state.msg = { text, tone };
+              state.pendingFocus = "cloud-copy";
+              render();
+            };
+            const copied = () => done("Key copied. Paste it in Data \u2192 Sync between browsers in your other browser.", "pos");
+            const failed = () => {
+              state.cloudKeyShown = true;
+              done("Could not copy. The key is shown in the box above: click it, then press Ctrl+C.", "neg");
+            };
+            if (typeof o.copyText === "function" && safe(() => o.copyText(cl.key)).value === true) copied();
+            else {
+              try {
+                navigator.clipboard.writeText(cl.key).then(copied, failed);
+              } catch {
+                failed();
+              }
+            }
+          }),
+          btn("cloud-show", state.cloudKeyShown ? "Hide key" : "Show key", "", () => {
+            state.cloudKeyShown = !state.cloudKeyShown;
+            state.pendingFocus = "cloud-show";
+            render();
+          }),
+          btn("cloud-sync", "Sync now", "", () => run("cloud-sync", () => o.onCloudSync(), (r) => `Cloud sync done: ${fmtInt(num3(r && r.added))} new events.`), {
+            busyLabel: "Syncing\u2026",
+            disabled: cl.state === "syncing"
+          }),
+          btn("cloud-stop", "Stop", "", () => run("cloud-stop", () => o.onCloudStop(), () => "Cloud sync is off in this browser. The cloud copy is kept."))
+        ),
+        h("p", {
+          class: "hint",
+          text: "Anyone with this key can read and change your history, so keep it private. Checks for new events every minute while the tab is open."
+        })
+      );
+      return sec;
+    }
     function viewData() {
       const ev = state.events;
       const c = cur();
@@ -4422,6 +5534,8 @@ option { background: var(--surface); color: var(--text); }
       const nUp = ev.filter((e) => e.kind === "upgrade").length;
       const nDep = ev.filter((e) => e.kind === "deposit").length;
       const nWd = ev.filter((e) => e.kind === "withdrawal").length;
+      const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
+      const totalEvents = state.accounts && ok4(state.accounts.total) ? state.accounts.total : ev.length;
       const busy = !!state.busy;
       const btn = (name, label, cls, onClick, extra = {}) => h("button", {
         type: "button",
@@ -4467,9 +5581,9 @@ option { background: var(--surface); color: var(--text); }
               text: `${fmtInt(ev.length)} (${fmtInt(nCase)} case drops, ${fmtInt(nUp)} upgrades${nDep ? `, ${fmtInt(nDep)} deposits` : ""}${nWd ? `, ${fmtInt(nWd)} withdrawals` : ""})`
             }),
             h("dt", { text: "Last event" }),
-            h("dd", { class: "num", text: ok3(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
+            h("dd", { class: "num", text: ok4(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
             h("dt", { text: "Last sync" }),
-            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok3(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
+            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok4(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
             h("dt", { text: "Storage", title: "Whether the browser promised not to clear the stored history on its own" }),
             h("dd", { text: st.storagePersisted === true ? "Kept by the browser" : st.storagePersisted === false ? "Browser may clear it when space runs low" : DASH }),
             h("dt", { text: "Unknown responses", title: "Site responses the parser did not recognise" }),
@@ -4503,6 +5617,38 @@ option { background: var(--surface); color: var(--text); }
           })
         )
       );
+      if (st.cloud && typeof o.onCloudStart === "function") out.push(cloudSection(st.cloud, btn));
+      const settings = safe(() => o.getSettings ? o.getSettings() : null).value;
+      if (settings && typeof o.setSetting === "function") {
+        out.push(
+          h(
+            "section",
+            null,
+            h("h3", { text: "Panels" }),
+            h(
+              "label",
+              { class: "switch" },
+              h("input", {
+                type: "checkbox",
+                checked: !!settings.upgradeOverlay,
+                "data-fk": "set-overlay",
+                on: {
+                  change: (e) => {
+                    safe(() => o.setSetting("upgradeOverlay", e.target.checked));
+                    state.pendingFocus = "set-overlay";
+                    render();
+                  }
+                }
+              }),
+              h("span", { text: "Upgrade odds card on the upgrade page" })
+            ),
+            h("p", {
+              class: "hint",
+              text: "Shows odds, EV and your real win rate for the selected upgrade. It recomputes over your whole history, so turn it off if the upgrade page lags."
+            })
+          )
+        );
+      }
       const exp = (format) => {
         try {
           if (typeof o.onExport !== "function") throw new Error("not available");
@@ -4522,9 +5668,10 @@ option { background: var(--surface); color: var(--text); }
           h(
             "div",
             { class: "btns" },
-            btn("export-json", "Export JSON", "", () => exp("json"), { disabled: !ev.length }),
-            btn("export-csv", "Export CSV", "", () => exp("csv"), { disabled: !ev.length })
-          )
+            btn("export-json", "Export JSON", "", () => exp("json"), { disabled: !totalEvents }),
+            btn("export-csv", "Export CSV", "", () => exp("csv"), { disabled: !totalEvents })
+          ),
+          nAccounts > 1 ? h("p", { class: "hint", text: "Exports hold the events of every account. Each event keeps its account id." }) : null
         )
       );
       const clearSection = h(
@@ -4540,7 +5687,7 @@ option { background: var(--surface); color: var(--text); }
             state.pendingFocus = "clear-cancel";
             render();
           },
-          { disabled: !ev.length || state.confirmClear }
+          { disabled: !totalEvents || state.confirmClear }
         )
       );
       if (state.confirmClear) {
@@ -4550,7 +5697,7 @@ option { background: var(--surface); color: var(--text); }
             { class: "confirm", role: "alertdialog", "aria-labelledby": "cst-confirm-text" },
             h("p", {
               id: "cst-confirm-text",
-              text: `Delete all ${fmtInt(ev.length)} recorded events from this browser? This cannot be undone. Export first if you want a backup.`
+              text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ""} from this browser? This cannot be undone. Export first if you want a backup.`
             }),
             h(
               "div",
@@ -4572,8 +5719,6 @@ option { background: var(--surface); color: var(--text); }
       out.push(h("p", { class: ["msg", state.msg && state.msg.tone], role: "status", "aria-live": "polite", text: state.msg ? state.msg.text : "" }));
       return out;
     }
-    updateLauncher();
-    netEl.textContent = "\u2026";
     doRefresh();
     return {
       refresh,
@@ -4595,16 +5740,16 @@ option { background: var(--surface); color: var(--text); }
   var MIN_HISTORY = 30;
   var REAL_MIN_N = 100;
   function curveRowFor(rows, chance) {
-    if (!Array.isArray(rows) || !ok4(chance)) return null;
+    if (!Array.isArray(rows) || !ok5(chance)) return null;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
-      if (!r || !ok4(r.lo) || !ok4(r.hi)) continue;
+      if (!r || !ok5(r.lo) || !ok5(r.hi)) continue;
       const last = i === rows.length - 1;
       if (chance >= r.lo && (chance < r.hi || last && chance <= r.hi)) return r;
     }
     return null;
   }
-  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
+  var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
   function icon(d) {
     return s(
       "svg",
@@ -4615,21 +5760,22 @@ option { background: var(--surface); color: var(--text); }
   var GRIP = "M6 4h.01M10 4h.01M6 8h.01M10 8h.01M6 12h.01M10 12h.01";
   var CHEVRON_UP = "M4 10l4-4 4 4";
   var CHEVRON_DOWN = "M4 6l4 4 4-4";
+  var CLOSE = "M4.5 4.5l7 7M11.5 4.5l-7 7";
   function verdictFor(q, stake, currency, real = null, targetPrice = null) {
-    if (real && ok4(real.rate) && ok4(targetPrice)) {
+    if (real && ok5(real.rate) && ok5(targetPrice)) {
       const perTry = real.rate * targetPrice - stake;
-      const sub2 = ok4(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
+      const sub2 = ok5(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
-    if (ok4(q.realEdge)) {
+    if (ok5(q.realEdge)) {
       const perTry = q.realEdge * stake;
       const sub2 = "Based on your own upgrades at similar chances.";
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
     const sub = `By the shown odds only. Your real results here are unknown until ${MIN_HISTORY} upgrades at similar chances.`;
-    if (!ok4(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
+    if (!ok5(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
     return q.ev < 0 ? { text: `On average you lose ${fmtMoney(-q.ev, currency)} per try at these odds.`, tone: "neg", sub } : { text: `The shown odds promise ${fmtMoney(q.ev, currency)} per try on average.`, tone: "", sub };
   }
   var pctCapped = (p) => p > 0.99 ? ">99%" : p < 0.01 ? "<1%" : fmtPct(p, 0);
@@ -4643,7 +5789,7 @@ option { background: var(--surface); color: var(--text); }
     const t = OUTLOOK_TEXT[ol.verdict];
     const ctx2 = ol.context || {};
     const kellyEl = kellyLine(ol, currency, balance);
-    const since = ctx2.minutesSinceDeposit === null || !ok4(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
+    const since = ctx2.minutesSinceDeposit === null || !ok5(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
     const rows = [];
     for (const w of ol.windows || []) {
       const cur = w.key === (ol.window && ol.window.key);
@@ -4687,7 +5833,7 @@ option { background: var(--surface); color: var(--text); }
     if (!(k.half > 0)) {
       return h("p", { class: "ol-kelly", text: "Suggested stake: 0 \u2014 skip this one." });
     }
-    const amount = ok4(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
+    const amount = ok5(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
     return h(
       "p",
       { class: "ol-kelly", title: "Half-Kelly: the stake that grows a bankroll fastest for this edge, halved because the real chance is an estimate" },
@@ -4712,7 +5858,7 @@ option { background: var(--surface); color: var(--text); }
     root.append(wrap);
     let collapsed = !!store.get(COLLAPSED_KEY, false);
     let pos = store.get(POS_KEY, null);
-    if (!pos || !ok4(pos.x) || !ok4(pos.y)) pos = null;
+    if (!pos || !ok5(pos.x) || !ok5(pos.y)) pos = null;
     const grip = h("button", { type: "button", class: "iconbtn grip", "aria-label": "Move card. Use arrow keys, hold Shift for bigger steps." }, icon(GRIP));
     const toggle = h("button", {
       type: "button",
@@ -4726,7 +5872,8 @@ option { background: var(--surface); color: var(--text); }
         }
       }
     });
-    const bar = h("div", { class: "bar" }, grip, h("span", { class: "ttl", text: "Upgrade odds" }), toggle);
+    const off = typeof o.onTurnOff === "function" ? h("button", { type: "button", class: "iconbtn", "aria-label": "Turn off upgrade odds", title: "Turn off. Turn it back on in Stats, Data tab.", on: { click: () => o.onTurnOff() } }, icon(CLOSE)) : null;
+    const bar = h("div", { class: "bar" }, grip, h("span", { class: "ttl", text: "Upgrade odds" }), toggle, off);
     const content = h("div", { class: "content", id: "cst-overlay-content" });
     const card = h("div", { class: "card", role: "region", "aria-label": "Upgrade odds", hidden: true }, bar, content);
     wrap.append(card);
@@ -4858,7 +6005,7 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const input = { stake, targetPrice };
-      if (ok4(sel.chanceShown)) input.chanceShown = sel.chanceShown;
+      if (ok5(sel.chanceShown)) input.chanceShown = sel.chanceShown;
       const qKey = `${stake}|${targetPrice}|${input.chanceShown}|${version}`;
       const res = quoteCache && quoteCache.key === qKey ? quoteCache.res : safe(() => {
         if (typeof stats.upgradeQuote !== "function") throw new Error("stats.upgradeQuote is missing");
@@ -4870,9 +6017,9 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const q = res.value;
-      const chance = ok4(q.chanceShown) ? q.chanceShown : ok4(sel.chanceShown) ? sel.chanceShown : null;
+      const chance = ok5(q.chanceShown) ? q.chanceShown : ok5(sel.chanceShown) ? sel.chanceShown : null;
       const row = curveRowFor(curveRows, chance);
-      const real = row && row.n >= REAL_MIN_N && ok4(row.winRate) && ok4(chance) ? {
+      const real = row && row.n >= REAL_MIN_N && ok5(row.winRate) && ok5(chance) ? {
         rate: row.expectedRate > 0 ? Math.min(1, chance / 100 * (row.winRate / row.expectedRate)) : row.winRate,
         bucketRate: row.winRate,
         bucketShown: row.expectedRate,
@@ -4906,7 +6053,7 @@ option { background: var(--surface); color: var(--text); }
           h("span", { class: "ci", text: `${fmtPct(q.evPct, 1, { sign: true })} of stake` })
         ),
         h("dt", { text: "Real edge", title: "From your history at similar chances: real return minus 1" }),
-        ok4(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
+        ok5(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
         h("dt", { text: "Your similar tries", title: "Same chance bucket and same stake bucket" }),
         sim.n ? h(
           "dd",
@@ -4924,7 +6071,7 @@ option { background: var(--surface); color: var(--text); }
           "div",
           { class: "line" },
           h("span", { text: "5\u201395% range" }),
-          h("span", { class: "num", text: ok4(lr.p05) && ok4(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
+          h("span", { class: "num", text: ok5(lr.p05) && ok5(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
         ),
         h("div", { class: "line" }, h("span", { text: "Chance to end in profit" }), h("span", { class: "num", text: fmtPct(lr.probProfit, 0) }))
       );
@@ -4932,7 +6079,7 @@ option { background: var(--surface); color: var(--text); }
       let balance = null;
       try {
         const hv = o.getHoldings ? o.getHoldings() : null;
-        if (hv && ok4(hv.balance)) balance = hv.balance;
+        if (hv && ok5(hv.balance)) balance = hv.balance;
       } catch {
       }
       const olEl = ol.value ? outlookBlock(ol.value, c, balance) : null;
@@ -4956,11 +6103,530 @@ option { background: var(--surface); color: var(--text); }
     };
   }
 
+  // src/ui/casepanel.js
+  var COLLAPSED_KEY2 = "cst.ui.casePanelCollapsed";
+  var POLL_MS2 = 500;
+  function icon2(d) {
+    return s(
+      "svg",
+      { viewBox: "0 0 16 16", "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": 1.6, "stroke-linecap": "round", "stroke-linejoin": "round" },
+      s("path", { d })
+    );
+  }
+  var CHEVRON_UP2 = "M4 10l4-4 4 4";
+  var CHEVRON_DOWN2 = "M4 6l4 4 4-4";
+  function mountCasePanel(o) {
+    const cur = () => {
+      try {
+        return String((o.currency && o.currency()) ?? "");
+      } catch {
+        return "";
+      }
+    };
+    const { host, root } = createHost("caser-tracker-cases", 2147482980);
+    root.append(h("style", { text: BASE_CSS + CASE_PANEL_CSS }));
+    const wrap = h("div", { class: "root" });
+    root.append(wrap);
+    let collapsed = !!store.get(COLLAPSED_KEY2, false);
+    const toggle = h("button", {
+      type: "button",
+      class: "iconbtn",
+      "aria-controls": "cst-case-content",
+      on: {
+        click: () => {
+          collapsed = !collapsed;
+          store.set(COLLAPSED_KEY2, collapsed);
+          applyCollapsed();
+        }
+      }
+    });
+    const ttl = h("span", { class: "ttl", text: "Case contents" });
+    const bar = h("div", { class: "bar" }, ttl, toggle);
+    const content = h("div", { class: "content", id: "cst-case-content" });
+    const panel = h("div", { class: "cpanel", role: "region", "aria-label": "Case contents", hidden: true }, bar, content);
+    wrap.append(panel);
+    panel.addEventListener("keydown", (e) => e.stopPropagation());
+    function applyCollapsed() {
+      panel.classList.toggle("collapsed", collapsed);
+      content.hidden = collapsed;
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggle.setAttribute("aria-label", collapsed ? "Expand case contents" : "Collapse case contents");
+      toggle.replaceChildren(icon2(collapsed ? CHEVRON_DOWN2 : CHEVRON_UP2));
+    }
+    applyCollapsed();
+    let slug = null;
+    let loadId = 0;
+    async function load(forSlug) {
+      const id = ++loadId;
+      ttl.textContent = "Case contents";
+      content.replaceChildren(h("p", { class: "muted pad", text: "Loading items\u2026" }));
+      let info = null;
+      let error = null;
+      try {
+        info = await o.getInfo(forSlug);
+      } catch (e) {
+        error = e;
+      }
+      if (id !== loadId) return;
+      if (error || !info) {
+        content.replaceChildren(h("p", { class: "error pad", role: "alert", text: error ? `Could not load the case items: ${error.message || error}` : "The site sent no items for this case." }));
+        return;
+      }
+      const res = safe(() => o.stats.caseOdds(info));
+      if (res.error || !res.value) {
+        content.replaceChildren(h("p", { class: "error pad", role: "alert", text: "Could not compute the case outcomes." }));
+        return;
+      }
+      render(info, res.value);
+    }
+    function render(info, odds) {
+      const c = cur();
+      ttl.textContent = info.title;
+      const multText = (m) => m === null ? "" : fmtMult(m);
+      const outcome = (label, it) => h(
+        "div",
+        { class: "box" },
+        h("div", { class: "k", text: label }),
+        h("div", { class: "v num" }, it ? fmtMoney(it.price, c) : DASH, it && odds.casePrice > 0 ? h("span", { class: ["x", signClass(it.price - odds.casePrice)], text: multText(it.price / odds.casePrice) }) : null),
+        h("div", { class: "s", title: it ? it.name : "", text: it ? it.name : "" })
+      );
+      let evBox;
+      if (odds.hasChances) {
+        const ratio = odds.evRatio;
+        evBox = h(
+          "div",
+          { class: "box wide" },
+          h("div", { class: "k", text: "Expected value per open", title: "Sum of item price \xD7 the chance the site shows" }),
+          h(
+            "div",
+            { class: "v num" },
+            fmtMoney(odds.ev, c),
+            ratio !== null ? h("span", { class: ["x", signClass(ratio - 1)], text: `return ${fmtNumber(ratio, 3)}` }) : null
+          ),
+          h("div", { class: "s", text: odds.casePrice > 0 ? `${fmtMoney(odds.ev - odds.casePrice, c, { sign: true })} per open on average, by the site's chances.` : "Free case." })
+        );
+      } else {
+        evBox = h(
+          "div",
+          { class: "box wide" },
+          h("div", { class: "k", text: "Expected value per open" }),
+          h("div", { class: "v muted", text: "Not available" }),
+          h("div", { class: "s wrap", text: "The site does not publish drop chances for this case, only prices." })
+        );
+      }
+      const head = h(
+        "div",
+        { class: "sum" },
+        h("p", { class: "meta" }, `${fmtInt(odds.n)} items \xB7 case price `, h("b", { class: "num", text: odds.casePrice > 0 ? fmtMoney(odds.casePrice, c) : "free" })),
+        h("div", { class: "grid" }, outcome("Cheapest drop", odds.min), outcome("Best drop", odds.max), evBox)
+      );
+      const rows = odds.items.map(
+        (it) => h(
+          "li",
+          { class: "item" },
+          it.image ? h("img", { src: it.image, alt: "", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer" }) : h("span", { class: "noimg" }),
+          h("span", { class: "name", title: it.name, text: it.name }),
+          h(
+            "span",
+            { class: "r" },
+            h("span", { class: "price num", text: fmtMoney(it.price, c) }),
+            h("span", { class: "second num" }, it.mult !== null ? h("span", { class: signClass(it.mult - 1), text: fmtMult(it.mult) }) : null, odds.hasChances && it.mult !== null ? " \xB7 " : null, odds.hasChances ? fmtChance(it.chance, it.chance < 0.01 ? 4 : it.chance < 1 ? 3 : 2) : null)
+          )
+        )
+      );
+      const listHead = h("div", { class: "lhead" }, h("span", { text: "Item" }), h("span", { text: odds.hasChances ? "Price \xB7 \xD7case \xB7 chance" : "Price \xB7 \xD7case" }));
+      content.replaceChildren(head, listHead, h("ul", { class: "items" }, ...rows));
+    }
+    function tick() {
+      attach(host);
+      let next = null;
+      try {
+        next = o.getSlug();
+      } catch {
+        next = null;
+      }
+      if (next === slug) return;
+      slug = next;
+      if (!slug) {
+        loadId++;
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      load(slug);
+    }
+    const timer = setInterval(tick, POLL_MS2);
+    tick();
+    return {
+      destroy() {
+        clearInterval(timer);
+        host.remove();
+      }
+    };
+  }
+
+  // src/ui/exchangepanel.js
+  var COLLAPSED_KEY3 = "cst.ui.exchangeCollapsed";
+  var SORT_KEY = "cst.ui.exchangeSort";
+  var BASIS_KEY = "cst.ui.exchangeBasis";
+  var MIN_SALES_KEY = "cst.ui.exchangeMinSales";
+  var POLL_MS3 = 500;
+  var okNum2 = (v) => typeof v === "number" && Number.isFinite(v);
+  var usd = (v, opts) => okNum2(v) ? (v < 0 ? "\u2212$" : opts?.sign && v > 0 ? "+$" : "$") + fmtNumber(Math.abs(v), 2) : DASH;
+  var feePct = `${fmtNumber(CSFLOAT_SELLER_FEE * 100, 0)}%`;
+  function icon3(d) {
+    return s("svg", { viewBox: "0 0 16 16", "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": 1.6, "stroke-linecap": "round", "stroke-linejoin": "round" }, s("path", { d }));
+  }
+  var sold30 = (m) => `${fmtInt(m.sales30d)}${m.salesCapped ? "+" : ""}`;
+  function splitText(m) {
+    const sp = m?.split;
+    if (!sp) return null;
+    return `Two price groups: ${fmtPct(sp.lowShare, 0)} of sales at ${usd(sp.lowMin)}\u2013${usd(sp.lowMax)}, the rest at ${usd(sp.highMin)}\u2013${usd(sp.highMax)} (pattern, phase or float). Prices use the lower group; the upper group is upside you only see once you hold the item.`;
+  }
+  function sourceText(m) {
+    if (!m) return "";
+    if (m.source === "sales") return `median of ${m.used} ${m.split ? "lower-group " : ""}sales in the last ${m.windowDays} days`;
+    if (m.source === "reference") return "CSFloat base price (fewer than 3 recent sales)";
+    if (m.source === "last") return "last sale only";
+    return "no CSFloat sales";
+  }
+  function trendTag(m) {
+    if (!m || !okNum2(m.trend) || Math.abs(m.trend) < 0.01) return null;
+    return h("span", { class: signClass(m.trend), title: "Median of the last 14 days against days 14 to 90", text: `${m.trend > 0 ? "\u25B2" : "\u25BC"}${fmtPct(Math.abs(m.trend), 1)}` });
+  }
+  function detail(name, m, basis, width) {
+    if (!m) return h("div", { class: "detail" }, h("p", { class: "faint", text: "Loading CSFloat sales\u2026" }));
+    const stat = (k, v, extra) => h("div", { class: "st" }, h("div", { class: "k", text: k }), h("div", { class: "v num" }, v, extra ?? null));
+    const fmtRange = okNum2(m.low) && okNum2(m.high) ? `${usd(m.low)} \u2013 ${usd(m.high)}` : DASH;
+    return h(
+      "div",
+      { class: "detail" },
+      salesChart({ points: expandPoints(m.pts), typical: m.source === "sales" ? m.value : null, fast: m.source === "sales" ? m.quick : null, base: m.basePrice, upper: m.split?.upper ?? null, width, height: 130 }),
+      m.split ? h("p", { class: "warnline", text: splitText(m) }) : null,
+      h(
+        "div",
+        { class: "stats" },
+        stat("You get, typical", usd(m.net), basis === "typical" ? h("span", { class: "tag", text: "ranked" }) : null),
+        stat("You get, fast sale", usd(m.quickNet), basis === "fast" ? h("span", { class: "tag", text: "ranked" }) : null),
+        stat("Listed now", okNum2(m.listings) ? fmtInt(m.listings) : DASH),
+        stat("Typical price", usd(m.value)),
+        stat("Fast-sale price", usd(m.quick)),
+        stat("CSFloat base", usd(m.basePrice)),
+        stat("Range of used sales", fmtRange),
+        stat("Trend 14 d", okNum2(m.trend) ? h("span", { class: signClass(m.trend), text: fmtPct(m.trend, 1, { sign: true }) }) : DASH),
+        stat("Sold 7 d / 30 d", `${fmtInt(m.sales7d)}${m.salesCapped && m.sales7d === m.n ? "+" : ""} / ${sold30(m)}`)
+      ),
+      h(
+        "div",
+        { class: "dfoot" },
+        h("span", { class: "faint", text: `Typical = ${sourceText(m)}. You get = price minus CSFloat's ${feePct} seller fee.` }),
+        h("a", { href: marketUrl(name), target: "_blank", rel: "noopener noreferrer", on: { click: (e) => e.stopPropagation() }, text: "Listings \u2197" })
+      )
+    );
+  }
+  function mountExchangePanel(o) {
+    const cur = () => {
+      try {
+        return String((o.currency && o.currency()) ?? "");
+      } catch {
+        return "";
+      }
+    };
+    const { host, root } = createHost("caser-tracker-exchange", 2147482990);
+    root.append(h("style", { text: BASE_CSS + EXCHANGE_CSS }));
+    const wrap = h("div", { class: "root" });
+    root.append(wrap);
+    let collapsed = !!store.get(COLLAPSED_KEY3, false);
+    let sort = store.get(SORT_KEY, "value") === "sales" ? "sales" : "value";
+    let basis = store.get(BASIS_KEY, "typical") === "fast" ? "fast" : "typical";
+    let minSales = Number(store.get(MIN_SALES_KEY, 3)) || 3;
+    let openId = null;
+    const toggle = h("button", {
+      type: "button",
+      class: "iconbtn",
+      on: {
+        click: () => {
+          collapsed = !collapsed;
+          store.set(COLLAPSED_KEY3, collapsed);
+          applyCollapsed();
+        }
+      }
+    });
+    const ttl = h("span", { class: "ttl", text: "Exchange by CSFloat sell value" });
+    const status = h("span", { class: "status num" });
+    const content = h("div", { class: "content" });
+    const panel = h("div", { class: "xpanel", role: "region", "aria-label": "Exchange by CSFloat sell value", hidden: true }, h("div", { class: "bar" }, ttl, status, toggle), content);
+    let revealOpen = false;
+    wrap.append(panel);
+    panel.addEventListener("keydown", (e) => e.stopPropagation());
+    function applyCollapsed() {
+      panel.classList.toggle("collapsed", collapsed);
+      content.hidden = collapsed;
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggle.setAttribute("aria-label", collapsed ? "Expand exchange panel" : "Collapse exchange panel");
+      toggle.replaceChildren(icon3(collapsed ? "M4 6l4 4 4-4" : "M4 10l4-4 4 4"));
+    }
+    applyCollapsed();
+    const results = /* @__PURE__ */ new Map();
+    let state = null;
+    let stateKey = "";
+    let loadId = 0;
+    let renderQueued = false;
+    function queueRender() {
+      if (renderQueued) return;
+      renderQueued = true;
+      requestAnimationFrame(() => {
+        renderQueued = false;
+        render();
+      });
+    }
+    function loadPrices(names) {
+      const id = ++loadId;
+      for (const name of names) {
+        const hit = o.prices.cached(name);
+        if (hit) results.set(name, { summary: hit, error: null });
+      }
+      queueRender();
+      (async () => {
+        for (const name of names) {
+          if (id !== loadId) return;
+          if (results.get(name)?.summary) continue;
+          try {
+            results.set(name, { summary: await o.prices.get(name), error: null });
+          } catch (e) {
+            results.set(name, { summary: null, error: String(e?.message || e) });
+          }
+          if (id === loadId) queueRender();
+        }
+      })();
+    }
+    function setPref(fn) {
+      fn();
+      render();
+    }
+    function seg(label, value, options, onPick) {
+      return h(
+        "span",
+        { class: "seg", role: "group", "aria-label": label },
+        ...options.map(([v, text, tip]) => h("button", { type: "button", title: tip, "aria-pressed": String(value === v), text, on: { click: () => onPick(v) } }))
+      );
+    }
+    function toggleOpen(id) {
+      openId = openId === id ? null : id;
+      revealOpen = openId !== null;
+      render();
+    }
+    function render() {
+      if (!state) {
+        content.replaceChildren(h("p", { class: "muted pad", text: "Waiting for the site to load the replacement list\u2026" }));
+        return;
+      }
+      const prevScroll = content.querySelector(".items")?.scrollTop ?? 0;
+      const c = cur();
+      const curName = state.current?.name ?? null;
+      const curMarket = curName ? results.get(curName)?.summary ?? null : null;
+      const curSell = o.stats.sellValue(curMarket, basis);
+      const rows = o.stats.rankCandidates(state.candidates, (n) => results.get(n), { minSales, sort, basis, currentValue: curSell });
+      const names = new Set([curName, ...state.candidates.map((x) => x.name)].filter(Boolean));
+      const done = [...names].filter((n) => results.has(n)).length;
+      const best = rows.find((r) => r.liquid) ?? null;
+      const basisWord = basis === "fast" ? "fast sale" : "typical";
+      const curOpen = openId === "@current";
+      const yourBox = h(
+        "button",
+        {
+          type: "button",
+          class: ["box", "clickable", curOpen ? "open" : null],
+          "aria-expanded": String(curOpen),
+          title: "Show the sales chart for your item",
+          disabled: !curName,
+          on: { click: () => toggleOpen("@current") }
+        },
+        h("div", { class: "k", text: `Your item, you get (${basisWord})` }),
+        h("div", { class: "v num" }, usd(curSell), trendTag(curMarket) ? h("span", { class: "x" }, trendTag(curMarket)) : null),
+        h("div", { class: "s", title: curName ?? "", text: curName ? `${curMarket ? `${sold30(curMarket)} sold / 30 d \xB7` : ""}${curName}` : "Item name unknown" })
+      );
+      const bestBox = h(
+        "div",
+        { class: "box" },
+        h("div", { class: "k", text: `Best swap, ${minSales}+ sales / 30 d` }),
+        h("div", { class: "v num" }, best ? usd(best.sell) : DASH, best && best.delta !== null ? h("span", { class: ["x", signClass(best.delta)], text: usd(best.delta, { sign: true }) }) : null),
+        h("div", { class: "s", title: best?.name ?? "", text: best ? best.name : done < names.size ? "Loading prices\u2026" : "None liquid enough" })
+      );
+      const minSel = h(
+        "select",
+        {
+          "aria-label": "Minimum sales in 30 days",
+          on: {
+            change: (e) => {
+              minSales = Number(e.target.value) || 1;
+              store.set(MIN_SALES_KEY, minSales);
+              render();
+            }
+          }
+        },
+        ...[1, 3, 5, 10, 20].map((n) => h("option", { value: String(n), selected: n === minSales, text: `${n}+ sales` }))
+      );
+      const tools = h(
+        "div",
+        { class: "tools" },
+        h(
+          "span",
+          { class: "tg" },
+          "Price",
+          seg("Sell price", basis, [
+            ["typical", "Typical", "Median recent sale price, after the fee"],
+            ["fast", "Fast sale", "25th percentile of recent sales, after the fee: priced to sell quickly"]
+          ], (v) => setPref(() => store.set(BASIS_KEY, basis = v)))
+        ),
+        h(
+          "span",
+          { class: "tg" },
+          "Sort",
+          seg("Sort", sort, [
+            ["value", "Value"],
+            ["sales", "Sales"]
+          ], (v) => setPref(() => store.set(SORT_KEY, sort = v)))
+        ),
+        h("span", { class: "tg" }, "Liquid at", minSel)
+      );
+      status.textContent = done < names.size ? `prices ${done}/${names.size}` : `${fmtInt(rows.length)} items`;
+      let sepDone = false;
+      const items = [];
+      rows.forEach((r, i) => {
+        const m = r.market;
+        const sep = !r.liquid && !sepDone && i > 0;
+        if (!r.liquid) sepDone = true;
+        const open = openId === r.id;
+        const sub = `site ${fmtMoney(r.price, c)}${r.refund ? ` \xB7 refund ${fmtMoney(r.refund, c)}` : ""}`;
+        const second = r.error ? h("span", { class: "neg", text: "no price" }) : !m ? "loading\u2026" : [`${sold30(m)} sold`, trendTag(m) ? " " : null, trendTag(m)];
+        const title = r.error ? r.error : m ? `${r.name}
+Typical ${usd(m.value)}, fast sale ${usd(m.quick)} (${sourceText(m)}).${m.split ? `
+${splitText(m)}` : ""}
+${sold30(m)} sold in 30 days${okNum2(m.listings) ? `, ${fmtInt(m.listings)} listed now` : ""}.
+Click for the sales chart.` : r.name;
+        const spark = m && m.pts?.length ? salesSparkline({ points: expandPoints(m.pts).filter((p) => Date.now() - p.ts <= 90 * 864e5), typical: m.source === "sales" ? m.value : null }) : null;
+        const activate = () => {
+          o.selectCandidate?.(r.id);
+          toggleOpen(r.id);
+        };
+        items.push(
+          h(
+            "li",
+            {
+              class: ["item", r.liquid ? null : "illiquid", sep ? "sep" : null, open ? "open" : null],
+              title,
+              tabIndex: 0,
+              "aria-expanded": String(open),
+              on: {
+                click: activate,
+                keydown: (e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    activate();
+                  }
+                }
+              }
+            },
+            h("span", { class: "rank num", text: r.liquid ? String(i + 1) : "" }),
+            r.image ? h("img", { src: r.image, alt: "", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer" }) : h("span", { class: "noimg" }),
+            h("span", { class: "mid" }, h("span", { class: "name", text: r.name }), h("span", { class: "sub num", text: sub })),
+            h("span", { class: "sp" }, spark),
+            h(
+              "span",
+              { class: "r" },
+              h(
+                "span",
+                { class: "price num" },
+                usd(r.sell),
+                m?.source && m.source !== "sales" ? h("span", { class: "flag", title: sourceText(m), text: "*" }) : null,
+                m?.split ? h("span", { class: "flag", title: splitText(m), text: "\xB2" }) : null,
+                r.delta !== null ? h("span", { class: ["delta", signClass(r.delta)], text: usd(r.delta, { sign: true }) }) : null
+              ),
+              h("span", { class: "second num" }, second)
+            )
+          )
+        );
+        if (open) items.push(h("li", { class: "dwrap", on: { click: (e) => e.stopPropagation() } }, detail(r.name, m, basis, 414)));
+      });
+      content.replaceChildren(
+        h(
+          "div",
+          { class: "sum" },
+          h("div", { class: "grid" }, yourBox, bestBox),
+          curOpen && curName ? h("div", { class: "curdetail" }, detail(curName, curMarket, basis, 388)) : null,
+          tools
+        ),
+        h("div", { class: "lhead" }, h("span", { text: "Item \xB7 site price" }), h("span", { text: `You get (${basisWord}) \xB7 vs yours \xB7 sold 30 d` })),
+        items.length ? h("ul", { class: "items" }, ...items) : h("p", { class: "muted pad", text: "The site offered no items." }),
+        h(
+          "div",
+          { class: "note", text: `You get = recent CSFloat sale prices minus the ${feePct} seller fee. * = under 3 recent sales. \xB2 = two price groups, priced on the lower one. Float and stickers move prices. A row click opens its chart and selects it on the site; you confirm there.` }
+        )
+      );
+      const list = content.querySelector(".items");
+      if (list) list.scrollTop = prevScroll;
+      if (revealOpen && list) {
+        revealOpen = false;
+        const d = list.querySelector(".dwrap");
+        const row = d?.previousElementSibling;
+        if (d && row) {
+          const lr = list.getBoundingClientRect();
+          const bottom = d.getBoundingClientRect().bottom;
+          if (bottom > lr.bottom) list.scrollTop += Math.min(bottom - lr.bottom, row.getBoundingClientRect().top - lr.top);
+        }
+      }
+    }
+    function tick() {
+      attach(host);
+      let open = false;
+      try {
+        open = o.isOpen();
+      } catch {
+      }
+      if (!open) {
+        if (!panel.hidden) {
+          panel.hidden = true;
+          loadId++;
+          state = null;
+          stateKey = "";
+          openId = null;
+        }
+        return;
+      }
+      panel.hidden = false;
+      let next = null;
+      try {
+        next = o.getState();
+      } catch {
+      }
+      const key = next ? `${next.itemId}|${next.current?.name ?? ""}|${next.candidates.map((x) => x.id).join(",")}` : "";
+      if (key === stateKey) return;
+      stateKey = key;
+      state = next;
+      openId = null;
+      if (state) loadPrices([state.current?.name, ...state.candidates.map((x) => x.name)].filter(Boolean));
+      render();
+    }
+    const timer = setInterval(tick, POLL_MS3);
+    tick();
+    return {
+      destroy() {
+        clearInterval(timer);
+        host.remove();
+      }
+    };
+  }
+
   // src/main.js
-  var VERSION = true ? "0.4.4" : "dev";
+  var VERSION = true ? "0.9.0" : "dev";
+  var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
   var ctx = new Context();
   var store2 = new Store(indexedDB);
+  var sharedGm = gmStorage();
+  var shared = sharedGm && createSharedStore(sharedGm);
+  var browserPrefs = sharedGm ? { get: (k) => sharedGm.get(k, null), set: (k, v) => sharedGm.set(k, v) } : { get: (k) => store.get(k, null), set: (k, v) => store.set(k, v) };
   var lastAuth = null;
   var lastEventTs = null;
   var unknownResponses = 0;
@@ -4984,6 +6650,61 @@ option { background: var(--surface); color: var(--text); }
     }
     return memLoad.then((list) => list.slice());
   }
+  var ACCOUNT_SEL_KEY = "cst.ui.account";
+  function knownAccounts() {
+    const v = browserPrefs.get("accounts");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  }
+  function rememberAccount() {
+    if (ctx.userId == null) return;
+    const known = knownAccounts();
+    const name = ctx.userName ?? known[ctx.userId]?.name ?? null;
+    if (known[ctx.userId] && known[ctx.userId].name === name) return;
+    browserPrefs.set("accounts", { ...known, [ctx.userId]: { name } });
+  }
+  function legacyOwner() {
+    const v = browserPrefs.get("acct:legacy");
+    if (typeof v === "string" && v) return v;
+    return memEvents ? pickLegacyOwner(memEvents) : null;
+  }
+  function fixLegacyOwner() {
+    const v = browserPrefs.get("acct:legacy");
+    if (typeof v === "string" && v) return;
+    const pick = memEvents ? pickLegacyOwner(memEvents) : null;
+    if (pick) browserPrefs.set("acct:legacy", pick);
+  }
+  function selectedAccount() {
+    return resolveSelection(store.get(ACCOUNT_SEL_KEY, "current"), ctx.userId, legacyOwner());
+  }
+  async function getViewEvents() {
+    const all = await getEvents();
+    return filterByAccount(all, selectedAccount(), legacyOwner());
+  }
+  function accountsState() {
+    const all = memEvents ?? [];
+    return {
+      list: listAccounts(all, knownAccounts(), legacyOwner(), ctx.userId),
+      selected: selectedAccount(),
+      total: all.length
+    };
+  }
+  function selectAccount(sel) {
+    store.set(ACCOUNT_SEL_KEY, sel);
+    dashboard?.refresh();
+    overlay?.refresh();
+  }
+  function onAccountSeen(previous) {
+    rememberAccount();
+    if (ctx.userId === previous) return;
+    dashboard?.refresh();
+    overlay?.refresh();
+    if (mounted && previous != null) setTimeout(maybeAutoSync, 3e3);
+  }
+  function holdings() {
+    const sel = selectedAccount();
+    if (sel != null && sel !== ctx.userId) return { balance: null, inventoryValue: null };
+    return { balance: ctx.balance, inventoryValue: ctx.inventoryValue };
+  }
   function applyToMemory(events) {
     if (!memEvents) return;
     let unsorted = false;
@@ -5005,16 +6726,239 @@ option { background: var(--surface); color: var(--text); }
       memIndex = new Map(memEvents.map((e, i) => [e.id, i]));
     }
   }
+  async function removeTwins() {
+    const events = await getEvents();
+    const twins = [...withdrawalTwinIds(events), ...caseTwinIds(events)];
+    if (!twins.length) return 0;
+    await deleteEvents(twins);
+    return twins.length;
+  }
+  async function deleteEvents(ids, { cloud: toCloud = true } = {}) {
+    if (!ids.length) return;
+    const drop = new Set(ids);
+    await store2.deleteEvents(ids);
+    try {
+      shared?.remove(ids);
+    } catch (err) {
+      console.warn("[caser-tracker] could not update shared storage", err);
+    }
+    if (memEvents) {
+      memEvents = memEvents.filter((e) => !drop.has(e.id));
+      memIndex = new Map(memEvents.map((e, i) => [e.id, i]));
+    }
+    if (toCloud && cloudKey()) cloud.remove(ids).catch((err) => console.warn("[caser-tracker] could not delete in cloud", err));
+  }
   function dropMemory() {
     memEvents = null;
     memIndex = null;
   }
-  async function saveEvents(events) {
+  async function saveEvents(events, { share = true, cloud: toCloud = true } = {}) {
     const added = await store2.putEvents(events);
     applyToMemory(events);
     if (memLoad) memLoad.then(() => applyToMemory(events), () => {
     });
+    if (share) queueShared(events);
+    if (toCloud) queueCloud(events);
     return added;
+  }
+  var sharedQueue = [];
+  var sharedTimer = null;
+  function queueShared(events) {
+    if (!shared || !events.length) return;
+    sharedQueue.push(...events);
+    if (!sharedTimer) sharedTimer = setTimeout(flushShared, 1500);
+  }
+  function flushShared() {
+    sharedTimer = null;
+    const batch = sharedQueue;
+    sharedQueue = [];
+    try {
+      shared.merge(batch);
+    } catch (err) {
+      console.warn("[caser-tracker] could not write shared storage", err);
+    }
+  }
+  async function clearLocal() {
+    const ids = new Set(Object.keys(knownAccounts()));
+    for (const e of memEvents ?? await getEvents()) if (e.userId != null) ids.add(String(e.userId));
+    if (ctx.userId != null) ids.add(ctx.userId);
+    await store2.clearEvents();
+    dropMemory();
+    const keys = ["lastSync", "lastSyncBy", ...HISTORY_STREAMS.map((s2) => `sync:${s2}`)];
+    for (const id of ids) for (const s2 of HISTORY_STREAMS) keys.push(progressKey(s2, id));
+    for (const k of keys) await store2.setMeta(k, null);
+    browserPrefs.set("sync:complete", []);
+    browserPrefs.set("acct:legacy", null);
+    lastSyncLegacy = null;
+    lastSyncBy = {};
+  }
+  var HISTORY_STREAMS = ["upgrades", "inventory", "payments"];
+  function browserComplete() {
+    const v = browserPrefs.get("sync:complete");
+    return Array.isArray(v) ? v : [];
+  }
+  function markBrowserComplete(flag) {
+    const v = browserComplete();
+    if (!v.includes(flag)) browserPrefs.set("sync:complete", [...v, flag]);
+  }
+  function markComplete(flag) {
+    markBrowserComplete(flag);
+    if (cloudKey()) cloud.markComplete(flag).catch((err) => console.warn("[caser-tracker] could not update cloud", err));
+  }
+  async function publishLocalComplete() {
+    for (const s2 of HISTORY_STREAMS) if ((await store2.getMeta(`sync:${s2}`))?.complete) markBrowserComplete(s2);
+  }
+  var historyProgress = {
+    async load(name) {
+      const uid = ctx.userId;
+      const legacy = legacyOwner();
+      let local = await store2.getMeta(progressKey(name, uid));
+      if (local == null && uid === legacy) local = await store2.getMeta(`sync:${name}`);
+      if (local?.complete || !flagComplete(browserComplete(), name, uid, legacy)) return local;
+      return { complete: true, offset: 0 };
+    },
+    async save(name, v) {
+      await store2.setMeta(progressKey(name, ctx.userId), v);
+      if (v?.complete) markComplete(streamFlag(name, ctx.userId));
+    }
+  };
+  async function syncShared() {
+    if (!shared) return;
+    const clearedAt = shared.clearedAt();
+    if (clearedAt && clearedAt > (await store2.getMeta("sharedClearSeen") ?? 0)) {
+      await clearLocal();
+      await store2.setMeta("sharedClearSeen", clearedAt);
+    }
+    const remote = shared.readAll();
+    if (remote.length) await saveEvents(remote, { share: false, cloud: false });
+    await removeTwins();
+    shared.merge(await getEvents());
+    shared.onRemoteChange(async (rev) => {
+      try {
+        const cleared = shared.clearedAt();
+        if (cleared && cleared > (await store2.getMeta("sharedClearSeen") ?? 0)) {
+          await clearLocal();
+          await store2.setMeta("sharedClearSeen", cleared);
+          dashboard?.refresh();
+          return;
+        }
+        const events = shared.readDays(rev?.days);
+        if (events.length && await saveEvents(events, { share: false, cloud: false })) {
+          await removeTwins();
+          refreshAfterLive();
+        }
+      } catch (err) {
+        console.warn("[caser-tracker] could not read shared storage", err);
+      }
+    });
+  }
+  var CLOUD_PULL_EVERY_MS = 60 * 1e3;
+  var cloud = createCloud({ request: gmRequest, getKey: () => cloudKey() });
+  var cloudStatus = { state: "idle", lastPull: null, error: null, progress: null };
+  var cloudQueue = /* @__PURE__ */ new Set();
+  var cloudTimer = null;
+  var cloudRun = null;
+  function cloudKey() {
+    const k = browserPrefs.get("cloud:key");
+    return isSyncKey(k) ? k : null;
+  }
+  function queueCloud(events) {
+    if (!cloudKey() || !events.length) return;
+    for (const e of events) cloudQueue.add(e.id);
+    if (!cloudTimer) {
+      cloudTimer = setTimeout(() => {
+        cloudTimer = null;
+        flushCloud().catch(() => {
+        });
+      }, 3e3);
+    }
+  }
+  async function flushCloud() {
+    if (!cloudQueue.size || !cloudKey()) return;
+    const ids = [...cloudQueue];
+    cloudQueue.clear();
+    const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+    const events = ids.map((id) => byId.get(id)).filter(Boolean);
+    try {
+      await cloud.push(events);
+      if (cloudStatus.state === "error") cloudStatus = { ...cloudStatus, state: "idle", error: null };
+    } catch (err) {
+      for (const id of ids) cloudQueue.add(id);
+      cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err) };
+      throw err;
+    }
+  }
+  function cloudSync() {
+    const key = cloudKey();
+    if (!key) return Promise.resolve(null);
+    if (cloudRun) return cloudRun;
+    cloudRun = (async () => {
+      cloudStatus = { ...cloudStatus, state: "syncing", progress: "Checking" };
+      dashboard?.refresh();
+      try {
+        const account = await cloud.account();
+        const seen = Number(browserPrefs.get("cloud:clearSeen")) || 0;
+        if (account.clearedAt && account.clearedAt > seen) {
+          browserPrefs.set("cloud:clearSeen", account.clearedAt);
+          await clearLocal();
+          if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
+        }
+        let cursor = await store2.getMeta("cloudCursor");
+        if (!cursor || cursor.key !== key) cursor = null;
+        cloudStatus = { ...cloudStatus, progress: cursor ? "Downloading changes" : "Downloading history" };
+        dashboard?.refresh();
+        const res = await cloud.pull(cursor);
+        if (res.deletedIds.length) await deleteEvents(res.deletedIds, { cloud: false });
+        let added = 0;
+        for (let i = 0; i < res.events.length; i += 2e3) added += await saveEvents(res.events.slice(i, i + 2e3), { cloud: false });
+        if (res.cursor) await store2.setMeta("cloudCursor", { key, ...res.cursor });
+        if (added) await removeTwins();
+        if (await store2.getMeta("cloudPushedKey") !== key) {
+          await cloud.push(await getEvents(), (done, total) => {
+            cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${total}` };
+            refreshSoon();
+          });
+          await store2.setMeta("cloudPushedKey", key);
+        }
+        await flushCloud();
+        for (const s2 of account.complete) if (isStreamFlag(s2, HISTORY_STREAMS)) markBrowserComplete(s2);
+        for (const s2 of browserComplete()) {
+          if (account.complete.includes(s2)) continue;
+          try {
+            await cloud.markComplete(s2);
+          } catch (err) {
+            console.warn("[caser-tracker] could not update cloud", err);
+          }
+        }
+        fixLegacyOwner();
+        cloudStatus = { state: "idle", lastPull: Date.now(), error: null, progress: null };
+        if (added) refreshSoon();
+        return { added };
+      } catch (err) {
+        cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err), progress: null };
+        throw err;
+      } finally {
+        cloudRun = null;
+        dashboard?.refresh();
+      }
+    })();
+    return cloudRun;
+  }
+  function setCloudKey(key) {
+    if (key != null && !isSyncKey(key)) throw new Error("That is not a sync key. A key is 32 or more letters, digits, - or _.");
+    browserPrefs.set("cloud:key", key);
+    browserPrefs.set("cloud:clearSeen", key ? Date.now() : null);
+    cloudQueue.clear();
+    cloudStatus = { state: "idle", lastPull: null, error: null, progress: null };
+    return key ? cloudSync() : null;
+  }
+  var cloudTicker = null;
+  function startCloudTicker() {
+    if (cloudTicker) return;
+    cloudTicker = setInterval(() => {
+      if (document.visibilityState !== "visible" || !cloudKey()) return;
+      cloudSync().catch((err) => console.warn("[caser-tracker] cloud sync failed", err));
+    }, CLOUD_PULL_EVERY_MS);
   }
   var liveTimer = null;
   function refreshAfterLive() {
@@ -5029,10 +6973,83 @@ option { background: var(--surface); color: var(--text); }
       else run();
     }, 2500);
   }
-  var { origFetch } = installHook(window, async (ex) => {
+  var caseInfos = /* @__PURE__ */ new Map();
+  var caseInfoLoads = /* @__PURE__ */ new Map();
+  function rememberCaseInfo(ex) {
+    if (ex.method !== "GET" || ex.status >= 400) return;
+    const d = caseDetailPath(ex.path);
+    if (!d) return;
+    const info = caseInfoFromResponse(ex.resBody, d);
+    if (info) caseInfos.set(d.slug, info);
+  }
+  async function getCaseInfo(slug) {
+    const known = caseInfos.get(slug);
+    if (known) return known;
+    for (let i = 0; i < 8 && !caseInfos.has(slug); i++) await new Promise((r) => setTimeout(r, 200));
+    if (caseInfos.has(slug)) return caseInfos.get(slug);
+    if (!caseInfoLoads.has(slug)) {
+      const p = fetchCaseInfo(origFetch, slug).then((info) => {
+        if (info) caseInfos.set(slug, info);
+        return info;
+      }).finally(() => caseInfoLoads.delete(slug));
+      caseInfoLoads.set(slug, p);
+    }
+    return caseInfoLoads.get(slug);
+  }
+  var replacement = null;
+  function rememberReplacement(ex) {
+    if (ex.method !== "GET" || ex.status >= 400) return;
+    const itemId = replacementItemId(ex.path);
+    if (!itemId) return;
+    replacement = { itemId, candidates: candidatesFromResponse(ex.resBody), ts: Date.now() };
+  }
+  function replacementState() {
+    if (!replacement) return null;
+    const it = ctx.items.get(replacement.itemId);
+    return { itemId: replacement.itemId, current: it ? { name: it.name, price: it.price } : null, candidates: replacement.candidates };
+  }
+  function gmRequest({ method = "GET", url, headers = { accept: "application/json" }, body, timeout = 3e4 }) {
+    return new Promise((resolve, reject) => {
+      const gm = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
+      const host = new URL(url).hostname;
+      if (!gm) {
+        reject(new Error("Reinstall the script: it needs the GM_xmlhttpRequest permission"));
+        return;
+      }
+      gm({
+        method,
+        url,
+        headers,
+        data: body,
+        anonymous: true,
+        timeout,
+        onload: (r) => {
+          let json = null;
+          try {
+            json = JSON.parse(r.responseText);
+          } catch {
+          }
+          resolve({ status: r.status, json });
+        },
+        onerror: () => reject(new Error(`Request to ${host} failed`)),
+        ontimeout: () => reject(new Error(`Request to ${host} timed out`))
+      });
+    });
+  }
+  var csfloatRequest = (url) => gmRequest({ url });
+  var prices = createPriceClient({ request: csfloatRequest, storage: store });
+  var { origFetch } = installHook(pageWindow, async (ex) => {
     if (ex.auth) lastAuth = ex.auth;
+    try {
+      rememberCaseInfo(ex);
+      rememberReplacement(ex);
+    } catch {
+    }
     const { events, recognized } = parseExchange(ex, ctx, site);
+    const userBefore = ctx.userId;
+    const nameBefore = ctx.userName;
     ctx.learn(ex);
+    if (ctx.userId !== userBefore || ctx.userName !== nameBefore) onAccountSeen(userBefore);
     if (!recognized && !events.length) return;
     try {
       if (events.length) {
@@ -5066,9 +7083,31 @@ option { background: var(--surface); color: var(--text); }
   function currencyLabel() {
     return "";
   }
+  var OVERLAY_ON_KEY = "cst.ui.upgradeOverlayOn";
+  function setUpgradeOverlay(on) {
+    store.set(OVERLAY_ON_KEY, on);
+    if (on && !overlay) {
+      overlay = mountUpgradeOverlay({
+        getSelection: () => readUpgradeSelection(document),
+        getEvents: getViewEvents,
+        stats: stats_exports,
+        currency: currencyLabel,
+        getHoldings: holdings,
+        onTurnOff: () => {
+          setUpgradeOverlay(false);
+          dashboard?.refresh();
+        }
+      });
+    } else if (!on && overlay) {
+      overlay.destroy();
+      overlay = null;
+    }
+  }
   function mount() {
     dashboard = mountDashboard({
-      getEvents,
+      getEvents: getViewEvents,
+      getAccounts: accountsState,
+      selectAccount,
       stats: stats_exports,
       currency: currencyLabel,
       onExport: async (format) => {
@@ -5079,31 +7118,77 @@ option { background: var(--surface); color: var(--text); }
       },
       onImportFile: async (file) => {
         const added = await saveEvents(fromJson(await file.text()));
+        if (added) await removeTwins();
         dashboard.refresh();
         return { added };
       },
       onImportHistory: () => sync(),
       onClear: async () => {
-        await store2.clearEvents();
-        dropMemory();
-        for (const k of ["lastSync", "sync:upgrades", "sync:inventory", "sync:payments"]) await store2.setMeta(k, null);
-        lastSync = null;
+        sharedQueue = [];
+        await clearLocal();
+        if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
+        if (cloudKey()) browserPrefs.set("cloud:clearSeen", await cloud.clear());
+        store.set(ACCOUNT_SEL_KEY, "current");
         dashboard.refresh();
       },
-      getStatus: () => ({ capturing: true, lastEventTs, unknownResponses, version: VERSION, lastSync, syncing: syncProgress, storagePersisted }),
-      getHoldings: () => ({ balance: ctx.balance, inventoryValue: ctx.inventoryValue })
+      getStatus: () => ({
+        capturing: true,
+        lastEventTs,
+        unknownResponses,
+        version: VERSION,
+        lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
+        syncing: syncProgress,
+        storagePersisted,
+        cloud: { key: cloudKey(), ...cloudStatus }
+      }),
+      onCloudStart: () => setCloudKey(newSyncKey()),
+      onCloudJoin: (key) => setCloudKey(String(key ?? "").trim()),
+      onCloudStop: () => setCloudKey(null),
+      onCloudSync: () => cloudSync(),
+      copyText: (text) => {
+        if (typeof GM_setClipboard !== "function") return false;
+        GM_setClipboard(text, "text");
+        return true;
+      },
+      getHoldings: holdings,
+      getSettings: () => ({ upgradeOverlay: !!overlay }),
+      setSetting: (key, value) => {
+        if (key === "upgradeOverlay") setUpgradeOverlay(!!value);
+      }
     });
-    overlay = mountUpgradeOverlay({
-      getSelection: () => readUpgradeSelection(document),
-      getEvents,
+    setUpgradeOverlay(store.get(OVERLAY_ON_KEY, true) !== false);
+    mountCasePanel({
+      getSlug: () => caseSlugFromPath(location.pathname),
+      getInfo: getCaseInfo,
+      stats: stats_exports,
+      currency: currencyLabel
+    });
+    mountExchangePanel({
+      isOpen: () => !!document.querySelector('[data-testid="replace-item-modal"]'),
+      getState: replacementState,
+      prices,
       stats: stats_exports,
       currency: currencyLabel,
-      getHoldings: () => ({ balance: ctx.balance, inventoryValue: ctx.inventoryValue })
+      // Selects the item in the site's own list (same as clicking its card). Never confirms the replacement.
+      selectCandidate: (id) => {
+        const card = document.querySelector(`[data-testid="replace-item-modal-candidate-${CSS.escape(id)}"]`);
+        if (!card) return false;
+        card.scrollIntoView({ block: "nearest" });
+        card.click();
+        return true;
+      }
     });
+    mounted = true;
     startAutoSync();
   }
   var AUTO_SYNC_AFTER_MS = 15 * 60 * 1e3;
-  var lastSync = null;
+  var lastSyncBy = {};
+  var lastSyncLegacy = null;
+  var mounted = false;
+  function lastSyncFor(uid) {
+    if (uid == null || uid === "all") return Math.max(0, lastSyncLegacy ?? 0, ...Object.values(lastSyncBy)) || null;
+    return lastSyncBy[uid] ?? (uid === legacyOwner() ? lastSyncLegacy : null);
+  }
   var syncProgress = null;
   var syncPromise = null;
   var storagePersisted = null;
@@ -5119,6 +7204,12 @@ option { background: var(--surface); color: var(--text); }
     if (syncPromise) return syncPromise;
     syncPromise = (async () => {
       try {
+        if (cloudRun) {
+          syncProgress = "Waiting for cloud download";
+          dashboard?.refresh();
+          await cloudRun.catch(() => {
+          });
+        }
         const res = await importHistory({
           fetch: origFetch,
           ctx,
@@ -5129,18 +7220,18 @@ option { background: var(--surface); color: var(--text); }
             if (added) refreshSoon();
             return added;
           },
-          getStored: () => getEvents(),
+          // Only the signed-in account's events: they decide where an unfinished walk resumes.
+          getStored: async () => filterByAccount(await getEvents(), ctx.userId, legacyOwner()),
           onProgress: (msg) => {
             syncProgress = msg;
             refreshSoon();
           },
-          progressStore: {
-            load: (name) => store2.getMeta(`sync:${name}`),
-            save: (name, v) => store2.setMeta(`sync:${name}`, v)
-          }
+          progressStore: historyProgress
         });
-        lastSync = Date.now();
-        await store2.setMeta("lastSync", lastSync);
+        if (ctx.userId != null) {
+          lastSyncBy = { ...lastSyncBy, [ctx.userId]: Date.now() };
+          await store2.setMeta("lastSyncBy", lastSyncBy);
+        }
         return res;
       } finally {
         syncProgress = null;
@@ -5152,9 +7243,18 @@ option { background: var(--surface); color: var(--text); }
   }
   async function startAutoSync() {
     try {
-      lastSync = await store2.getMeta("lastSync") ?? null;
+      lastSyncLegacy = await store2.getMeta("lastSync") ?? null;
+      const by = await store2.getMeta("lastSyncBy");
+      lastSyncBy = by && typeof by === "object" ? by : {};
+      await syncShared().catch((err) => console.warn("[caser-tracker] could not sync shared storage", err));
+      await publishLocalComplete().catch(() => {
+      });
+      cloudSync().catch((err) => console.warn("[caser-tracker] cloud sync failed", err));
+      startCloudTicker();
+      await removeTwins().catch((err) => console.warn("[caser-tracker] could not remove duplicates", err));
       const events = await getEvents();
       if (events.length && !lastEventTs) lastEventTs = events[events.length - 1].ts;
+      if (!cloudKey()) fixLegacyOwner();
       dashboard?.refresh();
     } catch {
     }
@@ -5162,13 +7262,15 @@ option { background: var(--surface); color: var(--text); }
       storagePersisted = await navigator.storage?.persist?.() ?? null;
     } catch {
     }
-    setTimeout(() => {
-      if (!getAuth()) return;
-      if (lastSync && Date.now() - lastSync < AUTO_SYNC_AFTER_MS) return;
-      sync().catch((err) => console.warn("[caser-tracker] sync failed", err));
-    }, 5e3);
+    setTimeout(maybeAutoSync, 5e3);
+  }
+  function maybeAutoSync() {
+    if (!getAuth()) return;
+    const last = lastSyncFor(ctx.userId);
+    if (last && Date.now() - last < AUTO_SYNC_AFTER_MS) return;
+    sync().catch((err) => console.warn("[caser-tracker] sync failed", err));
   }
   if (document.body) mount();
   else document.addEventListener("DOMContentLoaded", mount, { once: true });
-  window.__caserTracker = { version: VERSION, store: store2, ctx, stats: stats_exports };
+  pageWindow.__caserTracker = { version: VERSION, store: store2, ctx, stats: stats_exports };
 })();

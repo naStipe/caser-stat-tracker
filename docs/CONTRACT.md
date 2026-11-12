@@ -31,6 +31,7 @@ Rules for every module:
 - API base: `https://<site>/api`. The site's API client calls the global `fetch` at request time.
 - Case open: `POST /api/game/cases/{slug}/open` with `{count, gameMode}`. Response has `items[]` (each with `price`) and `case_stats`.
 - Case details: `GET /api/game/cases/{slug}`. Case list: `GET /api/game/cases` → `{cases:[{id,slug,title,price,type,...}]}`.
+- Custom case details: `GET /api/game/custom-cases/{slug}` → `{id,slug,title,price,items:[{item:{...},chancePercent}]}`. Official case details carry no chances. Both kinds use the page URL `/{locale}/cases/{slug}`; the site tries the official endpoint first and falls back on 404. Read by `src/capture/caseinfo.js` for the case contents panel.
 - Upgrade: `POST /api/game/upgrade/bet` with `{betInventoryItemIds[], addedBalance, isMystery, gameMode, targetItemId?}`.
   Response has `bet` with `status: "won" | "lost" | "pending"`, `targetItem`, plus `superDrop {shown, won, item}` and `compensationItems[]`.
 - Shown upgrade chance (client code): `min(max(stake / targetPrice * 103, 0), 100)` percent.
@@ -178,7 +179,17 @@ Facts learned from 15,846 real upgrades, 17,517 inventory-history rows and 536 p
 - Deposits: `GET /api/payments/history?limit&offset` → `{items:[{id, methodName, amount, status: completed|failed|expired, createdAt, completedAt}], hasMore}`.
 - Withdrawals: no history endpoint. Inventory history rows with `status: "withdrawn"` give the item and value, but their
   `createdAt` is when the item arrived, not when it was withdrawn. Live capture of `POST /api/withdrawals` gives the exact time.
+  The live event keys on the inventory item id and the imported one on the history row id, so one withdrawal can arrive
+  twice under two ids. `withdrawalTwinIds` pairs them by item name (import arrived at most 7 days before the live
+  capture); the import skips the imported copy and stored copies are deleted at startup.
 - `GET /api/items/inventory/balance` → `{amount}` is the value of skins held, not the cash balance. Cash balance is `/users/me` `balance`.
+- Item replacement: `GET /api/inventory/items/{inventoryId}/replacements?limit=50&offset=0` →
+  `{success, data: [{id, item: {id, marketName, price, image, ...}, price, refund}]}`; the modal shows only these 50.
+  `POST /api/inventory/items/{inventoryId}/replace {itemId}` swaps and credits `refund` to the balance (the tracker never sends it).
+  Modal DOM: `[data-testid="replace-item-modal"]`, cards `[data-testid="replace-item-modal-candidate-{id}"]`.
+- CSFloat: `GET https://csfloat.com/api/v1/history/{market_hash_name}/sales` is public (no login, no CORS, so it goes
+  through `GM_xmlhttpRequest`). Newest ~40 sales, prices in US cents, each with `sold_at`, `item.float_value` and `reference: {base_price, predicted_price, float_factor, quantity}`
+  (`quantity` = active listings). `/api/v1/listings` needs a login and is not used.
 
 ### Event schema additions
 

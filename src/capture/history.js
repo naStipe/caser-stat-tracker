@@ -2,7 +2,7 @@
 // Only ever requests the current user's id (from /users/me). The site rate-limits these endpoints
 // (HTTP 429 after a few quick pages), so requests are paced and retried after a pause.
 
-import { upgradeFromRecord, upgradeHistoryRows, caseFromInventoryRecord, withdrawalFromInventoryRecord, depositFromPayment, dropLiveTwins } from './parsers.js';
+import { upgradeFromRecord, upgradeHistoryRows, caseFromInventoryRecord, withdrawalFromInventoryRecord, depositFromPayment, dropLiveTwins, withdrawalTwinIds } from './parsers.js';
 
 const PAGE = 50;
 const MAX_PAGES = 4000;
@@ -59,6 +59,7 @@ export async function importHistory({ fetch, ctx, site, getAuth, save, getStored
   const triedSlugs = new Set();
   let cases = 0;
   let withdrawn = 0;
+  const knownWithdrawals = new Map(stored.filter((e) => e.kind === 'withdrawal').map((e) => [e.id, e]));
   let skipped = 0;
   await paginate(get, `/api/users/${uid}/inventory/history`, async (body, page) => {
     onProgress?.(`Case drops: page ${page}`);
@@ -76,7 +77,11 @@ export async function importHistory({ fetch, ctx, site, getAuth, save, getStored
     const parsed = drops.map((r) => caseFromInventoryRecord(r, ctx, site)).filter(Boolean);
     skipped += drops.length - parsed.length;
     const events = dropLiveTwins(parsed, stored);
-    const withdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx, site)).filter(Boolean);
+    // A withdrawal captured live comes back here under another id; keep only the live one.
+    const parsedWithdrawals = items.map((r) => withdrawalFromInventoryRecord(r, ctx, site)).filter((w) => w && !knownWithdrawals.has(w.id));
+    const twins = withdrawalTwinIds([...knownWithdrawals.values(), ...parsedWithdrawals]);
+    const withdrawals = parsedWithdrawals.filter((w) => !twins.has(w.id));
+    for (const w of withdrawals) knownWithdrawals.set(w.id, w);
     const added = await save(events);
     cases += added;
     withdrawn += await save(withdrawals);
@@ -145,6 +150,7 @@ export async function paginate(get, path, onPage, progress, storedCount = 0) {
 
 async function fetchMe(get, ctx) {
   const body = await get('/api/users/me');
+  ctx.learn({ method: 'GET', path: '/users/me', status: 200, resBody: body });
   const u = body?.user ?? body?.data ?? body;
   if (u?.id != null) ctx.userId = String(u.id);
   return ctx.userId;

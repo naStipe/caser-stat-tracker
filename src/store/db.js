@@ -72,6 +72,15 @@ export class Store {
     return list.sort((a, b) => a.ts - b.ts);
   }
 
+  /** Delete events by id. */
+  async deleteEvents(ids) {
+    if (!ids.length) return;
+    await this.tx(['events'], 'readwrite', (t) => {
+      const s = t.objectStore('events');
+      for (const id of ids) s.delete(id);
+    });
+  }
+
   async clearEvents() {
     await this.tx(['events', 'raw'], 'readwrite', (t) => {
       t.objectStore('events').clear();

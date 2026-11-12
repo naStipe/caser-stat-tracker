@@ -17,6 +17,7 @@ export class Context {
     this.cases = new Map(); // slug -> {id, slug, name, price}
     this.items = new Map(); // inventory item id -> Item
     this.userId = null;
+    this.userName = null;
     this.balance = null;
     this.inventoryValue = null;
   }
@@ -33,7 +34,17 @@ export class Context {
       this.addCase(obj(body.case) ?? body);
     } else if (p === '/users/me') {
       const u = obj(body.user) ?? body;
-      if (u.id != null) this.userId = String(u.id);
+      if (u.id != null) {
+        const id = String(u.id);
+        // A different account signed in: the old one's balance and inventory no longer apply.
+        if (this.userId != null && this.userId !== id) {
+          this.items.clear();
+          this.inventoryValue = null;
+        }
+        this.userId = id;
+        const name = u.username ?? u.nickname ?? u.displayName ?? u.name ?? u.steamName ?? u.personaName;
+        this.userName = typeof name === 'string' && name.trim() ? name.trim().slice(0, 64) : null;
+      }
       this.setBalance(u.balance);
     } else if (p === '/items/inventory/balance') {
       // {amount}: total value of the skins in the inventory, not the cash balance.
@@ -127,6 +138,49 @@ export function withdrawalFromInventoryRecord(row, ctx, site) {
   return { id: `withdrawal:${r.id}`, kind: 'withdrawal', ts, site, userId: ctx.userId, source: 'import', balanceBefore: null, balanceAfter: null, item, value: item.price, exactTime: false };
 }
 
+// An imported withdrawal's time is when the item arrived, so it comes before the live capture of the
+// same withdrawal. Items held longer than this before withdrawing are not paired.
+const WITHDRAWAL_TWIN_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const WITHDRAWAL_TWIN_SLACK_MS = 5 * 60 * 1000;
+
+/**
+ * Ids of imported withdrawals that repeat a live-captured one. The live event (POST /withdrawals) keys
+ * on the inventory item id and the imported one (inventory history) on the history row id, so the two
+ * never share an id. They are paired by item name: each live withdrawal takes the latest unpaired
+ * imported withdrawal of the same item that arrived before it, within WITHDRAWAL_TWIN_WINDOW_MS.
+ * @param {any[]} events any mix of events; only withdrawals are looked at
+ * @returns {Set<string>}
+ */
+export function withdrawalTwinIds(events) {
+  const imported = new Map(); // item name -> imported withdrawals, oldest first
+  const live = [];
+  for (const e of events) {
+    if (!e || e.kind !== 'withdrawal') continue;
+    if (e.source === 'live') live.push(e);
+    else if (e.source === 'import') {
+      const name = e.item?.name;
+      if (!imported.has(name)) imported.set(name, []);
+      imported.get(name).push(e);
+    }
+  }
+  for (const list of imported.values()) list.sort((a, b) => a.ts - b.ts);
+  live.sort((a, b) => a.ts - b.ts);
+  const twins = new Set();
+  for (const l of live) {
+    const list = imported.get(l.item?.name);
+    if (!list) continue;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const imp = list[i];
+      if (imp.ts > l.ts + WITHDRAWAL_TWIN_SLACK_MS) continue;
+      if (l.ts - imp.ts > WITHDRAWAL_TWIN_WINDOW_MS) break;
+      twins.add(imp.id);
+      list.splice(i, 1);
+      break;
+    }
+  }
+  return twins;
+}
+
 /** POST /withdrawals: one event per requested inventory item, priced from the learned inventory. */
 export function parseWithdrawalRequest(ex, ctx, site) {
   if (ex.status >= 400) return [];
@@ -168,6 +222,18 @@ export function dropLiveTwins(imported, stored) {
     times.splice(i, 1); // one live drop matches one imported drop
     return false;
   });
+}
+
+/**
+ * Imported case drops that duplicate a stored live drop. Import normally skips these (dropLiveTwins),
+ * but when a browser imports from the site first and gets the live copies later (from another
+ * browser through the cloud, or a file), both end up stored. Returns the ids of the imported copies.
+ */
+export function caseTwinIds(events) {
+  const imported = events.filter((e) => e && e.kind === 'case' && e.source === 'import' && e.item);
+  if (!imported.length) return new Set();
+  const kept = new Set(dropLiveTwins(imported, events));
+  return new Set(imported.filter((e) => !kept.has(e)).map((e) => e.id));
 }
 
 /** POST /game/cases/{slug}/open  ->  one CaseEvent per dropped item. */

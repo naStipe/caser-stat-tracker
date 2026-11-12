@@ -157,6 +157,7 @@ export function mountDashboard(opts = {}) {
     holdings: null,
     holdingsError: null,
     dailyAll: false,
+    accounts: null,
   };
   for (const kind of ['chance', 'stake']) {
     const cfg = EDGE_CFG[kind];
@@ -180,7 +181,6 @@ export function mountDashboard(opts = {}) {
   };
 
   // ---------- launcher ----------
-  const netEl = h('span', { class: 'net num', text: DASH });
   const launcher = h(
     'button',
     {
@@ -193,14 +193,16 @@ export function mountDashboard(opts = {}) {
     },
     h('span', { class: 'mark', 'aria-hidden': 'true' }),
     h('span', { class: 'label', text: 'Stats' }),
-    netEl,
   );
 
   // ---------- panel ----------
   const titleEl = h('h2', { class: 'title', id: 'cst-title', text: 'Case and upgrade stats' });
   const subEl = h('div', { class: 'sub' });
+  // Account picker: shown once more than one site account has events (or is signed in).
+  const acctEl = h('div', { class: 'acct', hidden: true });
+  let acctShown = '';
   const closeBtn = h('button', { type: 'button', class: 'iconbtn', 'aria-label': 'Close stats panel', on: { click: () => close() } }, iconClose());
-  const head = h('div', { class: 'head' }, h('div', null, titleEl, subEl), closeBtn);
+  const head = h('div', { class: 'head' }, h('div', null, titleEl, subEl, acctEl), closeBtn);
 
   const tabsEl = h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Stats sections' });
   const tabBtns = {};
@@ -317,6 +319,7 @@ export function mountDashboard(opts = {}) {
     } catch (e) {
       state.loadError = e;
     }
+    if (typeof o.getAccounts === 'function') state.accounts = safe(() => o.getAccounts()).value || null;
     // Holdings (cash balance + skin value) for the Money tab. Optional; may be sync or async.
     if (typeof o.getHoldings === 'function') {
       try {
@@ -330,7 +333,6 @@ export function mountDashboard(opts = {}) {
     state.loading = false;
     state.loaded = true;
     state.cache.clear();
-    updateLauncher();
     if (state.open) render();
     if (state.again) {
       state.again = false;
@@ -338,21 +340,6 @@ export function mountDashboard(opts = {}) {
     }
   }
   const refresh = debounce(doRefresh, 250);
-
-  function updateLauncher() {
-    const c = cur();
-    if (!state.events.length) {
-      netEl.textContent = 'no data';
-      netEl.className = 'net num muted';
-      launcher.setAttribute('aria-label', 'Open stats panel. No events recorded yet.');
-      return;
-    }
-    const sum = memo('summary', () => call('summarize', state.events));
-    const net = sum.value && sum.value.total ? sum.value.total.net : null;
-    netEl.textContent = fmtMoney(net, c, { sign: true });
-    netEl.className = `net num ${signClass(net)}`;
-    launcher.setAttribute('aria-label', `Open stats panel. Total net ${fmtMoney(net, c, { sign: true })}.`);
-  }
 
   // ---------- render ----------
   function contentWidth() {
@@ -381,6 +368,7 @@ export function mountDashboard(opts = {}) {
       : n
         ? `${fmtInt(n)} events, ${fmtDate(first)} ${DASH} ${fmtDate(last)}`
         : 'No events recorded yet';
+    renderAccounts();
 
     for (const [id] of TABS) {
       const sel = id === state.tab;
@@ -429,6 +417,41 @@ export function mountDashboard(opts = {}) {
       }
     }
     state.pendingFocus = null;
+  }
+
+  // Rebuilt only when the choices change, so an open dropdown keeps its focus across refreshes.
+  function renderAccounts() {
+    const a = state.accounts;
+    const list = a && Array.isArray(a.list) ? a.list : [];
+    const show = list.length > 1;
+    const value = a && a.selected != null ? String(a.selected) : 'all';
+    const sig = show ? JSON.stringify([value, list.map((x) => [x.id, x.name, x.events, x.current])]) : '';
+    if (sig === acctShown) return;
+    acctShown = sig;
+    acctEl.hidden = !show;
+    if (!show) {
+      acctEl.replaceChildren();
+      return;
+    }
+    const current = list.find((x) => x.current);
+    const label = (x) => `${x.name}${x.current ? ' (signed in)' : ''}, ${fmtInt(x.events)} events`;
+    const select = h(
+      'select',
+      {
+        'aria-label': 'Account',
+        title: 'Which site account the stats are for',
+        on: {
+          change: (e) => {
+            const v = e.target.value;
+            // Picking the signed-in account means "follow whoever is signed in".
+            safe(() => o.selectAccount(current && v === current.id ? 'current' : v));
+          },
+        },
+      },
+      list.map((x) => h('option', { value: x.id, selected: x.id === value, text: label(x) })),
+      h('option', { value: 'all', selected: value === 'all', text: 'All accounts' }),
+    );
+    acctEl.replaceChildren(select);
   }
 
   // ---------- small view helpers ----------
@@ -1224,6 +1247,122 @@ export function mountDashboard(opts = {}) {
     doRefresh();
   }
 
+  // Cloud sync: one random key shared by all the user's browsers names their common history.
+  function cloudSection(cl, btn) {
+    const on = !!cl.key;
+    const sec = h('section', null, h('h3', { text: 'Sync between browsers' }));
+    if (!on) {
+      const keyInput = h('input', {
+        type: 'text',
+        class: 'key-input',
+        placeholder: 'Paste the sync key from your other browser',
+        autocomplete: 'off',
+        spellcheck: 'false',
+        'aria-label': 'Sync key',
+        'data-fk': 'cloud-key-input',
+        value: state.cloudKeyDraft || '',
+        on: { input: (e) => (state.cloudKeyDraft = e.target.value) },
+      });
+      sec.append(
+        h('p', {
+          class: 'hint',
+          text: 'Keeps one history in every browser you use (Brave, Chrome, another PC). Your events are stored in the tracker\'s cloud database under a secret key. Start in one browser, then paste the key in the others.',
+        }),
+        h(
+          'div',
+          { class: 'btns' },
+          btn('cloud-start', 'Start cloud sync', 'primary', () =>
+            run('cloud-start', () => o.onCloudStart(), () => 'Cloud sync is on. Copy the key into your other browsers.'),
+          ),
+        ),
+        h(
+          'div',
+          { class: 'btns key-row' },
+          keyInput,
+          btn('cloud-join', 'Use key', '', () =>
+            run('cloud-join', () => o.onCloudJoin(state.cloudKeyDraft), (r) => {
+              state.cloudKeyDraft = '';
+              return `Cloud sync is on. ${fmtInt(num(r && r.added))} events came from your other browsers.`;
+            }),
+          ),
+        ),
+      );
+      return sec;
+    }
+
+    const stateText =
+      cl.state === 'syncing'
+        ? `Syncing… ${cl.progress || ''}`
+        : cl.state === 'error'
+          ? `Failed: ${cl.error}`
+          : ok(cl.lastPull)
+            ? `Up to date, checked ${fmtAgo(cl.lastPull)}`
+            : 'Waiting';
+    // Shown in a read-only field: the site turns off text selection on the page, inputs keep it.
+    const shown = state.cloudKeyShown
+      ? h('input', {
+          type: 'text',
+          readonly: true,
+          class: 'key-input key-shown',
+          value: cl.key,
+          'aria-label': 'Sync key',
+          'data-fk': 'cloud-key-shown',
+          spellcheck: 'false',
+          on: { focus: (e) => e.target.select(), click: (e) => e.target.select() },
+        })
+      : `${cl.key.slice(0, 4)}${'•'.repeat(12)}`;
+    sec.append(
+      h(
+        'dl',
+        { class: 'status' },
+        h('dt', { text: 'Cloud' }),
+        h('dd', { class: cl.state === 'error' ? 'neg' : null }, h('span', { class: ['dot', cl.state === 'error' ? 'off' : 'on'], 'aria-hidden': 'true' }), stateText),
+        h('dt', { text: 'Sync key' }),
+        h('dd', { class: 'num key-text' }, shown),
+      ),
+      h(
+        'div',
+        { class: 'btns' },
+        btn('cloud-copy', 'Copy key', 'primary', () => {
+          const done = (text, tone) => {
+            state.msg = { text, tone };
+            state.pendingFocus = 'cloud-copy';
+            render();
+          };
+          const copied = () => done('Key copied. Paste it in Data → Sync between browsers in your other browser.', 'pos');
+          const failed = () => {
+            state.cloudKeyShown = true;
+            done('Could not copy. The key is shown in the box above: click it, then press Ctrl+C.', 'neg');
+          };
+          // The userscript manager's clipboard works where the page blocks navigator.clipboard.
+          if (typeof o.copyText === 'function' && safe(() => o.copyText(cl.key)).value === true) copied();
+          else {
+            try {
+              navigator.clipboard.writeText(cl.key).then(copied, failed);
+            } catch {
+              failed();
+            }
+          }
+        }),
+        btn('cloud-show', state.cloudKeyShown ? 'Hide key' : 'Show key', '', () => {
+          state.cloudKeyShown = !state.cloudKeyShown;
+          state.pendingFocus = 'cloud-show';
+          render();
+        }),
+        btn('cloud-sync', 'Sync now', '', () => run('cloud-sync', () => o.onCloudSync(), (r) => `Cloud sync done: ${fmtInt(num(r && r.added))} new events.`), {
+          busyLabel: 'Syncing…',
+          disabled: cl.state === 'syncing',
+        }),
+        btn('cloud-stop', 'Stop', '', () => run('cloud-stop', () => o.onCloudStop(), () => 'Cloud sync is off in this browser. The cloud copy is kept.')),
+      ),
+      h('p', {
+        class: 'hint',
+        text: 'Anyone with this key can read and change your history, so keep it private. Checks for new events every minute while the tab is open.',
+      }),
+    );
+    return sec;
+  }
+
   function viewData() {
     const ev = state.events;
     const c = cur();
@@ -1232,6 +1371,9 @@ export function mountDashboard(opts = {}) {
     const nUp = ev.filter((e) => e.kind === 'upgrade').length;
     const nDep = ev.filter((e) => e.kind === 'deposit').length;
     const nWd = ev.filter((e) => e.kind === 'withdrawal').length;
+    // Export and "Clear all" cover every account, not only the one shown.
+    const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
+    const totalEvents = state.accounts && ok(state.accounts.total) ? state.accounts.total : ev.length;
     const busy = !!state.busy;
 
     const btn = (name, label, cls, onClick, extra = {}) =>
@@ -1319,6 +1461,40 @@ export function mountDashboard(opts = {}) {
       ),
     );
 
+    if (st.cloud && typeof o.onCloudStart === 'function') out.push(cloudSection(st.cloud, btn));
+
+    const settings = safe(() => (o.getSettings ? o.getSettings() : null)).value;
+    if (settings && typeof o.setSetting === 'function') {
+      out.push(
+        h(
+          'section',
+          null,
+          h('h3', { text: 'Panels' }),
+          h(
+            'label',
+            { class: 'switch' },
+            h('input', {
+              type: 'checkbox',
+              checked: !!settings.upgradeOverlay,
+              'data-fk': 'set-overlay',
+              on: {
+                change: (e) => {
+                  safe(() => o.setSetting('upgradeOverlay', e.target.checked));
+                  state.pendingFocus = 'set-overlay';
+                  render();
+                },
+              },
+            }),
+            h('span', { text: 'Upgrade odds card on the upgrade page' }),
+          ),
+          h('p', {
+            class: 'hint',
+            text: 'Shows odds, EV and your real win rate for the selected upgrade. It recomputes over your whole history, so turn it off if the upgrade page lags.',
+          }),
+        ),
+      );
+    }
+
     const exp = (format) => {
       try {
         if (typeof o.onExport !== 'function') throw new Error('not available');
@@ -1338,9 +1514,10 @@ export function mountDashboard(opts = {}) {
         h(
           'div',
           { class: 'btns' },
-          btn('export-json', 'Export JSON', '', () => exp('json'), { disabled: !ev.length }),
-          btn('export-csv', 'Export CSV', '', () => exp('csv'), { disabled: !ev.length }),
+          btn('export-json', 'Export JSON', '', () => exp('json'), { disabled: !totalEvents }),
+          btn('export-csv', 'Export CSV', '', () => exp('csv'), { disabled: !totalEvents }),
         ),
+        nAccounts > 1 ? h('p', { class: 'hint', text: 'Exports hold the events of every account. Each event keeps its account id.' }) : null,
       ),
     );
 
@@ -1357,7 +1534,7 @@ export function mountDashboard(opts = {}) {
           state.pendingFocus = 'clear-cancel';
           render();
         },
-        { disabled: !ev.length || state.confirmClear },
+        { disabled: !totalEvents || state.confirmClear },
       ),
     );
     if (state.confirmClear) {
@@ -1367,7 +1544,7 @@ export function mountDashboard(opts = {}) {
           { class: 'confirm', role: 'alertdialog', 'aria-labelledby': 'cst-confirm-text' },
           h('p', {
             id: 'cst-confirm-text',
-            text: `Delete all ${fmtInt(ev.length)} recorded events from this browser? This cannot be undone. Export first if you want a backup.`,
+            text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ''} from this browser? This cannot be undone. Export first if you want a backup.`,
           }),
           h(
             'div',
@@ -1391,8 +1568,6 @@ export function mountDashboard(opts = {}) {
   }
 
   // ---------- start ----------
-  updateLauncher();
-  netEl.textContent = '…';
   doRefresh();
 
   return {

@@ -36,6 +36,7 @@ function icon(d) {
 const GRIP = 'M6 4h.01M10 4h.01M6 8h.01M10 8h.01M6 12h.01M10 12h.01';
 const CHEVRON_UP = 'M4 10l4-4 4 4';
 const CHEVRON_DOWN = 'M4 6l4 4 4-4';
+const CLOSE = 'M4.5 4.5l7 7M11.5 4.5l-7 7';
 
 /**
  * One-line plain-language verdict.
@@ -179,7 +180,11 @@ export function mountUpgradeOverlay(opts = {}) {
       },
     },
   });
-  const bar = h('div', { class: 'bar' }, grip, h('span', { class: 'ttl', text: 'Upgrade odds' }), toggle);
+  const off =
+    typeof o.onTurnOff === 'function'
+      ? h('button', { type: 'button', class: 'iconbtn', 'aria-label': 'Turn off upgrade odds', title: 'Turn off. Turn it back on in Stats, Data tab.', on: { click: () => o.onTurnOff() } }, icon(CLOSE))
+      : null;
+  const bar = h('div', { class: 'bar' }, grip, h('span', { class: 'ttl', text: 'Upgrade odds' }), toggle, off);
   const content = h('div', { class: 'content', id: 'cst-overlay-content' });
   const card = h('div', { class: 'card', role: 'region', 'aria-label': 'Upgrade odds', hidden: true }, bar, content);
   wrap.append(card);

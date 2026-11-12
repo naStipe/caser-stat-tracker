@@ -1,18 +1,37 @@
 // Userscript entry. Runs at document-start so the fetch hook is in place before the site's first request.
 
 import { installHook } from './capture/hook.js';
-import { Context, parseExchange } from './capture/parsers.js';
+import { Context, parseExchange, withdrawalTwinIds, caseTwinIds } from './capture/parsers.js';
 import { importHistory } from './capture/history.js';
 import { readUpgradeSelection } from './capture/selection.js';
+import { caseSlugFromPath, caseDetailPath, caseInfoFromResponse, fetchCaseInfo } from './capture/caseinfo.js';
+import { replacementItemId, candidatesFromResponse } from './capture/replacements.js';
+import { createPriceClient } from './prices/csfloat.js';
 import { Store, shouldReplace, mergeEvent } from './store/db.js';
 import { toJson, toCsv, fromJson } from './store/export.js';
+import { createSharedStore, gmStorage } from './store/shared.js';
+import { createCloud, isSyncKey, newSyncKey } from './store/cloud.js';
+import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
 import * as stats from './stats/index.js';
-import { mountDashboard, mountUpgradeOverlay } from './ui/index.js';
+import { mountDashboard, mountUpgradeOverlay, mountCasePanel, mountExchangePanel } from './ui/index.js';
+import { store as uiStore } from './ui/dom.js';
 
 const VERSION = typeof __VERSION__ === 'string' ? __VERSION__ : 'dev';
+// The script runs in Tampermonkey's sandbox (it needs GM_xmlhttpRequest for CSFloat), so the site's own
+// fetch / XMLHttpRequest live on unsafeWindow.
+// eslint-disable-next-line no-undef
+const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 const site = location.hostname.replace(/^www\./, '');
 const ctx = new Context();
 const store = new Store(indexedDB);
+// Same account on every domain: events are also kept in the script's own storage, which all
+// domains share (see store/shared.js). Null when the manager does not grant GM storage.
+const sharedGm = gmStorage();
+const shared = sharedGm && createSharedStore(sharedGm);
+// Settings that belong to this browser rather than to one domain (the cloud sync key).
+const browserPrefs = sharedGm
+  ? { get: (k) => sharedGm.get(k, null), set: (k, v) => sharedGm.set(k, v) }
+  : { get: (k) => uiStore.get(k, null), set: (k, v) => uiStore.set(k, v) };
 
 let lastAuth = null;
 let lastEventTs = null;
@@ -44,6 +63,85 @@ function getEvents() {
   return memLoad.then((list) => list.slice());
 }
 
+// ---- Accounts (see store/accounts.js) ----
+// Every event keeps the userId of the account that made it. The panels show the account picked in
+// the dashboard: "current" (default) follows whoever is signed in on the page.
+const ACCOUNT_SEL_KEY = 'cst.ui.account';
+
+function knownAccounts() {
+  const v = browserPrefs.get('accounts');
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+
+/** Remember the signed-in account's name for the picker (script storage: every domain sees it). */
+function rememberAccount() {
+  if (ctx.userId == null) return;
+  const known = knownAccounts();
+  const name = ctx.userName ?? known[ctx.userId]?.name ?? null;
+  if (known[ctx.userId] && known[ctx.userId].name === name) return;
+  browserPrefs.set('accounts', { ...known, [ctx.userId]: { name } });
+}
+
+/**
+ * Owner of events without a userId and of the old flags that had no account. Fixed once the
+ * events of this browser are all here (see fixLegacyOwner); until then it is computed.
+ */
+function legacyOwner() {
+  const v = browserPrefs.get('acct:legacy');
+  if (typeof v === 'string' && v) return v;
+  return memEvents ? pickLegacyOwner(memEvents) : null;
+}
+
+function fixLegacyOwner() {
+  const v = browserPrefs.get('acct:legacy');
+  if (typeof v === 'string' && v) return;
+  const pick = memEvents ? pickLegacyOwner(memEvents) : null;
+  if (pick) browserPrefs.set('acct:legacy', pick);
+}
+
+/** The account the panels show: an id, 'all', or null when no account is known yet. */
+function selectedAccount() {
+  return resolveSelection(uiStore.get(ACCOUNT_SEL_KEY, 'current'), ctx.userId, legacyOwner());
+}
+
+/** Events of the selected account. Sync, export and clear keep working on all events. */
+async function getViewEvents() {
+  const all = await getEvents();
+  return filterByAccount(all, selectedAccount(), legacyOwner());
+}
+
+function accountsState() {
+  const all = memEvents ?? [];
+  return {
+    list: listAccounts(all, knownAccounts(), legacyOwner(), ctx.userId),
+    selected: selectedAccount(),
+    total: all.length,
+  };
+}
+
+function selectAccount(sel) {
+  uiStore.set(ACCOUNT_SEL_KEY, sel);
+  dashboard?.refresh();
+  overlay?.refresh();
+}
+
+/** The site reported who is signed in (page load, or a switch to another account). */
+function onAccountSeen(previous) {
+  rememberAccount();
+  if (ctx.userId === previous) return;
+  dashboard?.refresh();
+  overlay?.refresh();
+  // A newly signed-in account gets its own history sync when it is due.
+  if (mounted && previous != null) setTimeout(maybeAutoSync, 3000);
+}
+
+/** Cash balance and skin value are only known for the signed-in account. */
+function holdings() {
+  const sel = selectedAccount();
+  if (sel != null && sel !== ctx.userId) return { balance: null, inventoryValue: null };
+  return { balance: ctx.balance, inventoryValue: ctx.inventoryValue };
+}
+
 /** Mirror of Store.putEvents on the in-memory copy. */
 function applyToMemory(events) {
   if (!memEvents) return;
@@ -67,17 +165,299 @@ function applyToMemory(events) {
   }
 }
 
+/**
+ * A withdrawal or case drop captured live and the same one imported from the site's history have
+ * different ids. Import skips the copy when the live one is already stored, but the live one can
+ * arrive later (another browser through the cloud, the other domain, a file), and older versions
+ * also stored both. Remove the imported copies; the deletion reaches the other domain and the cloud.
+ */
+async function removeTwins() {
+  const events = await getEvents();
+  const twins = [...withdrawalTwinIds(events), ...caseTwinIds(events)];
+  if (!twins.length) return 0;
+  await deleteEvents(twins);
+  return twins.length;
+}
+
+/** Delete events here, in the storage shared by the domains and (unless the cloud asked) in the cloud. */
+async function deleteEvents(ids, { cloud: toCloud = true } = {}) {
+  if (!ids.length) return;
+  const drop = new Set(ids);
+  await store.deleteEvents(ids);
+  try {
+    shared?.remove(ids);
+  } catch (err) {
+    console.warn('[caser-tracker] could not update shared storage', err);
+  }
+  if (memEvents) {
+    memEvents = memEvents.filter((e) => !drop.has(e.id));
+    memIndex = new Map(memEvents.map((e, i) => [e.id, i]));
+  }
+  if (toCloud && cloudKey()) cloud.remove(ids).catch((err) => console.warn('[caser-tracker] could not delete in cloud', err));
+}
+
 function dropMemory() {
   memEvents = null;
   memIndex = null;
 }
 
-async function saveEvents(events) {
+async function saveEvents(events, { share = true, cloud: toCloud = true } = {}) {
   const added = await store.putEvents(events);
   applyToMemory(events);
   // A load that was already running may have read the store before this save; applying twice is harmless.
   if (memLoad) memLoad.then(() => applyToMemory(events), () => {});
+  if (share) queueShared(events);
+  if (toCloud) queueCloud(events);
   return added;
+}
+
+// ---- Shared storage across domains ----
+// Writes are batched: a history sync saves page after page, and each shared write rewrites a whole day.
+let sharedQueue = [];
+let sharedTimer = null;
+function queueShared(events) {
+  if (!shared || !events.length) return;
+  sharedQueue.push(...events);
+  if (!sharedTimer) sharedTimer = setTimeout(flushShared, 1500);
+}
+
+function flushShared() {
+  sharedTimer = null;
+  const batch = sharedQueue;
+  sharedQueue = [];
+  try {
+    shared.merge(batch);
+  } catch (err) {
+    console.warn('[caser-tracker] could not write shared storage', err);
+  }
+}
+
+/** Clears this domain's copy, for "clear all data" here or on another domain. */
+async function clearLocal() {
+  const ids = new Set(Object.keys(knownAccounts()));
+  for (const e of memEvents ?? (await getEvents())) if (e.userId != null) ids.add(String(e.userId));
+  if (ctx.userId != null) ids.add(ctx.userId);
+  await store.clearEvents();
+  dropMemory();
+  const keys = ['lastSync', 'lastSyncBy', ...HISTORY_STREAMS.map((s) => `sync:${s}`)];
+  for (const id of ids) for (const s of HISTORY_STREAMS) keys.push(progressKey(s, id));
+  for (const k of keys) await store.setMeta(k, null);
+  browserPrefs.set('sync:complete', []);
+  browserPrefs.set('acct:legacy', null);
+  lastSyncLegacy = null;
+  lastSyncBy = {};
+}
+
+// ---- "History read to the end" flags ----
+// A full read of a site-history stream takes many minutes. Once any domain or browser has done it
+// and the events reach here (shared storage or cloud), later syncs only need the newest pages.
+// The flag is kept per domain (IndexedDB meta, with the resume offset), per browser (script
+// storage, all domains) and per sync key (cloud), each per site account ("upgrades:<userId>").
+const HISTORY_STREAMS = ['upgrades', 'inventory', 'payments'];
+
+function browserComplete() {
+  const v = browserPrefs.get('sync:complete');
+  return Array.isArray(v) ? v : [];
+}
+
+function markBrowserComplete(flag) {
+  const v = browserComplete();
+  if (!v.includes(flag)) browserPrefs.set('sync:complete', [...v, flag]);
+}
+
+function markComplete(flag) {
+  markBrowserComplete(flag);
+  if (cloudKey()) cloud.markComplete(flag).catch((err) => console.warn('[caser-tracker] could not update cloud', err));
+}
+
+/** Domains that finished a full read before flags were shared: publish it to the browser. */
+async function publishLocalComplete() {
+  for (const s of HISTORY_STREAMS) if ((await store.getMeta(`sync:${s}`))?.complete) markBrowserComplete(s);
+}
+
+// Progress of the signed-in account. Before multi-account support it was kept without an account;
+// that copy belongs to the legacy owner.
+const historyProgress = {
+  async load(name) {
+    const uid = ctx.userId;
+    const legacy = legacyOwner();
+    let local = await store.getMeta(progressKey(name, uid));
+    if (local == null && uid === legacy) local = await store.getMeta(`sync:${name}`);
+    if (local?.complete || !flagComplete(browserComplete(), name, uid, legacy)) return local;
+    return { complete: true, offset: 0 };
+  },
+  async save(name, v) {
+    await store.setMeta(progressKey(name, ctx.userId), v);
+    if (v?.complete) markComplete(streamFlag(name, ctx.userId));
+  },
+};
+
+/**
+ * Pull the other domains' events into this domain, then push this domain's events out.
+ * The first run on a domain copies its whole IndexedDB history into the shared storage.
+ */
+async function syncShared() {
+  if (!shared) return;
+  const clearedAt = shared.clearedAt();
+  if (clearedAt && clearedAt > ((await store.getMeta('sharedClearSeen')) ?? 0)) {
+    // Data was cleared on another domain after this domain last looked.
+    await clearLocal();
+    await store.setMeta('sharedClearSeen', clearedAt);
+  }
+  // Not queued for the cloud: the first cloud sync on this domain sends everything stored here.
+  const remote = shared.readAll();
+  if (remote.length) await saveEvents(remote, { share: false, cloud: false });
+  await removeTwins();
+  shared.merge(await getEvents());
+  shared.onRemoteChange(async (rev) => {
+    try {
+      const cleared = shared.clearedAt();
+      if (cleared && cleared > ((await store.getMeta('sharedClearSeen')) ?? 0)) {
+        await clearLocal();
+        await store.setMeta('sharedClearSeen', cleared);
+        dashboard?.refresh();
+        return;
+      }
+      // The tab that wrote these also sends them to the cloud.
+      const events = shared.readDays(rev?.days);
+      if (events.length && (await saveEvents(events, { share: false, cloud: false }))) {
+        await removeTwins();
+        refreshAfterLive();
+      }
+    } catch (err) {
+      console.warn('[caser-tracker] could not read shared storage', err);
+    }
+  });
+}
+
+// ---- Cloud sync between browsers (see store/cloud.js) ----
+// The sync key lives in this browser's script storage, so both domains use the same one.
+// Per domain, IndexedDB meta keeps how far the cloud was read ("cloudCursor") and whether this
+// domain's own history was sent once ("cloudPushedKey").
+const CLOUD_PULL_EVERY_MS = 60 * 1000;
+const cloud = createCloud({ request: gmRequest, getKey: () => cloudKey() });
+let cloudStatus = { state: 'idle', lastPull: null, error: null, progress: null };
+const cloudQueue = new Set();
+let cloudTimer = null;
+let cloudRun = null;
+
+function cloudKey() {
+  const k = browserPrefs.get('cloud:key');
+  return isSyncKey(k) ? k : null;
+}
+
+function queueCloud(events) {
+  if (!cloudKey() || !events.length) return;
+  for (const e of events) cloudQueue.add(e.id);
+  if (!cloudTimer) {
+    cloudTimer = setTimeout(() => {
+      cloudTimer = null;
+      flushCloud().catch(() => {});
+    }, 3000);
+  }
+}
+
+/** Send queued events. The stored (merged) copy is sent, so the cloud gets the best version. */
+async function flushCloud() {
+  if (!cloudQueue.size || !cloudKey()) return;
+  const ids = [...cloudQueue];
+  cloudQueue.clear();
+  const byId = new Map((await getEvents()).map((e) => [e.id, e]));
+  const events = ids.map((id) => byId.get(id)).filter(Boolean);
+  try {
+    await cloud.push(events);
+    if (cloudStatus.state === 'error') cloudStatus = { ...cloudStatus, state: 'idle', error: null };
+  } catch (err) {
+    for (const id of ids) cloudQueue.add(id);
+    cloudStatus = { ...cloudStatus, state: 'error', error: err.message || String(err) };
+    throw err;
+  }
+}
+
+/** Pull what other browsers sent, then send what this domain has that the cloud may lack. */
+function cloudSync() {
+  const key = cloudKey();
+  if (!key) return Promise.resolve(null);
+  if (cloudRun) return cloudRun;
+  cloudRun = (async () => {
+    cloudStatus = { ...cloudStatus, state: 'syncing', progress: 'Checking' };
+    dashboard?.refresh();
+    try {
+      // "Clear all" in another browser: drop the local copy too, unless the clear happened before
+      // this browser started using the key.
+      const account = await cloud.account();
+      const seen = Number(browserPrefs.get('cloud:clearSeen')) || 0;
+      if (account.clearedAt && account.clearedAt > seen) {
+        browserPrefs.set('cloud:clearSeen', account.clearedAt);
+        await clearLocal();
+        if (shared) await store.setMeta('sharedClearSeen', shared.clear());
+      }
+
+      let cursor = await store.getMeta('cloudCursor');
+      if (!cursor || cursor.key !== key) cursor = null;
+      cloudStatus = { ...cloudStatus, progress: cursor ? 'Downloading changes' : 'Downloading history' };
+      dashboard?.refresh();
+      const res = await cloud.pull(cursor);
+      if (res.deletedIds.length) await deleteEvents(res.deletedIds, { cloud: false });
+      let added = 0;
+      for (let i = 0; i < res.events.length; i += 2000) added += await saveEvents(res.events.slice(i, i + 2000), { cloud: false });
+      if (res.cursor) await store.setMeta('cloudCursor', { key, ...res.cursor });
+      if (added) await removeTwins();
+
+      // First sync of this domain under this key: send its whole history once.
+      if ((await store.getMeta('cloudPushedKey')) !== key) {
+        await cloud.push(await getEvents(), (done, total) => {
+          cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${total}` };
+          refreshSoon();
+        });
+        await store.setMeta('cloudPushedKey', key);
+      }
+      await flushCloud();
+
+      // Exchange "history read to the end" flags, now that the events behind them are here.
+      for (const s of account.complete) if (isStreamFlag(s, HISTORY_STREAMS)) markBrowserComplete(s);
+      for (const s of browserComplete()) {
+        if (account.complete.includes(s)) continue;
+        try {
+          await cloud.markComplete(s);
+        } catch (err) {
+          console.warn('[caser-tracker] could not update cloud', err);
+        }
+      }
+      // Every event of this key is here now, so the owner of old account-less data is known.
+      fixLegacyOwner();
+
+      cloudStatus = { state: 'idle', lastPull: Date.now(), error: null, progress: null };
+      if (added) refreshSoon();
+      return { added };
+    } catch (err) {
+      cloudStatus = { ...cloudStatus, state: 'error', error: err.message || String(err), progress: null };
+      throw err;
+    } finally {
+      cloudRun = null;
+      dashboard?.refresh();
+    }
+  })();
+  return cloudRun;
+}
+
+function setCloudKey(key) {
+  if (key != null && !isSyncKey(key)) throw new Error('That is not a sync key. A key is 32 or more letters, digits, - or _.');
+  browserPrefs.set('cloud:key', key);
+  // Clears made under this key before now do not apply to this browser's data.
+  browserPrefs.set('cloud:clearSeen', key ? Date.now() : null);
+  cloudQueue.clear();
+  cloudStatus = { state: 'idle', lastPull: null, error: null, progress: null };
+  return key ? cloudSync() : null;
+}
+
+let cloudTicker = null;
+function startCloudTicker() {
+  if (cloudTicker) return;
+  cloudTicker = setInterval(() => {
+    if (document.visibilityState !== 'visible' || !cloudKey()) return;
+    cloudSync().catch((err) => console.warn('[caser-tracker] cloud sync failed', err));
+  }, CLOUD_PULL_EVERY_MS);
 }
 
 // After a live upgrade or case open the site plays its animation. Recomputing stats then makes it
@@ -96,11 +476,99 @@ function refreshAfterLive() {
   }, 2500);
 }
 
-const { origFetch } = installHook(window, async (ex) => {
+// ---- Case contents (item prices and, for custom cases, chances) ----
+// Filled from the site's own case-page responses; fetched directly only when the site's
+// response was not seen (for example when the page came from the site's cache).
+const caseInfos = new Map(); // slug -> CaseInfo
+const caseInfoLoads = new Map(); // slug -> Promise<CaseInfo|null>
+
+function rememberCaseInfo(ex) {
+  if (ex.method !== 'GET' || ex.status >= 400) return;
+  const d = caseDetailPath(ex.path);
+  if (!d) return;
+  const info = caseInfoFromResponse(ex.resBody, d);
+  if (info) caseInfos.set(d.slug, info);
+}
+
+async function getCaseInfo(slug) {
+  const known = caseInfos.get(slug);
+  if (known) return known;
+  // Give the site's own request a moment to arrive before asking ourselves.
+  for (let i = 0; i < 8 && !caseInfos.has(slug); i++) await new Promise((r) => setTimeout(r, 200));
+  if (caseInfos.has(slug)) return caseInfos.get(slug);
+  if (!caseInfoLoads.has(slug)) {
+    const p = fetchCaseInfo(origFetch, slug).then((info) => {
+      if (info) caseInfos.set(slug, info);
+      return info;
+    }).finally(() => caseInfoLoads.delete(slug));
+    caseInfoLoads.set(slug, p);
+  }
+  return caseInfoLoads.get(slug);
+}
+
+// ---- Item replacement ----
+// The site's replacement modal asks for candidates; the latest answer is kept for the exchange panel.
+let replacement = null;
+
+function rememberReplacement(ex) {
+  if (ex.method !== 'GET' || ex.status >= 400) return;
+  const itemId = replacementItemId(ex.path);
+  if (!itemId) return;
+  replacement = { itemId, candidates: candidatesFromResponse(ex.resBody), ts: Date.now() };
+}
+
+function replacementState() {
+  if (!replacement) return null;
+  const it = ctx.items.get(replacement.itemId);
+  return { itemId: replacement.itemId, current: it ? { name: it.name, price: it.price } : null, candidates: replacement.candidates };
+}
+
+// Cross-origin request (CSFloat prices, cloud sync). anonymous: no cookies are sent.
+function gmRequest({ method = 'GET', url, headers = { accept: 'application/json' }, body, timeout = 30000 }) {
+  return new Promise((resolve, reject) => {
+    // eslint-disable-next-line no-undef
+    const gm = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
+    const host = new URL(url).hostname;
+    if (!gm) {
+      reject(new Error('Reinstall the script: it needs the GM_xmlhttpRequest permission'));
+      return;
+    }
+    gm({
+      method,
+      url,
+      headers,
+      data: body,
+      anonymous: true,
+      timeout,
+      onload: (r) => {
+        let json = null;
+        try {
+          json = JSON.parse(r.responseText);
+        } catch {}
+        resolve({ status: r.status, json });
+      },
+      onerror: () => reject(new Error(`Request to ${host} failed`)),
+      ontimeout: () => reject(new Error(`Request to ${host} timed out`)),
+    });
+  });
+}
+
+const csfloatRequest = (url) => gmRequest({ url });
+
+const prices = createPriceClient({ request: csfloatRequest, storage: uiStore });
+
+const { origFetch } = installHook(pageWindow, async (ex) => {
   if (ex.auth) lastAuth = ex.auth;
+  try {
+    rememberCaseInfo(ex);
+    rememberReplacement(ex);
+  } catch {}
   // Parse before learning: learn() updates the balance, and events need the balance from before.
   const { events, recognized } = parseExchange(ex, ctx, site);
+  const userBefore = ctx.userId;
+  const nameBefore = ctx.userName;
   ctx.learn(ex);
+  if (ctx.userId !== userBefore || ctx.userName !== nameBefore) onAccountSeen(userBefore);
   if (!recognized && !events.length) return;
 
   try {
@@ -143,9 +611,34 @@ function currencyLabel() {
   return '';
 }
 
+// The upgrade overlay re-reads the selection every 400 ms and recomputes odds over the whole history,
+// so it can be turned off. Off means not mounted at all: no polling, no stats work.
+const OVERLAY_ON_KEY = 'cst.ui.upgradeOverlayOn';
+function setUpgradeOverlay(on) {
+  uiStore.set(OVERLAY_ON_KEY, on);
+  if (on && !overlay) {
+    overlay = mountUpgradeOverlay({
+      getSelection: () => readUpgradeSelection(document),
+      getEvents: getViewEvents,
+      stats,
+      currency: currencyLabel,
+      getHoldings: holdings,
+      onTurnOff: () => {
+        setUpgradeOverlay(false);
+        dashboard?.refresh();
+      },
+    });
+  } else if (!on && overlay) {
+    overlay.destroy();
+    overlay = null;
+  }
+}
+
 function mount() {
   dashboard = mountDashboard({
-    getEvents,
+    getEvents: getViewEvents,
+    getAccounts: accountsState,
+    selectAccount,
     stats,
     currency: currencyLabel,
     onExport: async (format) => {
@@ -156,27 +649,69 @@ function mount() {
     },
     onImportFile: async (file) => {
       const added = await saveEvents(fromJson(await file.text()));
+      if (added) await removeTwins();
       dashboard.refresh();
       return { added };
     },
     onImportHistory: () => sync(),
     onClear: async () => {
-      await store.clearEvents();
-      dropMemory();
-      for (const k of ['lastSync', 'sync:upgrades', 'sync:inventory', 'sync:payments']) await store.setMeta(k, null);
-      lastSync = null;
+      sharedQueue = [];
+      await clearLocal();
+      if (shared) await store.setMeta('sharedClearSeen', shared.clear());
+      if (cloudKey()) browserPrefs.set('cloud:clearSeen', await cloud.clear());
+      uiStore.set(ACCOUNT_SEL_KEY, 'current');
       dashboard.refresh();
     },
-    getStatus: () => ({ capturing: true, lastEventTs, unknownResponses, version: VERSION, lastSync, syncing: syncProgress, storagePersisted }),
-    getHoldings: () => ({ balance: ctx.balance, inventoryValue: ctx.inventoryValue }),
+    getStatus: () => ({
+      capturing: true,
+      lastEventTs,
+      unknownResponses,
+      version: VERSION,
+      lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
+      syncing: syncProgress,
+      storagePersisted,
+      cloud: { key: cloudKey(), ...cloudStatus },
+    }),
+    onCloudStart: () => setCloudKey(newSyncKey()),
+    onCloudJoin: (key) => setCloudKey(String(key ?? '').trim()),
+    onCloudStop: () => setCloudKey(null),
+    onCloudSync: () => cloudSync(),
+    copyText: (text) => {
+      // eslint-disable-next-line no-undef
+      if (typeof GM_setClipboard !== 'function') return false;
+      // eslint-disable-next-line no-undef
+      GM_setClipboard(text, 'text');
+      return true;
+    },
+    getHoldings: holdings,
+    getSettings: () => ({ upgradeOverlay: !!overlay }),
+    setSetting: (key, value) => {
+      if (key === 'upgradeOverlay') setUpgradeOverlay(!!value);
+    },
   });
-  overlay = mountUpgradeOverlay({
-    getSelection: () => readUpgradeSelection(document),
-    getEvents,
+  setUpgradeOverlay(uiStore.get(OVERLAY_ON_KEY, true) !== false);
+  mountCasePanel({
+    getSlug: () => caseSlugFromPath(location.pathname),
+    getInfo: getCaseInfo,
     stats,
     currency: currencyLabel,
-    getHoldings: () => ({ balance: ctx.balance, inventoryValue: ctx.inventoryValue }),
   });
+  mountExchangePanel({
+    isOpen: () => !!document.querySelector('[data-testid="replace-item-modal"]'),
+    getState: replacementState,
+    prices,
+    stats,
+    currency: currencyLabel,
+    // Selects the item in the site's own list (same as clicking its card). Never confirms the replacement.
+    selectCandidate: (id) => {
+      const card = document.querySelector(`[data-testid="replace-item-modal-candidate-${CSS.escape(id)}"]`);
+      if (!card) return false;
+      card.scrollIntoView({ block: 'nearest' });
+      card.click();
+      return true;
+    },
+  });
+  mounted = true;
   startAutoSync();
 }
 
@@ -184,7 +719,15 @@ function mount() {
 // Everything is kept in IndexedDB, so a sync only fetches what is new: the import stops after
 // two pages of already-stored events. The first sync on a browser is a full import.
 const AUTO_SYNC_AFTER_MS = 15 * 60 * 1000;
-let lastSync = null;
+// Last site-history sync per account. "lastSync" from before multi-account support belongs to the legacy owner.
+let lastSyncBy = {};
+let lastSyncLegacy = null;
+let mounted = false;
+
+function lastSyncFor(uid) {
+  if (uid == null || uid === 'all') return Math.max(0, lastSyncLegacy ?? 0, ...Object.values(lastSyncBy)) || null;
+  return lastSyncBy[uid] ?? (uid === legacyOwner() ? lastSyncLegacy : null);
+}
 let syncProgress = null;
 let syncPromise = null;
 let storagePersisted = null;
@@ -204,6 +747,13 @@ function sync() {
   if (syncPromise) return syncPromise;
   syncPromise = (async () => {
     try {
+      // Events still downloading from the cloud would look new to the site sync and make it
+      // read far down the history, so let the download finish first.
+      if (cloudRun) {
+        syncProgress = 'Waiting for cloud download';
+        dashboard?.refresh();
+        await cloudRun.catch(() => {});
+      }
       const res = await importHistory({
         fetch: origFetch,
         ctx,
@@ -214,18 +764,18 @@ function sync() {
           if (added) refreshSoon();
           return added;
         },
-        getStored: () => getEvents(),
+        // Only the signed-in account's events: they decide where an unfinished walk resumes.
+        getStored: async () => filterByAccount(await getEvents(), ctx.userId, legacyOwner()),
         onProgress: (msg) => {
           syncProgress = msg;
           refreshSoon();
         },
-        progressStore: {
-          load: (name) => store.getMeta(`sync:${name}`),
-          save: (name, v) => store.setMeta(`sync:${name}`, v),
-        },
+        progressStore: historyProgress,
       });
-      lastSync = Date.now();
-      await store.setMeta('lastSync', lastSync);
+      if (ctx.userId != null) {
+        lastSyncBy = { ...lastSyncBy, [ctx.userId]: Date.now() };
+        await store.setMeta('lastSyncBy', lastSyncBy);
+      }
       return res;
     } finally {
       syncProgress = null;
@@ -238,10 +788,19 @@ function sync() {
 
 async function startAutoSync() {
   try {
-    lastSync = (await store.getMeta('lastSync')) ?? null;
+    lastSyncLegacy = (await store.getMeta('lastSync')) ?? null;
+    const by = await store.getMeta('lastSyncBy');
+    lastSyncBy = by && typeof by === 'object' ? by : {};
+    await syncShared().catch((err) => console.warn('[caser-tracker] could not sync shared storage', err));
+    await publishLocalComplete().catch(() => {});
+    cloudSync().catch((err) => console.warn('[caser-tracker] cloud sync failed', err));
+    startCloudTicker();
     // "Last event" covers stored history too, not only events captured since the page loaded.
+    await removeTwins().catch((err) => console.warn('[caser-tracker] could not remove duplicates', err));
     const events = await getEvents();
     if (events.length && !lastEventTs) lastEventTs = events[events.length - 1].ts;
+    // Without cloud sync every event of this browser is here now (with it, see cloudSync).
+    if (!cloudKey()) fixLegacyOwner();
     dashboard?.refresh();
   } catch {}
   // Ask the browser not to evict the stored history under storage pressure.
@@ -249,15 +808,19 @@ async function startAutoSync() {
     storagePersisted = (await navigator.storage?.persist?.()) ?? null;
   } catch {}
   // Wait for the site to sign in and settle, then sync if it is due.
-  setTimeout(() => {
-    if (!getAuth()) return;
-    if (lastSync && Date.now() - lastSync < AUTO_SYNC_AFTER_MS) return;
-    sync().catch((err) => console.warn('[caser-tracker] sync failed', err));
-  }, 5000);
+  setTimeout(maybeAutoSync, 5000);
+}
+
+/** Sync the signed-in account's site history unless that ran in the last 15 minutes. */
+function maybeAutoSync() {
+  if (!getAuth()) return;
+  const last = lastSyncFor(ctx.userId);
+  if (last && Date.now() - last < AUTO_SYNC_AFTER_MS) return;
+  sync().catch((err) => console.warn('[caser-tracker] sync failed', err));
 }
 
 if (document.body) mount();
 else document.addEventListener('DOMContentLoaded', mount, { once: true });
 
 // Debug handle for the developer console. Holds no credentials.
-window.__caserTracker = { version: VERSION, store, ctx, stats };
+pageWindow.__caserTracker = { version: VERSION, store, ctx, stats };

@@ -420,8 +420,19 @@ if (new URLSearchParams(location.search).get('stats') === 'real') {
   try { STATS = { ...stats, ...(await import('../src/stats/index.js')) }; } catch (e) { console.warn('[preview] real stats failed to load', e); }
 }
 const $ = (id) => document.getElementById(id);
+// Second account: every 4th event belongs to "u2", to show the account picker.
+let ACCOUNT = 'current';
+const ownerOf = (e, i) => (i % 4 === 3 ? 'u2' : e.userId);
+const viewEvents = () => (ACCOUNT === 'all' ? EVENTS.slice() : EVENTS.filter((e, i) => ownerOf(e, i) === (ACCOUNT === 'current' ? 'u1' : ACCOUNT)));
 const dash = mountDashboard({
-  getEvents: async () => EVENTS.slice(),
+  getEvents: async () => viewEvents(),
+  getAccounts: () => {
+    const n2 = EVENTS.filter((e, i) => ownerOf(e, i) === 'u2').length;
+    const list = [{ id: 'u1', name: 'preview-main', events: EVENTS.length - n2, current: true }];
+    if (n2) list.push({ id: 'u2', name: 'Account u2', events: n2, current: false });
+    return { list, selected: ACCOUNT === 'current' ? 'u1' : ACCOUNT, total: EVENTS.length };
+  },
+  selectAccount: (sel) => { ACCOUNT = sel; dash.refresh(); },
   stats: STATS,
   currency: () => '₽',
   onExport: (format) => console.log('[preview] export', format),

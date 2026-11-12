@@ -15,6 +15,7 @@ const COLORS = {
   diag: '#6b7480',
   deposit: '#ef6b6b',
   withdrawal: '#45c486',
+  fast: '#d8a650',
 };
 
 function niceStep(raw) {
@@ -249,12 +250,15 @@ export function diffBars({
 
 function hoverLayer(svg, { x0, y0, w, h: hh, onMove, onLeave }) {
   const hit = s('rect', { x: x0, y: y0, width: w, height: hh, fill: 'transparent' });
-  const toLocal = (clientX) => {
+  // Local x (and y, for charts that pick the nearest point in 2D) in viewBox units.
+  const move = (e) => {
     const r = svg.getBoundingClientRect();
-    return ((clientX - r.left) / (r.width || 1)) * Number(svg.getAttribute('width'));
+    const px = ((e.clientX - r.left) / (r.width || 1)) * Number(svg.getAttribute('width'));
+    const py = ((e.clientY - r.top) / (r.height || 1)) * Number(svg.getAttribute('height'));
+    onMove(px, py);
   };
-  hit.addEventListener('pointermove', (e) => onMove(toLocal(e.clientX)));
-  hit.addEventListener('pointerdown', (e) => onMove(toLocal(e.clientX)));
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
   hit.addEventListener('pointerleave', onLeave);
   svg.append(hit);
 }
@@ -482,6 +486,182 @@ export function moneyChart({ series, width, currency = '' }) {
     { class: 'legend' },
     h('span', null, h('i', { class: 'sw', style: { background: COLORS.deposit } }), 'Deposit'),
     h('span', null, h('i', { class: 'sw', style: { background: COLORS.withdrawal } }), 'Withdrawal'),
+  );
+  return h('div', { class: 'chart' }, readout, svg, legend);
+}
+
+/**
+ * Tiny sales sparkline for a list row: sale prices over time with the typical price as a flat line.
+ * points: [{ts, price}] in any order. Returns null with fewer than 2 points.
+ */
+export function salesSparkline({ points, typical = null, width = 64, height = 22 }) {
+  let pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
+  // Leave out outliers so one sticker craft does not flatten the line.
+  const ref = okNum(typical) ? typical : [...pts].sort((a, b) => a.price - b.price)[pts.length >> 1]?.price;
+  pts = pts.filter((p) => p.price >= ref * 0.5 && p.price <= ref * 1.5);
+  if (pts.length < 2) return null;
+  const W = width;
+  const H = height;
+  const pad = 2;
+  const clip = (v) => Math.max(ref * 0.5, Math.min(ref * 1.5, v));
+  const vs = pts.map((p) => clip(p.price));
+  if (okNum(typical)) vs.push(typical);
+  const lo = Math.min(...vs);
+  const hi = Math.max(...vs);
+  const t0 = pts[0].ts;
+  const t1 = pts[pts.length - 1].ts;
+  const x = (t) => pad + (t1 === t0 ? (W - 2 * pad) / 2 : ((t - t0) / (t1 - t0)) * (W - 2 * pad));
+  const y = (v) => pad + (H - 2 * pad) - ((clip(v) - lo) / (hi - lo || 1)) * (H - 2 * pad);
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true', class: 'spark' });
+  if (okNum(typical)) {
+    const yy = Math.round(y(typical)) + 0.5;
+    svg.append(s('line', { x1: 0, x2: W, y1: yy, y2: yy, stroke: COLORS.zero, 'stroke-width': 1 }));
+  }
+  let d = '';
+  pts.forEach((p, i) => (d += `${i ? 'L' : 'M'}${x(p.ts).toFixed(1)},${y(p.price).toFixed(1)}`));
+  const last = pts[pts.length - 1];
+  svg.append(
+    s('path', { d, fill: 'none', stroke: COLORS.line, 'stroke-width': 1.25, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'stroke-opacity': 0.85 }),
+    s('circle', { cx: x(last.ts), cy: y(last.price), r: 2, fill: COLORS.marker }),
+  );
+  return svg;
+}
+
+/**
+ * Sales history scatter: every returned sale as a dot (x = time, y = price) with the typical and fast-sale prices
+ * as flat lines and CSFloat's base price as a dotted line. Sales older than 30 days are drawn fainter; sales far
+ * from the typical price are pinned to the edge as hollow dots. Hover shows a sale's date, price and float.
+ * points: [{ts, price, float}]; prices in USD.
+ */
+export function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => '$' + fmtNumber(v, 2) }) {
+  const pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
+  if (!pts.length) return h('div', { class: 'chart' }, h('p', { class: 'faint', text: 'No CSFloat sales to draw.' }));
+  const readout = h('div', { class: 'readout', 'aria-live': 'off' });
+  const W = Math.max(200, Math.floor(width));
+  const H = height;
+  const padL = 40;
+  const padR = 8;
+  const padT = 6;
+  const padB = 20;
+  const iw = W - padL - padR;
+  const ih = H - padT - padB;
+  const DAY = 86_400_000;
+
+  const ref = okNum(typical) ? typical : pts.map((p) => p.price).sort((a, b) => a - b)[pts.length >> 1];
+  const inRange = (v) => v >= ref * 0.5 && v <= ref * 1.5;
+  const ys = pts.map((p) => p.price).filter(inRange);
+  for (const v of [typical, fast, base, upper]) if (okNum(v) && inRange(v)) ys.push(v);
+  const { lo, hi, ticks } = niceTicks(Math.min(...ys), Math.max(...ys), 3);
+  // X spans the sales themselves up to now, so a liquid item whose 40 sales are all from today is not squeezed
+  // into the right edge of a 30-day axis.
+  const tEnd = Math.max(pts[pts.length - 1].ts, now);
+  const span = Math.max(tEnd - pts[0].ts, 3_600_000);
+  const t0 = pts[0].ts - span * 0.03;
+  const t1 = tEnd;
+  const x = (t) => padL + ((t - t0) / (t1 - t0 || 1)) * iw;
+  const short = span < 2 * DAY;
+  const tlabel = (t) => (short ? fmtDateTime(t) : fmtDateShort(t));
+  const y = (v) => padT + ih - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1)) * ih;
+
+  const svg = s('svg', {
+    width: W,
+    height: H,
+    viewBox: `0 0 ${W} ${H}`,
+    role: 'img',
+    'aria-label': `${pts.length} CSFloat sales from ${fmtDateShort(pts[0].ts)} to ${fmtDateShort(pts[pts.length - 1].ts)}${okNum(typical) ? `, typical ${fmt(typical)}` : ''}`,
+  });
+  for (const t of ticks) {
+    const yy = Math.round(y(t)) + 0.5;
+    svg.append(
+      s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid, 'stroke-width': 1 }),
+      s('text', { x: padL - 6, y: yy + 3.5, 'text-anchor': 'end', text: compact(t) }),
+    );
+  }
+  // The last 30 days: the window the typical price comes from. Drawn only when older sales are on the chart.
+  const x30 = Math.round(x(now - 30 * DAY)) + 0.5;
+  const mark30 = x30 > padL + 60 && x30 < W - padR - 60;
+  if (mark30) {
+    svg.append(
+      s('line', { x1: x30, x2: x30, y1: padT, y2: padT + ih, stroke: COLORS.zero, 'stroke-width': 1, 'stroke-dasharray': '2 3' }),
+      s('text', { x: x30, y: H - 6, 'text-anchor': 'middle', text: '30 d ago' }),
+    );
+  } else {
+    const tm = (pts[0].ts + tEnd) / 2;
+    svg.append(s('text', { x: x(tm), y: H - 6, 'text-anchor': 'middle', text: tlabel(tm) }));
+  }
+  svg.append(
+    s('text', { x: padL, y: H - 6, 'text-anchor': 'start', text: tlabel(pts[0].ts) }),
+    s('text', { x: W - padR, y: H - 6, 'text-anchor': 'end', text: 'now' }),
+  );
+  const flat = (v, attrs) => {
+    if (!okNum(v)) return;
+    const yy = Math.round(y(v)) + 0.5;
+    svg.append(s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, 'stroke-width': 1.25, ...attrs }));
+  };
+  flat(base, { stroke: COLORS.diag, 'stroke-dasharray': '1 3' });
+  flat(upper, { stroke: COLORS.pos, 'stroke-opacity': 0.4, 'stroke-dasharray': '6 4' });
+  flat(fast, { stroke: COLORS.fast, 'stroke-dasharray': '4 3' });
+  flat(typical, { stroke: COLORS.pos });
+
+  const cutoff = now - 30 * DAY;
+  for (const p of pts) {
+    const out = !inRange(p.price);
+    svg.append(
+      s('circle', {
+        cx: x(p.ts),
+        cy: y(p.price),
+        r: 2.75,
+        fill: out ? 'none' : COLORS.line,
+        stroke: out ? COLORS.line : 'none',
+        'stroke-width': 1.25,
+        'fill-opacity': p.ts >= cutoff ? 0.9 : 0.4,
+      }),
+    );
+  }
+
+  const ring = s('circle', { r: 5, fill: 'none', stroke: COLORS.marker, 'stroke-width': 1.5, visibility: 'hidden' });
+  svg.append(ring);
+  const idle = () => {
+    const last = pts[pts.length - 1];
+    readout.replaceChildren(
+      h('span', { class: 'faint', text: `${pts.length} sales · last ` }),
+      h('span', { class: 'num', text: fmt(last.price) }),
+      h('span', { class: 'faint', text: ` on ${fmtDateTime(last.ts)} · hover a dot` }),
+    );
+  };
+  hoverLayer(svg, {
+    x0: padL,
+    y0: padT,
+    w: iw,
+    h: ih,
+    onMove: (px, py) => {
+      // Nearest dot in 2D: many sales can share almost the same time.
+      const dist = (p) => Math.hypot(x(p.ts) - px, y(p.price) - py);
+      let best = pts[0];
+      for (const p of pts) if (dist(p) < dist(best)) best = p;
+      ring.setAttribute('cx', x(best.ts));
+      ring.setAttribute('cy', y(best.price));
+      ring.setAttribute('visibility', 'visible');
+      readout.replaceChildren(
+        h('span', { class: 'num', text: `${fmtDateTime(best.ts)}  ` }),
+        h('span', { class: 'num strong', text: fmt(best.price) }),
+        okNum(best.float) ? h('span', { class: 'faint num', text: `  float ${best.float.toFixed(4)}` }) : null,
+        okNum(typical) ? h('span', { class: ['num', signClass(best.price - typical)], text: `  ${fmtPct(best.price / typical - 1, 1, { sign: true })} vs typical` }) : null,
+      );
+    },
+    onLeave: () => {
+      ring.setAttribute('visibility', 'hidden');
+      idle();
+    },
+  });
+  idle();
+  const legend = h(
+    'div',
+    { class: 'legend' },
+    okNum(typical) ? h('span', null, h('i', { class: 'ln', style: { borderTopColor: COLORS.pos } }), `Typical ${fmt(typical)}`) : null,
+    okNum(fast) ? h('span', null, h('i', { class: 'ln dash', style: { borderTopColor: COLORS.fast } }), `Fast sale ${fmt(fast)}`) : null,
+    okNum(upper) ? h('span', null, h('i', { class: 'ln dash', style: { borderTopColor: COLORS.pos, opacity: 0.5 } }), `Upper group ${fmt(upper)}`) : null,
+    okNum(base) ? h('span', null, h('i', { class: 'ln dot', style: { borderTopColor: COLORS.diag } }), `CSFloat base ${fmt(base)}`) : null,
   );
   return h('div', { class: 'chart' }, readout, svg, legend);
 }
