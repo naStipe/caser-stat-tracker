@@ -202,7 +202,16 @@ export function mountDashboard(opts = {}) {
   const acctEl = h('div', { class: 'acct', hidden: true });
   let acctShown = '';
   const closeBtn = h('button', { type: 'button', class: 'iconbtn', 'aria-label': 'Close stats panel', on: { click: () => close() } }, iconClose());
-  const head = h('div', { class: 'head' }, h('div', null, titleEl, subEl, acctEl), closeBtn);
+  // Running version, and a button once a newer published version is known.
+  const verEl = h('span', { class: 'ver' });
+  const updBtn = h('button', {
+    type: 'button',
+    class: 'btn sm primary',
+    hidden: true,
+    title: 'Opens the Tampermonkey update page',
+    on: { click: () => safe(() => o.onOpenUpdate()) },
+  });
+  const head = h('div', { class: 'head' }, h('div', null, h('div', { class: 'titlerow' }, titleEl, verEl, updBtn), subEl, acctEl), closeBtn);
 
   const tabsEl = h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Stats sections' });
   const tabBtns = {};
@@ -369,6 +378,12 @@ export function mountDashboard(opts = {}) {
         ? `${fmtInt(n)} events, ${fmtDate(first)} ${DASH} ${fmtDate(last)}`
         : 'No events recorded yet';
     renderAccounts();
+    const stHead = safe(() => (o.getStatus ? o.getStatus() : {})).value || {};
+    verEl.textContent = stHead.version ? `v${stHead.version}` : '';
+    const upd = stHead.update;
+    const showUpd = !!(upd && upd.newer && typeof o.onOpenUpdate === 'function');
+    updBtn.hidden = !showUpd;
+    if (showUpd) updBtn.textContent = `Update to v${upd.latest}`;
 
     for (const [id] of TABS) {
       const sel = id === state.tab;
@@ -452,6 +467,16 @@ export function mountDashboard(opts = {}) {
       h('option', { value: 'all', selected: value === 'all', text: 'All accounts' }),
     );
     acctEl.replaceChildren(select);
+  }
+
+  function versionText(st) {
+    const u = st.update;
+    const v = st.version || DASH;
+    if (!u || !u.available) return v;
+    if (u.newer) return `${v}, v${u.latest} available`;
+    if (u.error) return `${v}, update check failed: ${u.error}`;
+    if (ok(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
+    return v;
   }
 
   // ---------- small view helpers ----------
@@ -1431,7 +1456,7 @@ export function mountDashboard(opts = {}) {
           h('dt', { text: 'Unknown responses', title: 'Site responses the parser did not recognise' }),
           h('dd', { class: ['num', num(st.unknownResponses) > 0 && 'neg'], text: fmtInt(num(st.unknownResponses)) }),
           h('dt', { text: 'Version' }),
-          h('dd', { class: 'num', text: st.version || DASH }),
+          h('dd', { class: 'num', text: versionText(st) }),
           c ? [h('dt', { text: 'Currency' }), h('dd', { text: c })] : null,
         ),
       ),
@@ -1460,6 +1485,35 @@ export function mountDashboard(opts = {}) {
         }),
       ),
     );
+
+    if (st.update && st.update.available && typeof o.onCheckUpdate === 'function') {
+      const u = st.update;
+      out.push(
+        h(
+          'section',
+          null,
+          h('h3', { text: 'Updates' }),
+          h(
+            'div',
+            { class: 'btns' },
+            u.newer && typeof o.onOpenUpdate === 'function'
+              ? btn('update-install', `Install v${u.latest}`, 'primary', () => safe(() => o.onOpenUpdate()))
+              : null,
+            btn(
+              'update-check',
+              'Check for updates',
+              u.newer ? '' : 'primary',
+              () => run('update-check', () => o.onCheckUpdate(), (r) => (r && r.newer ? `Version ${r.latest} is available.` : 'You have the latest version.')),
+              { busyLabel: 'Checking…', disabled: !!u.checking },
+            ),
+          ),
+          h('p', {
+            class: 'hint',
+            text: 'Tampermonkey also checks once a day on its own. Install opens its update page: press Update (or Overwrite), then reload this page.',
+          }),
+        ),
+      );
+    }
 
     if (st.cloud && typeof o.onCloudStart === 'function') out.push(cloudSection(st.cloud, btn));
 

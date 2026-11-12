@@ -86,6 +86,10 @@ export const DASHBOARD_CSS = `
 
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 12px; }
 .title { font-size: 15px; font-weight: 650; margin: 0; }
+.titlerow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ver { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.btn.sm { height: 24px; padding: 0 9px; font-size: 12px; }
+.btn[hidden] { display: none; }
 .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .acct { margin-top: 8px; }
 .acct[hidden] { display: none; }

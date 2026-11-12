@@ -64,7 +64,8 @@ domain with old data copies that data over. Open tabs on both domains also pick 
 
 The script header has `@updateURL` / `@downloadURL` pointing at the raw file above. Tampermonkey checks it
 (once a day by default, or right away with "Check for userscript updates") and installs any build with a higher
-`@version`. To ship a change: bump `version` in `package.json`, run `npm run build`, commit `dist/`, push to `main`.
+`@version`. The panel title shows the running version; Data → Updates checks right away (the tracker also
+checks every 6 hours) and "Install" opens Tampermonkey's update page. To ship a change: bump `version` in `package.json`, run `npm run build`, commit `dist/`, push to `main`.
 
 ### Several site accounts
 

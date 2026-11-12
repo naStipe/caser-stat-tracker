@@ -13,10 +13,13 @@ import { createSharedStore, gmStorage } from './store/shared.js';
 import { createCloud, isSyncKey, newSyncKey, eventRank } from './store/cloud.js';
 import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
 import * as stats from './stats/index.js';
+import { checkForUpdate, compareVersions } from './update.js';
 import { mountDashboard, mountUpgradeOverlay, mountCasePanel, mountExchangePanel } from './ui/index.js';
 import { store as uiStore } from './ui/dom.js';
 
 const VERSION = typeof __VERSION__ === 'string' ? __VERSION__ : 'dev';
+// eslint-disable-next-line no-undef
+const UPDATE_URL = typeof __UPDATE_URL__ === 'string' ? __UPDATE_URL__ : null;
 // The script runs in Tampermonkey's sandbox (it needs GM_xmlhttpRequest for CSFloat), so the site's own
 // fetch / XMLHttpRequest live on unsafeWindow.
 // eslint-disable-next-line no-undef
@@ -586,7 +589,7 @@ function gmRequest({ method = 'GET', url, headers = { accept: 'application/json'
         try {
           json = JSON.parse(r.responseText);
         } catch {}
-        resolve({ status: r.status, json });
+        resolve({ status: r.status, json, text: r.responseText });
       },
       onerror: () => reject(new Error(`Request to ${host} failed`)),
       ontimeout: () => reject(new Error(`Request to ${host} timed out`)),
@@ -595,6 +598,65 @@ function gmRequest({ method = 'GET', url, headers = { accept: 'application/json'
 }
 
 const csfloatRequest = (url) => gmRequest({ url });
+
+// ---- Update check (see update.js) ----
+// Checked on its own at most every 6 hours, and on demand from the dashboard. The last answer is kept
+// in script storage, so every domain and tab shows it.
+const UPDATE_CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
+let updateBusy = null;
+let updateError = null;
+
+function updateState() {
+  const v = browserPrefs.get('update:last');
+  const last = v && typeof v === 'object' && typeof v.latest === 'string' ? v : null;
+  return {
+    available: !!UPDATE_URL,
+    current: VERSION,
+    latest: last?.latest ?? null,
+    newer: !!last && compareVersions(last.latest, VERSION) > 0,
+    checkedAt: last?.checkedAt ?? null,
+    checking: !!updateBusy,
+    error: updateError,
+  };
+}
+
+function checkUpdate() {
+  if (!UPDATE_URL) return Promise.reject(new Error('This build has no update address'));
+  if (updateBusy) return updateBusy;
+  updateBusy = (async () => {
+    try {
+      const r = await checkForUpdate({
+        url: UPDATE_URL,
+        current: VERSION,
+        request: (url) => gmRequest({ url, headers: { accept: 'text/plain' } }),
+      });
+      browserPrefs.set('update:last', { latest: r.latest, checkedAt: r.checkedAt });
+      updateError = null;
+      return updateState();
+    } catch (err) {
+      updateError = err.message || String(err);
+      throw err;
+    } finally {
+      updateBusy = null;
+      dashboard?.refresh();
+    }
+  })();
+  return updateBusy;
+}
+
+function maybeCheckUpdate() {
+  const last = updateState().checkedAt;
+  if (last && Date.now() - last < UPDATE_CHECK_EVERY_MS) return;
+  checkUpdate().catch((err) => console.warn('[caser-tracker] update check failed', err));
+}
+
+/** Opens the published script; Tampermonkey shows its update page for it. */
+function openUpdate() {
+  if (!UPDATE_URL) return;
+  // eslint-disable-next-line no-undef
+  if (typeof GM_openInTab === 'function') GM_openInTab(UPDATE_URL, { active: true });
+  else window.open(UPDATE_URL, '_blank', 'noopener');
+}
 
 const prices = createPriceClient({ request: csfloatRequest, storage: uiStore });
 
@@ -716,7 +778,10 @@ function mount() {
       syncing: syncProgress,
       storagePersisted,
       cloud: { key: cloudKey(), ...cloudStatus },
+      update: updateState(),
     }),
+    onCheckUpdate: () => checkUpdate(),
+    onOpenUpdate: () => openUpdate(),
     onCloudStart: () => setCloudKey(newSyncKey()),
     onCloudJoin: (key) => setCloudKey(String(key ?? '').trim()),
     onCloudStop: () => setCloudKey(null),
@@ -856,6 +921,7 @@ async function startAutoSync() {
   } catch {}
   // Wait for the site to sign in and settle, then sync if it is due.
   setTimeout(maybeAutoSync, 5000);
+  setTimeout(maybeCheckUpdate, 15000);
 }
 
 /** Sync the signed-in account's site history unless that ran in the last 15 minutes. */

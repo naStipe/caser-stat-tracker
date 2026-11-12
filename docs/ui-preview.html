@@ -422,6 +422,7 @@ if (new URLSearchParams(location.search).get('stats') === 'real') {
 const $ = (id) => document.getElementById(id);
 // Second account: every 4th event belongs to "u2", to show the account picker.
 let ACCOUNT = 'current';
+let UPDATE = { available: true, current: '0.2.0-preview', latest: '0.2.0-preview', newer: false, checkedAt: Date.now() - 3600e3, checking: false, error: null };
 const ownerOf = (e, i) => (i % 4 === 3 ? 'u2' : e.userId);
 const viewEvents = () => (ACCOUNT === 'all' ? EVENTS.slice() : EVENTS.filter((e, i) => ownerOf(e, i) === (ACCOUNT === 'current' ? 'u1' : ACCOUNT)));
 const dash = mountDashboard({
@@ -439,7 +440,9 @@ const dash = mountDashboard({
   onImportFile: async () => { await new Promise((r) => setTimeout(r, 400)); return { added: 0 }; },
   onImportHistory: async () => { await new Promise((r) => setTimeout(r, 900)); const more = makeEvents(12, Date.now() - 864e5).map((e) => ({ ...e, id: 'h' + e.id + Date.now(), source: 'import' })); EVENTS.push(...more); return { added: more.length }; },
   onClear: async () => { EVENTS = []; },
-  getStatus: () => ({ capturing: true, lastEventTs: EVENTS.length ? Math.max(...EVENTS.map((e) => e.ts)) : null, unknownResponses: 2, version: '0.2.0-preview' }),
+  getStatus: () => ({ capturing: true, lastEventTs: EVENTS.length ? Math.max(...EVENTS.map((e) => e.ts)) : null, unknownResponses: 2, version: '0.2.0-preview', update: UPDATE }),
+  onCheckUpdate: async () => { await new Promise((r) => setTimeout(r, 600)); UPDATE = { ...UPDATE, latest: '0.2.1', newer: true, checkedAt: Date.now() }; return UPDATE; },
+  onOpenUpdate: () => console.log('[preview] open update page'),
   getHoldings: () => ({ balance: 1240.5, inventoryValue: 3810 }),
 });
 const overlay = mountUpgradeOverlay({

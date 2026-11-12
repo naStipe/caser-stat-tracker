@@ -25,8 +25,10 @@ const banner = `// ==UserScript==
 // @grant        GM_listValues
 // @grant        GM_addValueChangeListener
 // @grant        GM_setClipboard
+// @grant        GM_openInTab
 // @connect      csfloat.com
 // @connect      hafnhxumrqyaljmciqqq.supabase.co
+// @connect      raw.githubusercontent.com
 // @noframes
 // @homepageURL  https://github.com/naStipe/caser-stat-tracker
 // @updateURL    ${UPDATE_URL}
@@ -41,7 +43,7 @@ const options = {
   target: 'es2022',
   outfile: 'dist/caser-tracker.user.js',
   banner: { js: banner },
-  define: { __VERSION__: JSON.stringify(pkg.version) },
+  define: { __VERSION__: JSON.stringify(pkg.version), __UPDATE_URL__: JSON.stringify(UPDATE_URL) },
   legalComments: 'none',
   logLevel: 'info',
 };

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.9.1
+// @version      0.9.2
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -16,8 +16,10 @@
 // @grant        GM_listValues
 // @grant        GM_addValueChangeListener
 // @grant        GM_setClipboard
+// @grant        GM_openInTab
 // @connect      csfloat.com
 // @connect      hafnhxumrqyaljmciqqq.supabase.co
+// @connect      raw.githubusercontent.com
 // @noframes
 // @homepageURL  https://github.com/naStipe/caser-stat-tracker
 // @updateURL    https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js
@@ -2671,6 +2673,28 @@
     return rows;
   }
 
+  // src/update.js
+  function headerVersion(text) {
+    const m = /^\/\/\s*@version\s+(\S+)\s*$/m.exec(String(text ?? ""));
+    return m ? m[1] : null;
+  }
+  function compareVersions(a, b) {
+    const pa = String(a).split(".").map((x) => parseInt(x, 10) || 0);
+    const pb = String(b).split(".").map((x) => parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+      if (d) return Math.sign(d);
+    }
+    return 0;
+  }
+  async function checkForUpdate({ url, current, request }) {
+    const res = await request(`${url}?t=${Date.now()}`);
+    if (res.status < 200 || res.status >= 300) throw new Error(`Update check answered ${res.status}`);
+    const latest = headerVersion(res.text);
+    if (!latest) throw new Error("The published script has no @version");
+    return { latest, newer: compareVersions(latest, current) > 0, checkedAt: Date.now() };
+  }
+
   // src/ui/dom.js
   var SVG_NS = "http://www.w3.org/2000/svg";
   var PROPS = /* @__PURE__ */ new Set(["value", "checked", "disabled", "selected", "hidden", "tabIndex"]);
@@ -2846,6 +2870,10 @@ button { cursor: pointer; }
 
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 12px; }
 .title { font-size: 15px; font-weight: 650; margin: 0; }
+.titlerow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ver { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.btn.sm { height: 24px; padding: 0 9px; font-size: 12px; }
+.btn[hidden] { display: none; }
 .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .acct { margin-top: 8px; }
 .acct[hidden] { display: none; }
@@ -4471,7 +4499,15 @@ option { background: var(--surface); color: var(--text); }
     const acctEl = h("div", { class: "acct", hidden: true });
     let acctShown = "";
     const closeBtn = h("button", { type: "button", class: "iconbtn", "aria-label": "Close stats panel", on: { click: () => close() } }, iconClose());
-    const head = h("div", { class: "head" }, h("div", null, titleEl, subEl, acctEl), closeBtn);
+    const verEl = h("span", { class: "ver" });
+    const updBtn = h("button", {
+      type: "button",
+      class: "btn sm primary",
+      hidden: true,
+      title: "Opens the Tampermonkey update page",
+      on: { click: () => safe(() => o.onOpenUpdate()) }
+    });
+    const head = h("div", { class: "head" }, h("div", null, h("div", { class: "titlerow" }, titleEl, verEl, updBtn), subEl, acctEl), closeBtn);
     const tabsEl = h("div", { class: "tabs", role: "tablist", "aria-label": "Stats sections" });
     const tabBtns = {};
     for (const [id, label] of TABS) {
@@ -4619,6 +4655,12 @@ option { background: var(--surface); color: var(--text); }
       }
       subEl.textContent = !state.loaded ? "Loading\u2026" : n ? `${fmtInt(n)} events, ${fmtDate(first)} ${DASH} ${fmtDate(last)}` : "No events recorded yet";
       renderAccounts();
+      const stHead = safe(() => o.getStatus ? o.getStatus() : {}).value || {};
+      verEl.textContent = stHead.version ? `v${stHead.version}` : "";
+      const upd = stHead.update;
+      const showUpd = !!(upd && upd.newer && typeof o.onOpenUpdate === "function");
+      updBtn.hidden = !showUpd;
+      if (showUpd) updBtn.textContent = `Update to v${upd.latest}`;
       for (const [id] of TABS) {
         const sel = id === state.tab;
         tabBtns[id].setAttribute("aria-selected", String(sel));
@@ -4695,6 +4737,15 @@ option { background: var(--surface); color: var(--text); }
         h("option", { value: "all", selected: value === "all", text: "All accounts" })
       );
       acctEl.replaceChildren(select);
+    }
+    function versionText(st) {
+      const u = st.update;
+      const v = st.version || DASH;
+      if (!u || !u.available) return v;
+      if (u.newer) return `${v}, v${u.latest} available`;
+      if (u.error) return `${v}, update check failed: ${u.error}`;
+      if (ok4(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
+      return v;
     }
     function errorBox(err, prefix = "Could not compute this view") {
       return h("div", { class: "error", role: "alert", text: `${prefix}: ${err && err.message || err}` });
@@ -5597,7 +5648,7 @@ option { background: var(--surface); color: var(--text); }
             h("dt", { text: "Unknown responses", title: "Site responses the parser did not recognise" }),
             h("dd", { class: ["num", num3(st.unknownResponses) > 0 && "neg"], text: fmtInt(num3(st.unknownResponses)) }),
             h("dt", { text: "Version" }),
-            h("dd", { class: "num", text: st.version || DASH }),
+            h("dd", { class: "num", text: versionText(st) }),
             c ? [h("dt", { text: "Currency" }), h("dd", { text: c })] : null
           )
         )
@@ -5625,6 +5676,32 @@ option { background: var(--surface); color: var(--text); }
           })
         )
       );
+      if (st.update && st.update.available && typeof o.onCheckUpdate === "function") {
+        const u = st.update;
+        out.push(
+          h(
+            "section",
+            null,
+            h("h3", { text: "Updates" }),
+            h(
+              "div",
+              { class: "btns" },
+              u.newer && typeof o.onOpenUpdate === "function" ? btn("update-install", `Install v${u.latest}`, "primary", () => safe(() => o.onOpenUpdate())) : null,
+              btn(
+                "update-check",
+                "Check for updates",
+                u.newer ? "" : "primary",
+                () => run("update-check", () => o.onCheckUpdate(), (r) => r && r.newer ? `Version ${r.latest} is available.` : "You have the latest version."),
+                { busyLabel: "Checking\u2026", disabled: !!u.checking }
+              )
+            ),
+            h("p", {
+              class: "hint",
+              text: "Tampermonkey also checks once a day on its own. Install opens its update page: press Update (or Overwrite), then reload this page."
+            })
+          )
+        );
+      }
       if (st.cloud && typeof o.onCloudStart === "function") out.push(cloudSection(st.cloud, btn));
       const settings = safe(() => o.getSettings ? o.getSettings() : null).value;
       if (settings && typeof o.setSetting === "function") {
@@ -6627,7 +6704,8 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.9.1" : "dev";
+  var VERSION = true ? "0.9.2" : "dev";
+  var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
   var ctx = new Context();
@@ -7070,7 +7148,7 @@ Click for the sales chart.` : r.name;
             json = JSON.parse(r.responseText);
           } catch {
           }
-          resolve({ status: r.status, json });
+          resolve({ status: r.status, json, text: r.responseText });
         },
         onerror: () => reject(new Error(`Request to ${host} failed`)),
         ontimeout: () => reject(new Error(`Request to ${host} timed out`))
@@ -7078,6 +7156,55 @@ Click for the sales chart.` : r.name;
     });
   }
   var csfloatRequest = (url) => gmRequest({ url });
+  var UPDATE_CHECK_EVERY_MS = 6 * 60 * 60 * 1e3;
+  var updateBusy = null;
+  var updateError = null;
+  function updateState() {
+    const v = browserPrefs.get("update:last");
+    const last = v && typeof v === "object" && typeof v.latest === "string" ? v : null;
+    return {
+      available: !!UPDATE_URL,
+      current: VERSION,
+      latest: last?.latest ?? null,
+      newer: !!last && compareVersions(last.latest, VERSION) > 0,
+      checkedAt: last?.checkedAt ?? null,
+      checking: !!updateBusy,
+      error: updateError
+    };
+  }
+  function checkUpdate() {
+    if (!UPDATE_URL) return Promise.reject(new Error("This build has no update address"));
+    if (updateBusy) return updateBusy;
+    updateBusy = (async () => {
+      try {
+        const r = await checkForUpdate({
+          url: UPDATE_URL,
+          current: VERSION,
+          request: (url) => gmRequest({ url, headers: { accept: "text/plain" } })
+        });
+        browserPrefs.set("update:last", { latest: r.latest, checkedAt: r.checkedAt });
+        updateError = null;
+        return updateState();
+      } catch (err) {
+        updateError = err.message || String(err);
+        throw err;
+      } finally {
+        updateBusy = null;
+        dashboard?.refresh();
+      }
+    })();
+    return updateBusy;
+  }
+  function maybeCheckUpdate() {
+    const last = updateState().checkedAt;
+    if (last && Date.now() - last < UPDATE_CHECK_EVERY_MS) return;
+    checkUpdate().catch((err) => console.warn("[caser-tracker] update check failed", err));
+  }
+  function openUpdate() {
+    if (!UPDATE_URL) return;
+    if (typeof GM_openInTab === "function") GM_openInTab(UPDATE_URL, { active: true });
+    else window.open(UPDATE_URL, "_blank", "noopener");
+  }
   var prices = createPriceClient({ request: csfloatRequest, storage: store });
   var { origFetch } = installHook(pageWindow, async (ex) => {
     if (ex.auth) lastAuth = ex.auth;
@@ -7183,8 +7310,11 @@ Click for the sales chart.` : r.name;
         lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
         syncing: syncProgress,
         storagePersisted,
-        cloud: { key: cloudKey(), ...cloudStatus }
+        cloud: { key: cloudKey(), ...cloudStatus },
+        update: updateState()
       }),
+      onCheckUpdate: () => checkUpdate(),
+      onOpenUpdate: () => openUpdate(),
       onCloudStart: () => setCloudKey(newSyncKey()),
       onCloudJoin: (key) => setCloudKey(String(key ?? "").trim()),
       onCloudStop: () => setCloudKey(null),
@@ -7309,6 +7439,7 @@ Click for the sales chart.` : r.name;
     } catch {
     }
     setTimeout(maybeAutoSync, 5e3);
+    setTimeout(maybeCheckUpdate, 15e3);
   }
   async function maybeAutoSync() {
     if (!getAuth()) return;
