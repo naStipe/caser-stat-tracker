@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.9.4
+// @version      0.9.5
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -1308,6 +1308,14 @@
   function planUpload(events, cloudRanks) {
     return events.filter((e) => !(cloudRanks.get(e.id) >= eventRank(e))).map((e) => e.id);
   }
+  function cleanNames(v) {
+    const out = {};
+    if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+    for (const [id, name] of Object.entries(v)) {
+      if (/^[A-Za-z0-9_-]{1,64}$/.test(id) && typeof name === "string" && name.trim()) out[id] = name.trim().slice(0, 64);
+    }
+    return out;
+  }
   var KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
   function isSyncKey(k) {
     return typeof k === "string" && KEY_RE.test(k);
@@ -1404,16 +1412,22 @@
       },
       /**
        * Facts about the whole history under this key: when "clear all" last ran (ms or null) and
-       * which site-history streams some browser has read to the end.
+       * which site-history streams some browser has read to the end, and the nicknames of the site
+       * accounts ({userId: name}).
        */
       async account() {
-        const rows = await call("GET", "/rest/v1/sync_accounts?select=cleared_at,history_complete");
+        const rows = await call("GET", "/rest/v1/sync_accounts?select=*");
         const row = Array.isArray(rows) && rows[0] ? rows[0] : {};
         const at = row.cleared_at ? Date.parse(row.cleared_at) : NaN;
         return {
           clearedAt: Number.isFinite(at) ? at : null,
-          complete: Array.isArray(row.history_complete) ? row.history_complete.filter((s2) => typeof s2 === "string") : []
+          complete: Array.isArray(row.history_complete) ? row.history_complete.filter((s2) => typeof s2 === "string") : [],
+          names: cleanNames(row.account_names)
         };
+      },
+      /** Store the nickname of a site account. */
+      async setName(userId, name) {
+        return call("POST", "/rest/v1/rpc/sync_set_name", { user_id: String(userId), name });
       },
       /** Record that a site-history stream was read to the end. */
       async markComplete(stream) {
@@ -1470,6 +1484,25 @@
   function accountName(id, known) {
     const name = known?.[id]?.name;
     return typeof name === "string" && name.trim() ? name.trim() : `Account ${id}`;
+  }
+  function mergeNames(known, cloudNames, currentId) {
+    const out = { ...known };
+    let changed = false;
+    const send = [];
+    for (const [id, name] of Object.entries(cloudNames ?? {})) {
+      const mine = known?.[id]?.name;
+      if (id === currentId && typeof mine === "string" && mine.trim()) continue;
+      if (mine !== name) {
+        out[id] = { ...out[id], name };
+        changed = true;
+      }
+    }
+    for (const [id, v] of Object.entries(known ?? {})) {
+      const name = typeof v?.name === "string" ? v.name.trim() : "";
+      if (!name) continue;
+      if (cloudNames?.[id] == null || id === currentId && cloudNames[id] !== name) send.push([id, name]);
+    }
+    return { known: out, changed, send };
   }
   function streamFlag(stream, userId) {
     return `${stream}:${userId}`;
@@ -6861,7 +6894,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.9.4" : "dev";
+  var VERSION = true ? "0.9.5" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
@@ -6930,6 +6963,22 @@ Click for the sales chart.` : r.name;
     const name = ctx.userName ?? known[ctx.userId]?.name ?? null;
     if (known[ctx.userId] && known[ctx.userId].name === name) return;
     browserPrefs.set("accounts", { ...known, [ctx.userId]: { name } });
+    if (name && cloudKey()) {
+      cloud.setName(ctx.userId, name).catch((err) => console.warn("[caser-tracker] could not send the account name to the cloud", err));
+    }
+  }
+  async function syncNames(cloudNames) {
+    const res = mergeNames(knownAccounts(), cloudNames, ctx.userId);
+    if (res.changed) browserPrefs.set("accounts", res.known);
+    for (const [id, name] of res.send) {
+      try {
+        await cloud.setName(id, name);
+      } catch (err) {
+        console.warn("[caser-tracker] could not send the account name to the cloud", err);
+        break;
+      }
+    }
+    return res.changed;
   }
   function legacyOwner() {
     const v = browserPrefs.get("acct:legacy");
@@ -7286,8 +7335,9 @@ Click for the sales chart.` : r.name;
           }
         }
         fixLegacyOwner();
+        const renamed = await syncNames(account.names);
         cloudStatus = { state: "idle", lastPull: Date.now(), error: null, progress: null };
-        if (added) refreshSoon();
+        if (added || renamed) refreshSoon();
         return { added };
       } catch (err) {
         cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err), progress: null };

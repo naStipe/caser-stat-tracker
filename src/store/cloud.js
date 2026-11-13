@@ -35,6 +35,16 @@ export function planUpload(events, cloudRanks) {
   return events.filter((e) => !(cloudRanks.get(e.id) >= eventRank(e))).map((e) => e.id);
 }
 
+/** {userId: name} with only usable entries. */
+export function cleanNames(v) {
+  const out = {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return out;
+  for (const [id, name] of Object.entries(v)) {
+    if (/^[A-Za-z0-9_-]{1,64}$/.test(id) && typeof name === 'string' && name.trim()) out[id] = name.trim().slice(0, 64);
+  }
+  return out;
+}
+
 const KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
 
 export function isSyncKey(k) {
@@ -150,16 +160,24 @@ export function createCloud({ request, getKey, url = CLOUD_URL, apiKey = CLOUD_K
 
     /**
      * Facts about the whole history under this key: when "clear all" last ran (ms or null) and
-     * which site-history streams some browser has read to the end.
+     * which site-history streams some browser has read to the end, and the nicknames of the site
+     * accounts ({userId: name}).
      */
     async account() {
-      const rows = await call('GET', '/rest/v1/sync_accounts?select=cleared_at,history_complete');
+      // "*" so a database without the account_names column still answers.
+      const rows = await call('GET', '/rest/v1/sync_accounts?select=*');
       const row = Array.isArray(rows) && rows[0] ? rows[0] : {};
       const at = row.cleared_at ? Date.parse(row.cleared_at) : NaN;
       return {
         clearedAt: Number.isFinite(at) ? at : null,
         complete: Array.isArray(row.history_complete) ? row.history_complete.filter((s) => typeof s === 'string') : [],
+        names: cleanNames(row.account_names),
       };
+    },
+
+    /** Store the nickname of a site account. */
+    async setName(userId, name) {
+      return call('POST', '/rest/v1/rpc/sync_set_name', { user_id: String(userId), name });
     },
 
     /** Record that a site-history stream was read to the end. */

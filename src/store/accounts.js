@@ -74,6 +74,35 @@ export function accountName(id, known) {
   return typeof name === 'string' && name.trim() ? name.trim() : `Account ${id}`;
 }
 
+/**
+ * Join the nicknames kept in this browser with the ones in the cloud.
+ * The cloud name wins, except for the account signed in here: its name was just read from the site.
+ * @param {Record<string, {name?: string|null}>} known  this browser's names
+ * @param {Record<string, string>} cloudNames  the cloud's names
+ * @param {string|null} currentId
+ * @returns {{known: Record<string, {name: string|null}>, changed: boolean, send: [string, string][]}}
+ *   the joined names, whether they differ from `known`, and the names the cloud lacks or has stale
+ */
+export function mergeNames(known, cloudNames, currentId) {
+  const out = { ...known };
+  let changed = false;
+  const send = [];
+  for (const [id, name] of Object.entries(cloudNames ?? {})) {
+    const mine = known?.[id]?.name;
+    if (id === currentId && typeof mine === 'string' && mine.trim()) continue;
+    if (mine !== name) {
+      out[id] = { ...out[id], name };
+      changed = true;
+    }
+  }
+  for (const [id, v] of Object.entries(known ?? {})) {
+    const name = typeof v?.name === 'string' ? v.name.trim() : '';
+    if (!name) continue;
+    if (cloudNames?.[id] == null || (id === currentId && cloudNames[id] !== name)) send.push([id, name]);
+  }
+  return { known: out, changed, send };
+}
+
 // ---- "History read to the end" flags ----
 // Stored as "<stream>:<userId>" (browser and cloud) and "sync:<userId>:<stream>" (IndexedDB meta).
 // The legacy owner also counts the old flags without a userId.

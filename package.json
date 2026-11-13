@@ -1,6 +1,6 @@
 {
   "name": "caser-stat-tracker",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "description": "Userscript that records case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics.",
   "type": "module",

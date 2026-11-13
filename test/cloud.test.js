@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { eventRank, isSyncKey, newSyncKey, createCloud, planUpload } from '../src/store/cloud.js';
+import { eventRank, isSyncKey, newSyncKey, createCloud, planUpload, cleanNames } from '../src/store/cloud.js';
 import { shouldReplace, mergeEvent } from '../src/store/db.js';
 
 test('rank grows whenever the local store would replace an event', () => {
@@ -113,4 +113,10 @@ test('first upload sends only what the cloud lacks or holds a worse copy of', as
   assert.equal(ids.length, 301);
   assert.equal(ids[0], 'upgrade:00007');
   assert.ok(!ids.includes('upgrade:00005'));
+});
+
+test('account names from the cloud keep only usable entries', () => {
+  assert.deepEqual(cleanNames({ 1: ' naStipe ', 2: '', 3: 5, 'bad id': 'x' }), { 1: 'naStipe' });
+  assert.deepEqual(cleanNames(null), {});
+  assert.deepEqual(cleanNames(['x']), {});
 });

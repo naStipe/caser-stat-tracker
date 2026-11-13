@@ -11,7 +11,7 @@ import { Store, shouldReplace, mergeEvent } from './store/db.js';
 import { toJson, toCsv, fromJson } from './store/export.js';
 import { createSharedStore, gmStorage } from './store/shared.js';
 import { createCloud, isSyncKey, newSyncKey, eventRank, planUpload } from './store/cloud.js';
-import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accountName, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
+import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accountName, mergeNames, streamFlag, flagComplete, progressKey, isStreamFlag } from './store/accounts.js';
 import { OWNER_LOCK, checkPassword, isGuest } from './store/lock.js';
 import * as stats from './stats/index.js';
 import { checkForUpdate, compareVersions } from './update.js';
@@ -109,13 +109,34 @@ function knownAccounts() {
   return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
 }
 
-/** Remember the signed-in account's name for the picker (script storage: every domain sees it). */
+/**
+ * Remember the signed-in account's name for the picker (script storage: every domain sees it),
+ * and in the cloud, so other browsers show it too.
+ */
 function rememberAccount() {
   if (ctx.userId == null) return;
   const known = knownAccounts();
   const name = ctx.userName ?? known[ctx.userId]?.name ?? null;
   if (known[ctx.userId] && known[ctx.userId].name === name) return;
   browserPrefs.set('accounts', { ...known, [ctx.userId]: { name } });
+  if (name && cloudKey()) {
+    cloud.setName(ctx.userId, name).catch((err) => console.warn('[caser-tracker] could not send the account name to the cloud', err));
+  }
+}
+
+/** Take the cloud's account names, and send the ones it lacks. */
+async function syncNames(cloudNames) {
+  const res = mergeNames(knownAccounts(), cloudNames, ctx.userId);
+  if (res.changed) browserPrefs.set('accounts', res.known);
+  for (const [id, name] of res.send) {
+    try {
+      await cloud.setName(id, name);
+    } catch (err) {
+      console.warn('[caser-tracker] could not send the account name to the cloud', err);
+      break;
+    }
+  }
+  return res.changed;
 }
 
 /**
@@ -572,9 +593,10 @@ function cloudSync() {
       }
       // Every event of this key is here now, so the owner of old account-less data is known.
       fixLegacyOwner();
+      const renamed = await syncNames(account.names);
 
       cloudStatus = { state: 'idle', lastPull: Date.now(), error: null, progress: null };
-      if (added) refreshSoon();
+      if (added || renamed) refreshSoon();
       return { added };
     } catch (err) {
       cloudStatus = { ...cloudStatus, state: 'error', error: err.message || String(err), progress: null };

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  accountOf, pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accountName,
+  accountOf, pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accountName, mergeNames,
   streamFlag, flagComplete, progressKey, isStreamFlag,
 } from '../src/store/accounts.js';
 import { Context } from '../src/capture/parsers.js';
@@ -105,4 +105,25 @@ test('import gives a live case drop without an account the owner of its imported
   const kept = dropLiveTwins([imp], [live], (l, i) => pairs.push([l.id, i.id]));
   assert.deepEqual(kept, []);
   assert.deepEqual(pairs, [['case:l', 'case:i']]);
+});
+
+test('account names: cloud fills the gaps, the signed-in account keeps the name the site just gave', () => {
+  const known = { 1: { name: 'naStipe' }, 2: { name: null }, 3: { name: 'old' } };
+  const cloudNames = { 1: 'stale', 2: 'second', 3: 'renamed', 4: 'fourth' };
+  const r = mergeNames(known, cloudNames, '1');
+  assert.equal(r.known['1'].name, 'naStipe');
+  assert.equal(r.known['2'].name, 'second');
+  assert.equal(r.known['3'].name, 'renamed');
+  assert.equal(r.known['4'].name, 'fourth');
+  assert.ok(r.changed);
+  assert.deepEqual(r.send, [['1', 'naStipe']]);
+});
+
+test('account names: local names the cloud lacks are sent, nothing changes when they agree', () => {
+  const r = mergeNames({ 5: { name: 'five' }, 6: { name: '' } }, {}, null);
+  assert.deepEqual(r.send, [['5', 'five']]);
+  assert.ok(!r.changed);
+  const same = mergeNames({ 5: { name: 'five' } }, { 5: 'five' }, '5');
+  assert.ok(!same.changed);
+  assert.deepEqual(same.send, []);
 });
