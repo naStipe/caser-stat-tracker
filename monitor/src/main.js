@@ -9,8 +9,10 @@
 //   RETENTION_DAYS        rows older than this are deleted, default 30
 //   HISTORY_DAYS          how far back a found player's history is read, default 7
 //   HISTORY_PAGES         older pages read per list per player, default 10
-//   REVISIT_HOURS         how often a known player who has not played for a day is checked again, default 6
+//   REVISIT_HOURS         how often a known player who last played 1 to 3 days ago is checked again, default 6
 //                         (players who played recently are checked every 10 min to 2 h, see collector.js)
+//   REVISIT_STALE_HOURS   how often a known player who last played more than 3 days ago is checked, default 24
+//   COUNTER_CHECKS        0 to check quiet players by reading their lists instead of their counters, default 1
 //   CASER_BASE            site origin, default https://caser.gg
 //   PULSE_GAP_MS          pause between requests, default 8000 (about 450 an hour), at least 2000
 //   DATA_DIR              state file, default ./data
@@ -156,6 +158,8 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
       historyMs: positive(env.HISTORY_DAYS, 7) * DAY,
       deepPages: Number.isFinite(Number(env.HISTORY_PAGES)) && env.HISTORY_PAGES !== undefined && env.HISTORY_PAGES !== '' ? Math.max(0, Number(env.HISTORY_PAGES)) : 10,
       revisitColdMs: positive(env.REVISIT_HOURS, 6) * HOUR,
+      revisitStaleMs: positive(env.REVISIT_STALE_HOURS, 24) * HOUR,
+      counterChecks: !['0', 'false', 'off', 'no'].includes(String(env.COUNTER_CHECKS ?? '').trim().toLowerCase()),
       ...options,
     },
   });

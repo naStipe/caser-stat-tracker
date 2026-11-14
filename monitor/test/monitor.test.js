@@ -578,6 +578,7 @@ function pagedSite({ upgrades = 0, cases = 0, stepMs = 30 * 60000, cap = Infinit
     if (p === '/api/game/cases') return { cases: [{ id: '1', slug: 'magnum', price: '19' }] };
     if (p === '/api/live-drops') return site.feed;
     if (p === '/api/statistics') return { cases_opened: 1, upgrader_count: 1, online: 1 };
+    if (/^\/api\/users\/[^/]+\/stats$/.test(p)) return { withdrawnAmount: 0, upgradesMade: site.ups.length, casesOpened: site.inv.length };
     if (p.startsWith('/api/game/upgrade/public-history/')) return page(site.ups);
     if (p.startsWith('/api/users/')) return page(site.inv);
     throw new HttpError(404, p);
@@ -648,12 +649,91 @@ test('collector: falls back to 50-row pages when the site caps or refuses larger
 test('collector: revisits a known player after the revisit time, only for rows newer than the last seen', async () => {
   const site = pagedSite({ upgrades: 5 });
   site.feed = { liveDrops: [] };
-  const initial = { profileProbed: true, known: [{ id: '7', seen: T0, revisited: T0 - 4 * 3600e3, newest: { upgrade: T0 - 2 * 30 * 60000, case: 0 }, deep: true }] };
+  const initial = { profileProbed: true, known: [{ id: '7', seen: T0, revisited: T0 - 4 * 3600e3, newest: { upgrade: T0 - 2 * 30 * 60000, case: 0 }, deep: true, ctr: { upgrade: 3, case: 0 } }] };
   const { c, saved, done } = run(site, { budget: 6, initial });
   await done;
   // Rows 0 and 1 are newer than the last seen (row 2's time); nothing older comes back.
   assert.deepEqual(saved.filter((r) => r.kind === 'upgrade').map((r) => r.id).sort(), ['upgrade:0', 'upgrade:1']);
   assert.ok(c.exportState().known[0].revisited >= T0, 'marked as revisited');
+  assert.ok(site.calls.includes('/api/users/7/stats'), 'not playing now: counters first');
+  assert.ok(!site.calls.some((p) => p.includes('/inventory/history') && /offset=0\b/.test(p)), 'the case counter did not move, so that list is not checked for new rows');
+  assert.deepEqual(c.exportState().known[0].ctr, { upgrade: 5, case: 0 });
+});
+
+const DAY_MS = 24 * 3600e3;
+const quietPlayer = (id, played, revisited, ctr) => ({ id, seen: played, revisited, newest: { upgrade: played, case: played }, hist: { upgrade: null, case: null }, ctr });
+
+test('collector: a quiet player whose counters did not move costs one request; a moved counter reads only its list', async () => {
+  const site = pagedSite({ upgrades: 3, cases: 2 });
+  site.feed = { liveDrops: [] };
+  const still = run(site, { budget: 4, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 2 })] } });
+  await still.done;
+  assert.equal(site.calls.at(-1), '/api/users/q/stats');
+  assert.ok(!site.calls.some((p) => /history/.test(p)), 'no list read');
+  assert.equal(still.c.status().counterChecks, true);
+
+  site.calls.length = 0;
+  const moved = run(site, { budget: 5, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 1 })] } });
+  await moved.done;
+  assert.ok(site.calls.some((p) => p.includes('/api/users/q/inventory/history')), 'case list read');
+  assert.ok(!site.calls.some((p) => p.includes('public-history')), 'upgrade list not read');
+  assert.equal(moved.saved.filter((r) => r.kind === 'case').length, 2);
+});
+
+test('collector: the first counter check only sets the base', async () => {
+  const site = pagedSite({ upgrades: 3 });
+  site.feed = { liveDrops: [] };
+  const { c, done } = run(site, { budget: 5, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3)] } });
+  await done;
+  assert.ok(site.calls.includes('/api/users/q/stats'));
+  assert.ok(!site.calls.some((p) => /history/.test(p)));
+  assert.deepEqual(c.exportState().known[0].ctr, { upgrade: 3, case: 0 });
+});
+
+test('collector: cold tiers by recency, and the most overdue for its tier goes first', async () => {
+  const site = pagedSite({ upgrades: 1 });
+  site.feed = { liveDrops: [] };
+  const ctr = { upgrade: 1, case: 0 };
+  const known = [
+    quietPlayer('stale', T0 - 10 * DAY_MS, T0 - 25 * 3600e3, ctr), // 24 h tier, 25 h ago: 1.04 times its interval
+    quietPlayer('cold', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, ctr), // 6 h tier, 7 h ago: 1.17 times
+    quietPlayer('later', T0 - 10 * DAY_MS, T0 - 20 * 3600e3, ctr), // 24 h tier, not due
+  ];
+  const { c, done } = run(site, { budget: 6, initial: { profileProbed: true, known } });
+  await done;
+  const order = site.calls.filter((p) => p.endsWith('/stats')).map((p) => p.split('/')[3]);
+  assert.deepEqual(order, ['cold', 'stale']);
+  assert.equal(c.status().revisitsDue, 0);
+});
+
+test('collector: reports counters that said "no new play" when the list later shows some', async () => {
+  const site = pagedSite({ upgrades: 3 });
+  site.feed = { liveDrops: [] };
+  const orig = site.getJson;
+  let checks = 0;
+  // The first check still shows the old counter although three rows are newer than the last seen.
+  site.getJson = async (p) => (p.endsWith('/stats') && ++checks === 1 ? { upgradesMade: 0, casesOpened: 0 } : orig(p));
+  const initial = { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 0, case: 0 })] };
+  const { c, events, done } = run(site, { budget: 7, initial, options: { revisitColdMs: 5000 } });
+  await done;
+  assert.ok(site.calls.some((p) => p.includes('public-history/q')), 'list read after the counter moved');
+  const e = events.find((x) => x.code === 'counters');
+  assert.ok(e && e.level === 'warn', 'reported');
+  assert.match(e.message, /2 upgrade row/, 'the row from the check time itself is within the slack');
+  assert.equal(c.status().counterMisses, 1);
+});
+
+test('collector: falls back to reading lists when stats lose their counters', async () => {
+  const site = pagedSite({ upgrades: 2, cases: 1 });
+  site.feed = { liveDrops: [] };
+  const orig = site.getJson;
+  site.getJson = async (p) => (p.endsWith('/stats') ? { withdrawnAmount: 1 } : orig(p));
+  const initial = { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 0, case: 0 })] };
+  const { c, events, done } = run(site, { budget: 6, initial });
+  await done;
+  assert.ok(events.some((e) => e.code === 'counters'));
+  assert.equal(c.status().counterChecks, false);
+  assert.ok(site.calls.some((p) => p.includes('public-history/q')) && site.calls.some((p) => p.includes('/api/users/q/inventory/history')));
 });
 
 test('collector: a run of failed turns is reported once, and so is the recovery', async () => {
@@ -781,7 +861,7 @@ test('collector: players playing now are revisited first and often, quiet ones r
     profileProbed: true,
     known: [
       { id: 'quiet', seen: T0 - 2 * 24 * 3600e3, revisited: T0 - 3600e3, newest: { upgrade: T0 - 2 * 24 * 3600e3, case: 0 }, hist: { upgrade: null, case: null } },
-      { id: 'warm', seen: T0 - 3600e3, revisited: T0 - 40 * M, newest: { upgrade: T0 - 2 * 3600e3, case: 0 }, hist: { upgrade: null, case: null } },
+      { id: 'warm', seen: T0 - 3600e3, revisited: T0 - 40 * M, newest: { upgrade: T0 - 2 * 3600e3, case: 0 }, hist: { upgrade: null, case: null }, ctr: { upgrade: 0, case: 0 } },
       { id: 'hot', seen: T0 - 3600e3, revisited: T0 - 15 * M, newest: { upgrade: T0 - 10 * M, case: 0 }, hist: { upgrade: null, case: null } },
     ],
   };

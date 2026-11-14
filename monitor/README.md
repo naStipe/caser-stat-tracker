@@ -48,8 +48,14 @@ One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does 
    - 1 × **revisit a player playing now**, 1 × **any revisit that is due**: every player the feed has shown is
      remembered (up to 5,000, for 14 days after they were last seen) and checked again for new rows: every 10
      minutes while they played in the last 30 minutes (these come first), every 30 minutes if they played in the
-     last 3 hours, every 2 hours within a day, else every 6 hours (`REVISIT_HOURS`). The dashboard shows how many
-     known players are playing now.
+     last 3 hours, every 2 hours within a day, every 6 hours within 3 days (`REVISIT_HOURS`), else every 24 hours
+     (`REVISIT_STALE_HOURS`). When more checks are due than requests allow, the most overdue for their tier go
+     first, so the backlog delays every tier alike. The dashboard shows how many known players are playing now.
+     A player who is not playing now is checked through their counters first (`/api/users/{id}/stats`:
+     `upgradesMade`, `casesOpened`): one request for both lists, and a list is read only when its counter moved.
+     The first counter check of a player only records the counters. If a list later shows rows from before a
+     check that said "no new play", the counters lag: the monitor reports it (`counters` event, `counterMisses`
+     in the status), and `COUNTER_CHECKS=0` turns the counter checks off.
    - 2 × **history**: older pages of each known player's lists, back 7 days (`HISTORY_DAYS`), at most 10 pages
      each (`HISTORY_PAGES`). This is what fills the time before the monitor ran. Where each player's history
      stands is saved with the monitor's state, so a restart carries on instead of losing it.
@@ -177,7 +183,9 @@ running monitor keeps working until it is updated.
 | `RETENTION_DAYS` | 30 | rows and events older than this are deleted |
 | `HISTORY_DAYS` | 7 | how far back a found player's history is read |
 | `HISTORY_PAGES` | 10 | older pages read per list per player (0: only the latest page) |
-| `REVISIT_HOURS` | 6 | how often known players who have not played for a day are checked again |
+| `REVISIT_HOURS` | 6 | how often known players who last played 1 to 3 days ago are checked again |
+| `REVISIT_STALE_HOURS` | 24 | how often known players who last played more than 3 days ago are checked again |
+| `COUNTER_CHECKS` | 1 | 0: check quiet players by reading both lists instead of their counters (2 requests instead of 1) |
 | `CASER_BASE` | https://caser.gg | site origin |
 | `PULSE_GAP_MS` | 8000 | pause between requests, at least 2000 |
 | `DATA_DIR` | ./data | state file (tokens, hash salt, known players, rows and events not yet sent) |

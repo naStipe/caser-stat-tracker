@@ -11,9 +11,12 @@
 //   look     first look at a found player: the latest page of their upgrades and case drops
 //   follow   one of the two lists of a followed player at most every 90 s, for new rows
 //   hot      revisit a known player who played in the last 30 min (checked every 10 min)
-//   revisit  any known player who is due: every 10 min, 30 min, 2 h or 6 h the longer ago they played.
-//            So players who play small, and rarely reach the drop board, stay in the sample once the
-//            board has shown them.
+//   revisit  any known player who is due: every 10 min, 30 min, 2 h, 6 h or 24 h the longer ago they
+//            played. So players who play small, and rarely reach the drop board, stay in the sample once
+//            the board has shown them. The most overdue for their tier go first.
+//            A player who is not playing now is first checked through their counters
+//            (/api/users/{id}/stats: upgradesMade, casesOpened), one request for both lists; a list is
+//            read only when its counter moved. The first counter check of a player only sets the base.
 //   history  older pages of a known player's lists, back to `historyMs` (7 days), at most `deepPages`
 //            each. Where each player's history stands is kept across restarts.
 // HTTP 429 pauses everything for 5 minutes, doubling up to 30. HTTP 401 (login refused) and 403 (blocked)
@@ -45,8 +48,12 @@ export const DEFAULTS = {
   revisitHotMs: 10 * 60 * 1000, // played in the last `activeMs`: they are on the site now
   revisitWarmMs: 30 * 60 * 1000, // played in the last 3 hours
   revisitMs: 2 * HOUR, // played in the last day
-  revisitColdMs: 6 * HOUR, // longer ago, or not seen playing yet
+  revisitColdMs: 6 * HOUR, // played in the last `staleAfterMs`
+  revisitStaleMs: 24 * HOUR, // longer ago, or not seen playing yet
+  staleAfterMs: 3 * 24 * HOUR,
   activeMs: 30 * 60 * 1000,
+  counterChecks: true, // check players who are not playing now through their counters first
+  counterSlackMs: 60_000, // rows this close to a counter check are not counted as missed by it
   knownMax: 5000, // players remembered for revisits
   knownKeepMs: 14 * 24 * HOUR, // forget players neither in the feed nor seen playing for this long
   maxPlayers: 30, // followed at once
@@ -97,7 +104,8 @@ function importKnown(k, t, opt) {
     const job = () => (recent ? { offset: opt.pageSize, pages: 0 } : null);
     hist = { upgrade: job(), case: job() };
   } else hist = { upgrade: undefined, case: undefined };
-  return { seen: k.seen ?? 0, revisited: k.revisited ?? 0, newest, hist };
+  const ctr = k.ctr && Number.isFinite(k.ctr.upgrade) && Number.isFinite(k.ctr.case) ? { upgrade: k.ctr.upgrade, case: k.ctr.case } : null;
+  return { seen: k.seen ?? 0, revisited: k.revisited ?? 0, newest, hist, ctr, quiet: {} };
 }
 
 /**
@@ -120,8 +128,10 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   const queue = []; // found, waiting for their first look: {id, skip: Set<item name>}
   const backfilled = new Map(); // site id -> when their first look ran
   const skips = new Map(); // site id -> names of the feed wins that found them (kept out of their history)
-  // Players seen in the feed: site id -> {seen, revisited, newest: {upgrade, case}, hist: {upgrade, case}}.
+  // Players seen in the feed: site id -> {seen, revisited, newest: {upgrade, case}, hist: {upgrade, case}, ctr, quiet}.
   // hist per list: undefined = not looked at yet, {offset, pages} = older pages still to read, null = done.
+  // ctr: {upgrade, case} counters at the last counter check, or null. quiet per list: {at, after} when a
+  // counter check found no new play, to catch counters that lag (rows read later from between the two).
   const known = new Map((initial.known ?? []).filter((k) => k && k.id).map((k) => [String(k.id), importKnown(k, now(), opt)]));
   // 'unknown' until a page shows what the site allows; then 'ok' (larger pages work), 'capped' or 'refused'.
   let pageSize = opt.tryPageSize;
@@ -139,6 +149,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   const triedSlugs = new Set();
   let turn = 0;
   let profileProbed = !!initial.profileProbed;
+  let countersOff = !opt.counterChecks;
+  let counterMisses = 0;
   let running = false;
   let wake = null;
   let lastFeed = -Infinity;
@@ -202,12 +214,13 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     if (ago <= opt.activeMs) return opt.revisitHotMs;
     if (ago <= 3 * HOUR) return opt.revisitWarmMs;
     if (ago <= 24 * HOUR) return opt.revisitMs;
-    return opt.revisitColdMs;
+    if (ago <= opt.staleAfterMs) return opt.revisitColdMs;
+    return opt.revisitStaleMs;
   }
 
   function remember(id) {
     let k = known.get(id);
-    if (!k) known.set(id, (k = { seen: now(), revisited: now(), newest: { upgrade: 0, case: 0 }, hist: { upgrade: undefined, case: undefined } }));
+    if (!k) known.set(id, (k = { seen: now(), revisited: now(), newest: { upgrade: 0, case: 0 }, hist: { upgrade: undefined, case: undefined }, ctr: null, quiet: {} }));
     k.seen = now();
     return k;
   }
@@ -215,6 +228,14 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   function noteNewest(id, stream, rows) {
     const k = known.get(id);
     if (!k) return;
+    const q = k.quiet[stream];
+    if (q) {
+      // A counter check said "no new play", yet the list has rows from before that check.
+      const missed = rows.filter((r) => r.ts > q.after && r.ts < q.at - opt.counterSlackMs).length;
+      delete k.quiet[stream];
+      if (missed && [1, 10, 100, 1000].includes(++counterMisses))
+        event('warn', 'counters', `Counter checks missed new play ${counterMisses} time(s) (latest: ${missed} ${stream} row(s)). The counters may lag; set COUNTER_CHECKS=0 if this keeps growing.`);
+    }
     for (const r of rows) if (r.ts > k.newest[stream]) k.newest[stream] = r.ts;
   }
 
@@ -354,13 +375,43 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     let pick = null;
     for (const [id, k] of known) {
       if (players.has(id) || backfilled.has(id)) continue;
-      const due = k.revisited + revisitEvery(k, t);
-      if (due > t) continue;
+      const every = revisitEvery(k, t);
+      if (k.revisited + every > t) continue;
       const hot = t - lastPlayed(k) <= opt.activeMs;
-      // Players on the site now first, then the most overdue.
-      if (!pick || (hot && !pick.hot) || (hot === pick.hot && due < pick.due)) pick = { id, k, due, hot };
+      // Players on the site now first, then the most overdue for their tier (time since the last check
+      // over the tier's interval), so a backlog delays every tier alike instead of starving the recent ones.
+      const late = (t - k.revisited) / every;
+      if (!pick || (hot && !pick.hot) || (hot === pick.hot && late > pick.late)) pick = { id, k, late, hot };
     }
     return pick;
+  }
+
+  /**
+   * Which lists of a player have new play by their counters: [] for none, null when the counters
+   * cannot tell (then both lists are read). The first check of a player only sets the base.
+   */
+  async function checkCounters(id, k) {
+    const t = now();
+    let body;
+    try {
+      body = await get(`/api/users/${encodeURIComponent(id)}/stats`);
+    } catch (e) {
+      // 403 here may be one private profile; a real block shows on the list read that follows.
+      if (e instanceof HttpError && !isHttp(e, 429, 401)) return null;
+      throw e;
+    }
+    const ctr = { upgrade: Number(body?.upgradesMade), case: Number(body?.casesOpened) };
+    if (body?.upgradesMade == null || body?.casesOpened == null || !Number.isFinite(ctr.upgrade) || !Number.isFinite(ctr.case)) {
+      countersOff = true;
+      event('warn', 'counters', 'Player stats no longer show upgradesMade and casesOpened. Quiet players are checked by reading their lists again, which costs twice the requests.');
+      return null;
+    }
+    const prev = k.ctr;
+    k.ctr = ctr;
+    if (!prev) return [];
+    const moved = STREAMS.filter((s) => ctr[s] !== prev[s]);
+    for (const s of STREAMS) if (!moved.includes(s)) k.quiet[s] = { at: t, after: k.newest[s] };
+    return moved;
   }
 
   /**
@@ -371,8 +422,14 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     const { id, k } = pick;
     const t = now();
     k.revisited = t;
+    let streams = STREAMS;
+    if (!pick.hot && !countersOff) {
+      streams = (await checkCounters(id, k)) ?? STREAMS;
+      if (!streams.length) return true;
+      await doSleep(opt.gapMs);
+    }
     const u = await hashUser(id);
-    for (const stream of STREAMS) {
+    for (const [i, stream] of streams.entries()) {
       // Rows newer than the last one seen are new play; with nothing seen yet, it is history.
       const since = k.newest[stream] || t - opt.historyMs;
       const back = !k.newest[stream];
@@ -389,7 +446,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         await doSleep(opt.gapMs);
       }
       if (back && k.hist[stream] === undefined) k.hist[stream] = more;
-      if (stream === 'upgrade') await doSleep(opt.gapMs);
+      if (i < streams.length - 1) await doSleep(opt.gapMs);
     }
     return true;
   }
@@ -540,7 +597,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     /** What a restart should carry over (see `initial`). Holds real site ids: keep it local. */
     exportState() {
       return {
-        known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, hist: k.hist })),
+        known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, hist: k.hist, ctr: k.ctr })),
         pageSize,
         pageProbe,
         profileProbed,
@@ -560,6 +617,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         // Lists with older pages still to read (up to `deepPages` each).
         historyPages: [...known.values()].reduce((s, k) => s + STREAMS.filter((st) => k.hist[st]).length, 0),
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
+        counterChecks: !countersOff,
+        counterMisses, // counter checks that said "no new play" when the list later showed some
         requestsLastHour: requests.length,
         rowsLastHour: counted.reduce((s, [, n]) => s + n, 0),
         backRowsLastHour: counted.reduce((s, [, n, b]) => s + (b ? n : 0), 0),
