@@ -20,22 +20,28 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 48px; }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
   header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; margin-bottom: 16px; }
   h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
-  h2 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
+  h2 { font-size: 14px; font-weight: 600; margin: 0; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 10px; }
   .muted { color: var(--muted); }
   .faint { color: var(--faint); }
   .hint { color: var(--faint); font-size: 12.5px; margin: 10px 0 0; }
   .pos { color: var(--pos); }
   .neg { color: var(--neg); }
+  .warn-text { color: var(--warn); }
   .num { font-variant-numeric: tabular-nums; }
-  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .group { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .group button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+  .group button:last-child { border-right: 0; }
+  .label { color: var(--faint); font-size: 12.5px; margin: 0 2px 0 6px; }
   button, input { font: inherit; color: inherit; }
-  button { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 5px 11px; cursor: pointer; transition: border-color 120ms, background 120ms; }
-  button:hover { border-color: var(--faint); }
-  button.on { background: var(--text); color: var(--bg); border-color: var(--text); }
+  button { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; transition: background 120ms, border-color 120ms; }
+  button:hover { background: #1b1f24; }
+  button.on { background: var(--text); color: var(--bg); }
   button.primary { background: var(--accent); color: #0b0d10; border-color: var(--accent); font-weight: 600; }
   button:disabled { opacity: 0.5; cursor: default; }
   input { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
@@ -51,20 +57,28 @@
   .health .state { font-weight: 600; }
   .health.warn .state { color: var(--warn); }
   .health.bad .state { color: var(--neg); }
+  .events { list-style: none; margin: 10px 0 0; padding: 0; font-size: 13px; }
+  .events li { display: grid; grid-template-columns: 70px 92px 1fr; gap: 10px; padding: 5px 0; border-top: 1px solid var(--line); }
+  .events .lv-error { color: var(--neg); }
+  .events .lv-warn { color: var(--warn); }
+  .events .lv-info { color: var(--faint); }
   .verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
   .verdicts section { margin: 0; border-left-width: 3px; }
   .verdicts .good { border-left-color: var(--pos); }
   .verdicts .bad { border-left-color: var(--neg); }
   .headline { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .kpi .k { color: var(--muted); font-size: 12.5px; }
   .kpi .v { font-size: 22px; font-weight: 600; }
   .kpi .s { color: var(--faint); font-size: 12.5px; }
-  .chart svg { display: block; width: 100%; height: auto; }
+  .chart svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
   .chart text { fill: var(--faint); font-size: 11px; font-family: inherit; }
-  .readout { min-height: 21px; font-size: 13px; margin-bottom: 6px; }
-  .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
-  .legend i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 6px; }
+  .readout { min-height: 42px; font-size: 13px; margin-bottom: 4px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
+  .legend i { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin-right: 6px; }
+  .legend i.dot { width: 8px; height: 8px; border-radius: 50%; }
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 12px; }
+  .split h3 { font-size: 12.5px; font-weight: 600; color: var(--muted); margin: 0 0 4px; }
   .table-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
@@ -81,29 +95,40 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, rangeSpec, compareWindows, buildView, monitorHealth } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
 const HOUR = 3600000;
-const COLORS = { line: '#7ea6f6', grid: '#22272e', zero: '#3a414b', pos: '#45c486', neg: '#ef6b6b', whisker: '#c3c8cf', marker: '#e6e8eb', diag: '#6b7480', bg: '#15181c', warn: '#d8a650' };
+const COLORS = { line: '#7ea6f6', grid: '#22272e', zero: '#3a414b', pos: '#45c486', neg: '#ef6b6b', whisker: '#c3c8cf', marker: '#e6e8eb', diag: '#6b7480', bg: '#15181c', warn: '#d8a650', bar: '#2c323a' };
 const DASH = '–';
 const ok = (v) => typeof v === 'number' && Number.isFinite(v);
 const fmt = (v, d = 0) => (ok(v) ? v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) : DASH);
-const fmtR = (v) => fmt(v, 3);
+const fmt3 = (v) => fmt(v, 3);
+const fmt2 = (v) => fmt(v, 2);
 const fmtInt = (v) => fmt(v, 0);
+const pct = (v, d = 1) => (ok(v) ? `${fmt(v * 100, d)}%` : DASH);
 const fmtAgo = (t) => {
   const s = Math.max(0, Math.round((Date.now() - t) / 1000));
   return s < 60 ? `${s} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} days ago`;
 };
 const sign = (v) => (!ok(v) ? 'faint' : v > 1e-9 ? 'pos' : v < -1e-9 ? 'neg' : '');
+const store = {
+  get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+const NAMES = { upgrade: ['Upgrades', 'upgrades', 'win index', 'wins against what the shown chances predict'], case: ['Cases', 'case opens', 'hit index', 'opens worth at least the case price, against each case’s normal rate'] };
 
-let rangeKey = (() => { try { return localStorage.getItem('pulse.range') || '24h'; } catch { return '24h'; } })();
-if (!RANGES[rangeKey]) rangeKey = '24h';
+let rangeKey = RANGES[store.get('pulse.range')] ? store.get('pulse.range') : '24h';
+let windowMin = pickWindow(rangeKey, store.get('pulse.window', 15));
+const metric = { upgrade: store.get('pulse.metric.upgrade', 'index'), case: store.get('pulse.metric.case', 'index') };
+let heatKind = store.get('pulse.heat', 'upgrade');
 let view = null;
 let health = null;
+let events = [];
 let session = null;
 let loading = false;
+let loadError = null;
 let firstPaint = true;
 
 function h(tag, attrs, ...kids) {
@@ -126,6 +151,10 @@ function s(tag, attrs) {
   }
   return el;
 }
+function toggle(options, current, onPick, label) {
+  return h('span', { class: 'row' }, label ? h('span', { class: 'label', text: label }) : null,
+    h('span', { class: 'group', role: 'group' }, options.map(([v, text, title]) => h('button', { type: 'button', class: String(v) === String(current) ? 'on' : '', 'aria-pressed': String(String(v) === String(current)), title, text, onclick: () => onPick(v) }))));
+}
 
 function timeLabel(t, span) {
   const d = new Date(t);
@@ -133,11 +162,12 @@ function timeLabel(t, span) {
   if (span <= 7 * 24 * HOUR) return d.toLocaleString([], { weekday: 'short', hour: '2-digit' });
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
-function bucketLabel(t, bucket) {
-  const d = new Date(t);
-  return bucket >= 24 * HOUR ? d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+function spanLabel(a, b) {
+  const da = new Date(a), db = new Date(b);
+  const t = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const day = da.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  return b - a >= 24 * HOUR ? day : `${day}, ${t(da)}–${t(db)}`;
 }
-
 function niceTicks(min, max, count = 4) {
   if (min === max) { const d = Math.abs(min) || 1; min -= d; max += d; }
   const raw = (max - min) / count;
@@ -151,10 +181,10 @@ function niceTicks(min, max, count = 4) {
   return { lo, hi, ticks };
 }
 
-/** Time axis shared by both chart kinds. */
-function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label }) {
-  const W = Math.max(260, Math.floor(width));
-  const H = 200, padL = 46, padR = 10, padT = 10, padB = 22;
+/** Time axis, value grid and an optional strip under the plot (for sample sizes). */
+function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, strip = 0 }) {
+  const W = Math.max(280, Math.floor(width));
+  const padL = 44, padR = 10, padT = 10, padB = 22 + strip;
   const iw = W - padL - padR, ih = H - padT - padB;
   const x = (t) => padL + ((Math.max(t0, Math.min(t1, t)) - t0) / (t1 - t0 || 1)) * iw;
   const y = (v) => padT + ih - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1)) * ih;
@@ -168,16 +198,16 @@ function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label }) {
   const offset = new Date().getTimezoneOffset() * 60000;
   for (let t = Math.ceil((t0 - offset) / step) * step + offset; t <= t1; t += step) {
     const xx = Math.round(x(t)) + 0.5;
-    svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih, stroke: COLORS.grid }));
-    if (xx > padL + 28 && xx < W - padR - 28) svg.append(s('text', { x: xx, y: padT + ih + 14, 'text-anchor': 'middle', text: timeLabel(t, span) }));
+    svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih + strip, stroke: COLORS.grid }));
+    if (xx > padL + 28 && xx < W - padR - 28) svg.append(s('text', { x: xx, y: H - 6, 'text-anchor': 'middle', text: timeLabel(t, span) }));
   }
-  return { svg, x, y, W, H, padL, padT, iw, ih };
+  return { svg, x, y, W, H, padL, padR, padT, iw, ih, stripTop: padT + ih + 4, strip };
 }
 
 function hover(f, marks, onPick, onIdle) {
   if (!marks.length) return;
   const ring = s('circle', { r: 6, fill: 'none', stroke: COLORS.marker, visibility: 'hidden' });
-  const hit = s('rect', { x: f.padL, y: f.padT, width: f.iw, height: f.ih, fill: 'transparent' });
+  const hit = s('rect', { x: f.padL, y: f.padT, width: f.iw, height: f.ih + f.strip, fill: 'transparent' });
   f.svg.append(ring, hit);
   const move = (e) => {
     const box = f.svg.getBoundingClientRect();
@@ -194,49 +224,149 @@ function hover(f, marks, onPick, onIdle) {
   hit.addEventListener('pointerleave', () => { ring.setAttribute('visibility', 'hidden'); onIdle(); });
 }
 
-/** Return per 1 by bucket, with 95% ranges; for short ranges also the two comparison windows as bands. */
-function returnChart({ v, kind, what, width }) {
-  const { spec, compare, windows, now } = v;
+/** One value per window: the index or return per 1, with ranges, the smoothed hour, and sample sizes. */
+function windowChart({ v, kind, width }) {
+  const k = v.kinds[kind];
+  const m = metric[kind];
+  const { spec, now } = v;
   const span = spec.to - spec.from;
-  const rows = v.buckets.map((b) => ({ start: b.start, r: b[kind] }));
-  const c = compare[kind];
-  const bands = span <= 24 * HOUR;
+  const [, what] = NAMES[kind];
+  const pick = (w) => (m === 'index' ? { val: w.index.index, ci: w.index.ci, n: w.index.n } : { val: w.money.ratio, ci: w.money.ci, n: w.money.n });
+  const ref = m === 'index' ? k.avg.index : k.money.ratio;
+  const cap = m === 'index' ? 2.5 : 3;
   const vals = [1];
-  for (const x of rows) if (ok(x.r?.ratio) && x.r.ci && x.r.n >= 20) vals.push(x.r.ratio);
-  if (bands) for (const k of ['recent', 'base']) { const r = c?.[k]; if (ok(r?.ratio)) vals.push(r.ratio, ...(r.ci || [])); }
-  const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(3, q)));
+  if (ok(ref)) vals.push(ref);
+  for (const w of k.windows) {
+    const p = pick(w);
+    if (ok(p.val) && p.n >= 20) vals.push(p.val);
+    if (m === 'index' && ok(w.smooth)) vals.push(w.smooth);
+  }
+  const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(cap, q)));
   const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
-  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, label: `Return per 1 staked on ${what} over the last ${spec.label}.` });
+  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, strip: 30, H: 250, label: `${NAMES[kind][0]}: ${m === 'index' ? NAMES[kind][2] : 'return per 1 staked'} per ${windowMin}-minute window over the last ${spec.label}.` });
   const { svg, x, y } = f;
   const yb = Math.round(y(1)) + 0.5;
-  svg.append(s('line', { x1: f.padL, x2: f.W - 10, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
-  if (bands) {
-    const vc = c?.verdict === 'better' ? COLORS.pos : c?.verdict === 'worse' ? COLORS.neg : COLORS.line;
-    for (const [k, color] of [['base', COLORS.whisker], ['recent', vc]]) {
-      const r = c?.[k], win = windows[k];
-      if (!ok(r?.ratio)) continue;
-      const xa = x(win.from), xb = x(Math.min(win.to, now));
-      if (r.ci) { const ya = y(r.ci[1]); svg.append(s('rect', { x: xa, y: ya, width: Math.max(1, xb - xa), height: Math.max(1, y(r.ci[0]) - ya), fill: color, 'fill-opacity': 0.14 })); }
-      svg.append(s('line', { x1: xa, x2: xb, y1: y(r.ratio), y2: y(r.ratio), stroke: color, 'stroke-width': 2 }));
-    }
+  svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+  if (ok(ref)) {
+    const ya = Math.round(y(ref)) + 0.5;
+    svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: ya, y2: ya, stroke: COLORS.warn, 'stroke-width': 1, 'stroke-opacity': 0.7 }));
   }
+  // Sample size per window, as bars under the plot.
+  const maxN = Math.max(1, ...k.windows.map((w) => pick(w).n));
+  const bw = Math.max(1, f.iw / Math.max(1, k.windows.length) - 1);
+  for (const w of k.windows) {
+    const p = pick(w);
+    if (!p.n) continue;
+    const bh = Math.max(1, (p.n / maxN) * (f.strip - 8));
+    svg.append(s('rect', { x: x(w.start), y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
+  }
+  const dense = k.windows.length > 160;
   const marks = [];
-  for (const row of rows) {
-    const r = row.r;
-    if (!r || !r.n || !ok(r.ratio)) continue;
-    const cx = x(row.start + spec.bucket / 2);
-    if (r.ci) svg.append(s('line', { x1: cx, x2: cx, y1: y(r.ci[0]), y2: y(r.ci[1]), stroke: COLORS.zero }));
-    svg.append(s('circle', { cx, cy: y(r.ratio), r: 3, fill: r.ci ? COLORS.line : COLORS.bg, stroke: COLORS.line, 'stroke-width': 1.5 }));
-    marks.push({ cx, cy: y(r.ratio), row });
+  for (const w of k.windows) {
+    const p = pick(w);
+    if (!ok(p.val) || !p.n) continue;
+    const cx = x(w.start + spec.window / 2);
+    const z = m === 'index' ? w.z : null;
+    const color = z != null && z >= 2 ? COLORS.pos : z != null && z <= -2 ? COLORS.neg : COLORS.line;
+    if (p.ci && !dense) svg.append(s('line', { x1: cx, x2: cx, y1: y(p.ci[0]), y2: y(p.ci[1]), stroke: COLORS.zero }));
+    const solid = p.n >= 20;
+    svg.append(s('circle', { cx, cy: y(p.val), r: dense ? 2 : 3, fill: solid ? color : COLORS.bg, stroke: color, 'stroke-width': 1.25 }));
+    marks.push({ cx, cy: y(p.val), w, p });
+  }
+  if (m === 'index') {
+    let d = '';
+    for (const w of k.windows) {
+      if (!ok(w.smooth)) { d += ' '; continue; }
+      const px = x(w.start + spec.window / 2), py = y(w.smooth);
+      d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${px.toFixed(1)},${py.toFixed(1)}`;
+    }
+    svg.append(s('path', { d: d.trim(), fill: 'none', stroke: COLORS.marker, 'stroke-width': 1.5, 'stroke-opacity': 0.8, 'stroke-linejoin': 'round' }));
   }
   const readout = h('div', { class: 'readout' });
-  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a point for details. Hollow dots: fewer than 5 players.' : 'No data in this range yet.' }));
+  const hasRows = k.windows.some((w) => w.n > 0);
+  const empty = !hasRows ? 'No data in this range yet.' : kind === 'case' ? 'No hit index yet: it needs the case of each open, which the monitor sends from version 1.2.0 on. Switch to “return per 1” for older rows.' : 'No win index yet: these upgrades have no shown chance. Switch to “return per 1”.';
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a window for details.' : empty }));
   idle();
-  hover(f, marks, ({ row }) => {
-    const r = row.r;
-    readout.replaceChildren(`${bucketLabel(row.start, spec.bucket)}: `, h('span', { class: ['num', sign(r.ratio - 1)], text: fmtR(r.ratio) }),
-      h('span', { class: 'faint', text: `  ${r.ci ? `range ${fmtR(r.ci[0])}–${fmtR(r.ci[1])}, ` : ''}${fmtInt(r.n)} ${what}, ${fmtInt(r.players)} players` }));
+  hover(f, marks, ({ w }) => {
+    const ix = w.index, mo = w.money;
+    readout.replaceChildren(
+      h('div', null, `${spanLabel(w.start, w.start + spec.window)}  `,
+        h('span', { class: ['num', sign((ix.index ?? NaN) - 1)], text: `index ${fmt2(ix.index)}` }),
+        h('span', { class: 'faint', text: ix.ci ? ` (${fmt2(ix.ci[0])}–${fmt2(ix.ci[1])})` : '' }), '  ',
+        h('span', { class: ['num', sign((mo.ratio ?? NaN) - 1)], text: `return ${fmt3(mo.ratio)}` })),
+      h('div', { class: 'faint', text: `${fmtInt(w.n)} ${what} from ${fmtInt(w.players)} players, ${fmtInt(w.up)} of them up${kind === 'upgrade' ? `; ${fmtInt(ix.obs)} wins where the shown chances predict ${fmt(ix.exp, 1)}` : `; ${fmtInt(ix.obs)} hits where ${fmt(ix.exp, 1)} were expected`}` }));
   }, idle);
+  const legend = h('div', { class: 'legend' },
+    h('span', null, h('i', { class: 'dot', style: `background:${COLORS.line}` }), m === 'index' ? NAMES[kind][2] : 'return per 1'),
+    m === 'index' ? h('span', null, h('i', { style: `background:${COLORS.marker}` }), 'last hour, smoothed') : null,
+    h('span', null, h('i', { style: `background:${COLORS.warn}` }), 'range average'),
+    h('span', null, h('i', { style: `background:${COLORS.diag}` }), m === 'index' ? (kind === 'upgrade' ? '1 = as the shown chances say' : '1 = the case’s normal rate') : '1 = break-even'),
+    m === 'index' ? h('span', null, h('i', { class: 'dot', style: `background:${COLORS.pos}` }), h('i', { class: 'dot', style: `background:${COLORS.neg};margin-left:-2px` }), 'clearly above / below average') : null,
+    h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'sample size'));
+  return h('div', { class: 'chart' }, legend, readout, svg);
+}
+
+function windowList(title, list, kind) {
+  return h('div', null, h('h3', { text: title }),
+    list.length
+      ? h('table', null, h('tbody', null, list.map((w) => h('tr', null,
+          h('td', { text: spanLabel(w.start, w.start + view.spec.window) }),
+          h('td', { class: ['num', sign(w.index.index - 1)], text: fmt2(w.index.index) }),
+          h('td', { class: 'num faint', text: `${fmtInt(w.index.n)} ${NAMES[kind][1]}` })))))
+      : h('p', { class: 'faint', text: 'Not enough windows with 20 or more yet.' }));
+}
+
+/** Weekday x hour, colored by the index (or return) against 1, faded where the sample is small. */
+function heatmap({ v, kind, width }) {
+  const cells = v.heat[kind];
+  const hours = v.hours[kind];
+  const m = metric[kind];
+  const val = (c) => (m === 'index' ? c?.index?.index : c?.money?.ratio);
+  const W = Math.max(300, Math.floor(width));
+  const padL = 44, padT = 4, padB = 18;
+  const cw = (W - padL - 4) / 24, ch = 20;
+  const rows = [...cells.map((r, i) => ({ label: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i], cells: r })), { label: 'All', cells: hours }];
+  const H = padT + rows.length * (ch + 2) + 4 + padB;
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `${NAMES[kind][0]} by weekday and hour, local time.` });
+  const marks = [];
+  rows.forEach((row, ri) => {
+    const yy = padT + ri * (ch + 2) + (ri === 7 ? 4 : 0);
+    svg.append(s('text', { x: padL - 6, y: yy + ch / 2 + 4, 'text-anchor': 'end', text: row.label }));
+    for (let hr = 0; hr < 24; hr++) {
+      const c = row.cells[hr];
+      const xx = padL + hr * cw;
+      svg.append(s('rect', { x: xx, y: yy, width: cw - 2, height: ch, rx: 2, fill: '#1a1e23' }));
+      const vv = val(c);
+      if (ok(vv) && c.n) {
+        const t = Math.max(-1, Math.min(1, (vv - 1) / 0.3));
+        const conf = Math.min(1, (m === 'index' ? c.index.n : c.money.n) / 60);
+        svg.append(s('rect', { x: xx, y: yy, width: cw - 2, height: ch, rx: 2, fill: t >= 0 ? COLORS.pos : COLORS.neg, 'fill-opacity': (0.12 + 0.75 * Math.abs(t)) * (0.25 + 0.75 * conf) }));
+      }
+      marks.push({ x: xx, y: yy, c, label: `${row.label === 'All' ? 'All days' : row.label} ${String(hr).padStart(2, '0')}:00–${String(hr + 1).padStart(2, '0')}:00` });
+    }
+  });
+  for (let hr = 0; hr < 24; hr += 3) svg.append(s('text', { x: padL + hr * cw + cw / 2, y: H - 4, 'text-anchor': 'middle', text: String(hr).padStart(2, '0') }));
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: 'Local time. Green: better than 1, red: worse; pale cells have few rows. Hover or tap a cell.' }));
+  idle();
+  const hit = s('rect', { x: padL, y: padT, width: W - padL, height: H - padT - padB, fill: 'transparent' });
+  svg.append(hit);
+  const move = (e) => {
+    const box = svg.getBoundingClientRect();
+    const px = ((e.clientX - box.left) / (box.width || 1)) * W;
+    const py = ((e.clientY - box.top) / (box.height || 1)) * H;
+    const hr = Math.max(0, Math.min(23, Math.floor((px - padL) / cw)));
+    const ri = Math.max(0, Math.min(7, Math.floor((py - padT) / (ch + 2))));
+    const mk = marks[ri * 24 + hr];
+    const c = mk?.c;
+    readout.replaceChildren(h('div', null, `${mk.label}  `,
+      h('span', { class: ['num', sign((c?.index?.index ?? NaN) - 1)], text: `index ${fmt2(c?.index?.index)}` }), '  ',
+      h('span', { class: ['num', sign((c?.money?.ratio ?? NaN) - 1)], text: `return ${fmt3(c?.money?.ratio)}` })),
+      h('div', { class: 'faint', text: `${fmtInt(c?.n ?? 0)} ${NAMES[kind][1]}` }));
+  };
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
+  hit.addEventListener('pointerleave', idle);
   return h('div', { class: 'chart' }, readout, svg);
 }
 
@@ -244,16 +374,17 @@ function returnChart({ v, kind, what, width }) {
 function activityChart({ v, width }) {
   const { spec, now } = v;
   const series = [['upgradesPerMin', 'Upgrades / min', COLORS.line], ['casesPerMin', 'Case opens / min', COLORS.warn]];
+  const buckets = v.volume.buckets;
   const vals = [];
-  for (const b of v.buckets) for (const [k] of series) if (ok(b.volume[k])) vals.push(b.volume[k]);
+  for (const b of buckets) for (const [k] of series) if (ok(b[k])) vals.push(b[k]);
   const { lo, hi, ticks } = niceTicks(0, Math.max(10, ...vals), 4);
-  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => (q >= 1000 ? `${fmt(q / 1000, q % 1000 ? 1 : 0)}k` : fmt(q)), span: spec.to - spec.from, label: `Site-wide upgrades and case opens per minute over the last ${spec.label}.` });
+  const f = frame({ width, t0: spec.coarse.from, t1: now, lo, hi, ticks, tickFmt: (q) => (q >= 1000 ? `${fmt(q / 1000, q % 1000 ? 1 : 0)}k` : fmt(q)), span: spec.to - spec.from, label: `Site-wide upgrades and case opens per minute over the last ${spec.label}.`, H: 190 });
   const marks = [];
   for (const [k, , color] of series) {
     let d = '';
-    for (const b of v.buckets) {
-      if (!ok(b.volume[k])) { d += ' '; continue; }
-      const cx = f.x(b.start + spec.bucket / 2), cy = f.y(b.volume[k]);
+    for (const b of buckets) {
+      if (!ok(b[k])) { d += ' '; continue; }
+      const cx = f.x(b.bucket + spec.coarse.bucket / 2), cy = f.y(b[k]);
       d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${cx.toFixed(1)},${cy.toFixed(1)}`;
       if (k === 'upgradesPerMin') marks.push({ cx, cy, b });
     }
@@ -262,95 +393,121 @@ function activityChart({ v, width }) {
   const readout = h('div', { class: 'readout' });
   const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'From the site’s public counters. Hover or tap for details.' : 'No counter samples in this range yet.' }));
   idle();
-  hover(f, marks, ({ b }) => readout.replaceChildren(`${bucketLabel(b.start, spec.bucket)}: `,
-    h('span', { class: 'num', text: `${fmtInt(b.volume.upgradesPerMin)} upgrades / min, ${fmtInt(b.volume.casesPerMin)} case opens / min, ${fmtInt(b.volume.online)} online` })), idle);
+  hover(f, marks, ({ b }) => readout.replaceChildren(`${spanLabel(b.bucket, b.bucket + spec.coarse.bucket)}: `,
+    h('span', { class: 'num', text: `${fmtInt(b.upgradesPerMin)} upgrades / min, ${fmtInt(b.casesPerMin)} case opens / min, ${fmtInt(b.online)} online` })), idle);
   const legend = h('div', { class: 'legend' }, series.map(([, label, color]) => h('span', null, h('i', { style: `background:${color}` }), label)));
   return h('div', { class: 'chart' }, legend, readout, f.svg);
 }
 
-const VERDICT = { better: ['good', 'Higher now'], worse: ['bad', 'Lower now'], same: ['', 'No clear change'], few: ['', 'Not enough data yet'] };
-function verdictCard(label, c) {
+const VERDICT = { better: ['good', 'Better now'], worse: ['bad', 'Worse now'], same: ['', 'No clear change'], few: ['', 'Not enough data yet'] };
+function verdictCard(kind) {
+  const c = view.compare[kind];
+  const mo = view.compareMoney[kind];
   const [cls, word] = VERDICT[c.verdict] || VERDICT.few;
   const r = c.recent, b = c.base;
   const detail = c.verdict === 'few'
-    ? `Needs at least 30 ${label.toLowerCase()} from 5 or more players in each window. Last hour: ${fmtInt(r.n)} from ${fmtInt(r.players)} players; the 3 hours before: ${fmtInt(b.n)}.`
-    : `Players got back ${fmtR(r.ratio)} per 1 staked in the last hour (${fmtInt(r.n)} from ${fmtInt(r.players)} players), against ${fmtR(b.ratio)} in the 3 hours before (${fmtInt(b.n)}). ${c.verdict === 'same' ? 'The difference is within random noise' : 'The difference is too large to be luck'} (p = ${ok(c.p) ? fmt(c.p, 3) : DASH}).`;
-  return h('section', { class: cls }, h('div', { class: 'headline', text: `${label}: ${word}` }), h('div', { class: 'muted', text: detail }));
+    ? `Needs at least 30 ${NAMES[kind][1]} in each window. Last hour: ${fmtInt(r.n)}; the 3 hours before: ${fmtInt(b.n)}.`
+    : `${NAMES[kind][0]} ${NAMES[kind][2]} ${fmt2(r.index)} in the last hour (${fmtInt(r.n)} ${NAMES[kind][1]}), against ${fmt2(b.index)} in the 3 hours before (${fmtInt(b.n)}). ${c.verdict === 'same' ? 'The difference is within random noise' : 'The difference is too large to be luck'} (p = ${ok(c.p) ? fmt(c.p, 3) : DASH}).`;
+  return h('section', { class: cls }, h('div', { class: 'headline', text: `${NAMES[kind][0]}: ${word}` }), h('div', { class: 'muted', text: detail }),
+    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)} last hour, ${fmt3(mo.base.ratio)} before.` }));
 }
-const kpi = (k, val, sub) => h('div', { class: 'kpi' }, h('div', { class: 'k', text: k }), h('div', { class: 'v num', text: val }), sub ? h('div', { class: 's', text: sub }) : null);
-const ratioCell = (r) => h('td', { class: 'num' }, h('span', { class: ok(r?.ratio) ? sign(r.ratio - 1) : 'faint', text: fmtR(r?.ratio) }), r?.ci ? h('span', { class: 'ci', text: `${fmtR(r.ci[0])} ${DASH} ${fmtR(r.ci[1])}` }) : null);
+const kpi = (k, val, sub, cls) => h('div', { class: 'kpi' }, h('div', { class: 'k', text: k }), h('div', { class: ['v', 'num', cls], text: val }), sub ? h('div', { class: 's', text: sub }) : null);
+const ixCell = (ix) => h('td', { class: 'num' }, h('span', { class: ok(ix?.index) ? sign(ix.index - 1) : 'faint', text: fmt2(ix?.index) }), ix?.ci ? h('span', { class: 'ci', text: `${fmt2(ix.ci[0])} ${DASH} ${fmt2(ix.ci[1])}` }) : null);
+const moneyCell = (r) => h('td', { class: ['num', ok(r?.ratio) ? sign(r.ratio - 1) : 'faint'], text: fmt3(r?.ratio) });
+const tableOf = (heads, rows) => h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null, heads.map((x) => h('th', { text: x })))), h('tbody', null, rows)));
 
-function healthSection() {
-  if (!health) return null;
-  const st = health.status ?? {};
-  const facts = health.level === 'bad' && !st.running ? [] : [
+function problemsSection() {
+  const st = health?.status ?? {};
+  const facts = !health || (health.level === 'bad' && !st.running) ? [] : [
     `${fmtInt(st.rowsLastHour)} rows in the last hour (${fmtInt(st.backRowsLastHour)} from players’ history)`,
     `${fmtInt(st.requestsLastHour)} requests`,
-    `${fmtInt(st.players)} players followed, ${fmtInt(st.queued)} waiting`,
+    `${fmtInt(st.players)} followed, ${fmtInt(st.queued)} waiting, ${fmtInt(st.known)} known, ${fmtInt(st.historyPages)} history pages to read`,
   ];
-  return h('section', { class: ['health', health.level] },
-    h('span', { class: 'state', text: health.text }),
-    ...facts.map((t) => h('span', { class: 'muted', text: t })),
-    health.at ? h('span', { class: 'faint', text: `Last report ${fmtAgo(health.at)}${st.version ? `, monitor ${st.version}` : ''}.` }) : null);
+  const recent = events.slice(0, 12);
+  return h('section', { class: ['health', health?.level ?? 'warn'] },
+    h('div', { style: 'flex-basis:100%' },
+      h('div', { class: 'row', style: 'gap:4px 14px' },
+        h('span', { class: 'state', text: health?.text ?? 'Loading…' }),
+        ...facts.map((t) => h('span', { class: 'muted', text: t })),
+        health?.at ? h('span', { class: 'faint', text: `Last report ${fmtAgo(health.at)}${st.version ? `, monitor ${st.version}` : ''}${st.pageSize ? `, ${st.pageSize} rows per page` : ''}${st.alerts === false ? ', alerts off' : ''}.` }) : null),
+      recent.length
+        ? h('ul', { class: 'events' }, recent.map((e) => h('li', null,
+            h('span', { class: `lv-${e.level}`, text: e.level }),
+            h('span', { class: 'faint', text: fmtAgo(Date.parse(e.at)) }),
+            h('span', { text: e.message }))))
+        : null));
 }
 
 function header() {
+  const wins = windowsFor(rangeKey);
   return h('header', null, h('h1', { text: 'Pulse monitor' }),
     h('div', { class: 'row' },
-      ...Object.entries(RANGES).map(([k, r]) => h('button', { type: 'button', class: k === rangeKey ? 'on' : '', 'aria-pressed': String(k === rangeKey), text: k, title: r.label, onclick: () => setRange(k) })),
+      toggle(Object.entries(RANGES).map(([k, r]) => [k, k, r.label]), rangeKey, setRange, 'Range'),
+      toggle(wins.map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window'),
       h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
       h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
 }
 
 function renderDashboard() {
   const v = view;
-  const width = Math.min(root.clientWidth || 960, 968) - 34;
-  const out = [header()];
-  const hs = healthSection();
-  if (hs) out.push(hs);
+  const width = Math.min(root.clientWidth || 1000, 1008) - 34;
+  const out = [header(), problemsSection()];
+  if (loadError) out.push(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${loadError}` }));
   if (!v) { out.push(h('p', { class: 'faint', text: 'Loading…' })); root.replaceChildren(...out); return; }
-  out.push(h('div', { class: 'verdicts' }, verdictCard('Upgrades', v.compare.upgrade), verdictCard('Cases', v.compare.case)));
-  const vol = v.volume;
-  out.push(h('section', null, h('h2', { text: 'Last hour against the 3 hours before' }),
-    h('div', { class: 'kpis' },
-      kpi('Upgrades, return per 1', fmtR(v.compare.upgrade.recent.ratio), `before ${fmtR(v.compare.upgrade.base.ratio)}`),
-      kpi('Cases, return per 1', fmtR(v.compare.case.recent.ratio), `before ${fmtR(v.compare.case.base.ratio)}`),
-      kpi('Site upgrades / min', fmtInt(vol.recent.upgradesPerMin), `before ${fmtInt(vol.base.upgradesPerMin)}`),
-      kpi('Site case opens / min', fmtInt(vol.recent.casesPerMin), `before ${fmtInt(vol.base.casesPerMin)}`)),
-    h('p', { class: 'hint', text: 'Return per 1 is total value received divided by total staked, over every sampled upgrade or case open. 1.000 means players broke even at site prices.' })));
 
-  const t = v.total;
-  out.push(h('section', null, h('h2', { text: `Whole range: last ${v.spec.label}` }),
-    h('div', { class: 'kpis' },
-      kpi('Upgrades, return per 1', fmtR(t.upgrade.ratio), t.upgrade.ci ? `range ${fmtR(t.upgrade.ci[0])}–${fmtR(t.upgrade.ci[1])}` : null),
-      kpi('Sampled upgrades', fmtInt(t.upgrade.n), `${fmtInt(t.upgrade.staked)} staked`),
-      kpi('Cases, return per 1', fmtR(t.case.ratio), t.case.ci ? `range ${fmtR(t.case.ci[0])}–${fmtR(t.case.ci[1])}` : null),
-      kpi('Sampled case opens', fmtInt(t.case.n), `${fmtInt(t.case.staked)} spent`))));
+  out.push(h('div', { class: 'verdicts' }, verdictCard('upgrade'), verdictCard('case')));
 
-  const step = v.spec.bucket >= 24 * HOUR ? 'day' : v.spec.bucket >= HOUR ? `${v.spec.bucket / HOUR} h` : `${v.spec.bucket / 60000} min`;
-  for (const [kind, label, what] of [['upgrade', 'Upgrades', 'upgrades'], ['case', 'Cases', 'case opens']]) {
-    out.push(h('section', null, h('h2', { text: `${label}: return per 1 staked, per ${step}` }), returnChart({ v, kind, what, width }),
-      kind === 'case' ? h('p', { class: 'hint', text: `Dots are ${step} buckets with their 95% range; hollow dots have too few players for a range. The dashed line at 1 is break-even at site prices.${v.spec.to - v.spec.from <= 24 * HOUR ? ' The bands are the last hour (right) and the 3 hours before it: when they overlap a lot, the change is noise.' : ''}` }) : null));
+  const t = v.totals;
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Last ${v.spec.label}` })),
+    h('div', { class: 'kpis' },
+      kpi('Upgrade win index', fmt2(v.kinds.upgrade.avg.index), v.kinds.upgrade.avg.ci ? `range ${fmt2(v.kinds.upgrade.avg.ci[0])}–${fmt2(v.kinds.upgrade.avg.ci[1])}` : null, sign((v.kinds.upgrade.avg.index ?? NaN) - 1)),
+      kpi('Upgrades, return per 1', fmt3(v.kinds.upgrade.money.ratio), `${fmtInt(v.kinds.upgrade.money.n)} upgrades`),
+      kpi('Case hit rate', pct(v.kinds.case.avg.exp ? v.kinds.case.avg.obs / v.kinds.case.avg.n : null), `index ${fmt2(v.kinds.case.avg.index)}`),
+      kpi('Cases, return per 1', fmt3(v.kinds.case.money.ratio), `${fmtInt(v.kinds.case.money.n)} opens`),
+      kpi('Players up, upgrades', t.upgrade.players ? pct(t.upgrade.up / t.upgrade.players, 0) : DASH, `${fmtInt(t.upgrade.up)} of ${fmtInt(t.upgrade.players)}`),
+      kpi('Players up, cases', t.case.players ? pct(t.case.up / t.case.players, 0) : DASH, `${fmtInt(t.case.up)} of ${fmtInt(t.case.players)}`)),
+    h('p', { class: 'hint', text: 'Win index: upgrade wins against the wins the shown chances predict. Hit index: case opens worth at least the case price, against each case’s normal rate over the last 7 days. 1 means as expected; above 1 is better for players. Both count every upgrade or open once, so they settle much faster than return per 1, which one big win can move.' })));
+
+  for (const kind of KINDS) {
+    const k = v.kinds[kind];
+    out.push(h('section', null,
+      h('div', { class: 'sec-head' },
+        h('h2', { text: `${NAMES[kind][0]} per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }),
+        toggle([['index', NAMES[kind][2], NAMES[kind][3]], ['money', 'return per 1', 'total received per 1 staked']], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); })),
+      windowChart({ v, kind, width }),
+      h('div', { class: 'split' }, windowList('Best windows (index above the range average)', k.best, kind), windowList('Worst windows', k.worst, kind)),
+      h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin. Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank windows by how far they sit from the average, counting their sample size.' })));
   }
-  out.push(h('section', null, h('h2', { text: `Site activity, per ${step}` }), activityChart({ v, width })));
 
-  const rows = [...v.buckets].reverse().filter((b) => b.upgrade.n || b.case.n || ok(b.volume.casesPerMin));
-  out.push(h('section', null, h('h2', { text: `By ${step}, newest first` }),
-    rows.length
-      ? h('div', { class: 'table-wrap' }, h('table', null,
-          h('thead', null, h('tr', null, ...['Time', 'Upgrades', 'Return', 'Cases', 'Return', 'Staked', 'Site / min', 'Online'].map((x) => h('th', { text: x })))),
-          h('tbody', null, rows.map((b) => h('tr', null,
-            h('td', { class: 'num', text: bucketLabel(b.start, v.spec.bucket) }),
-            h('td', { class: 'num', text: fmtInt(b.upgrade.n) }), ratioCell(b.upgrade),
-            h('td', { class: 'num', text: fmtInt(b.case.n) }), ratioCell(b.case),
-            h('td', { class: 'num', text: fmtInt(b.upgrade.staked + b.case.staked) }),
-            h('td', { class: 'num', text: ok(b.volume.upgradesPerMin) ? `${fmtInt(b.volume.upgradesPerMin)} / ${fmtInt(b.volume.casesPerMin)}` : DASH }),
-            h('td', { class: 'num', text: fmtInt(b.volume.online) }))))))
-      : h('p', { class: 'muted', text: 'Nothing collected in this range yet.' }),
-    h('p', { class: 'hint', text: 'Return: second line is the 95% range, clustered by player. Site / min: site-wide upgrades / case opens per minute.' })));
+  out.push(h('section', null,
+    h('div', { class: 'sec-head' }, h('h2', { text: 'By weekday and hour' }),
+      toggle(KINDS.map((k) => [k, NAMES[k][0]]), heatKind, (x) => { heatKind = x; store.set('pulse.heat', x); renderDashboard(); })),
+    heatmap({ v, kind: heatKind, width }),
+    h('p', { class: 'hint', text: `Shows ${metric[heatKind] === 'index' ? NAMES[heatKind][2] : 'return per 1'} (switch above the ${NAMES[heatKind][0].toLowerCase()} chart). Patterns need weeks of data to mean much; a single bright cell is usually luck.` })));
+
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by shown chance' })),
+    v.bands.length ? tableOf(['Shown chance', 'Upgrades', 'Players', 'Win rate', 'Shown', 'Win index', 'Return'],
+      v.bands.map((b) => h('tr', null, h('td', { text: b.label }), h('td', { class: 'num', text: fmtInt(b.n) }), h('td', { class: 'num', text: fmtInt(b.players) }),
+        h('td', { class: 'num', text: pct(b.winRate) }), h('td', { class: 'num faint', text: pct(b.shownRate) }), ixCell(b.index), moneyCell(b.money))))
+      : h('p', { class: 'faint', text: 'No upgrades in this range yet.' }),
+    h('p', { class: 'hint', text: 'Win rate against the average shown chance in each band. A band whose index is far from the others is where the shown odds are off the most.' })));
+
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Cases' })),
+    v.cases.length ? tableOf(['Case', 'Opens', 'Players', 'Price', 'Hit rate', 'Normal', 'Hit index', 'Return'],
+      v.cases.map((c) => h('tr', null, h('td', { text: c.slug }), h('td', { class: 'num', text: fmtInt(c.n) }), h('td', { class: 'num', text: fmtInt(c.players) }), h('td', { class: 'num', text: fmtInt(c.price) }),
+        h('td', { class: 'num', text: pct(c.hitRate) }), h('td', { class: 'num faint', text: pct(c.normalRate) }), ixCell(c.index), moneyCell(c.money))))
+      : h('p', { class: 'faint', text: 'No case opens with a known case in this range yet.' }),
+    h('p', { class: 'hint', text: 'Hit: an open worth at least the case price. Normal: the case’s hit rate over the last 7 days. The 60 most opened cases.' })));
+
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'By stake size' })),
+    v.stakes.length ? tableOf(['Kind', 'Stake', 'Rows', 'Players', 'Index', 'Return'],
+      v.stakes.map((x) => h('tr', null, h('td', { text: NAMES[x.kind][0] }), h('td', { class: 'num', text: x.label }), h('td', { class: 'num', text: fmtInt(x.n) }), h('td', { class: 'num', text: fmtInt(x.players) }), ixCell(x.index), moneyCell(x.money))))
+      : h('p', { class: 'faint', text: 'Nothing in this range yet.' })));
+
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Site activity' })), activityChart({ v, width })));
 
   out.push(h('section', null, h('h2', { text: 'How the sample is taken' }),
-    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their latest page of upgrades and case drops is read at once, leaving out the feed wins that found them. Then they are followed for up to 2 hours for new rows, the same for winners and losers. Players still playing now are more likely to be found, so the earlier hours come from people who kept going. Players are stored as a salted hash, never by name.' })));
+    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours for new rows, and checked again every 3 hours while they keep showing up in the feed. Players are stored as a salted hash, never by name.' })));
   root.replaceChildren(...out);
   if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
 }
@@ -394,33 +551,41 @@ async function load() {
     const isViewer = await rpc('monitor_is_viewer', {});
     if (!isViewer) { loading = false; renderNotViewer(); return; }
     const now = Date.now();
-    const spec = rangeSpec(rangeKey, now);
-    const w = compareWindows(now);
-    const one = (win) => ({ from_ms: Math.floor(win.from), to_ms: Math.ceil(win.to), bucket_ms: Math.ceil(win.to) - Math.floor(win.from) });
-    const [recent, base, series, volume, volRecent, volBase, statusRes] = await Promise.all([
-      rpc('monitor_agg', one(w.recent)),
-      rpc('monitor_agg', one(w.base)),
-      rpc('monitor_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket }),
-      rpc('monitor_volume_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket }),
-      rpc('monitor_volume_agg', one(w.recent)),
-      rpc('monitor_volume_agg', one(w.base)),
+    const spec = rangeSpec(rangeKey, now, windowMin);
+    const cs = compareSpec(now);
+    const tz = -new Date().getTimezoneOffset();
+    const one = (from, to) => ({ from_ms: Math.floor(from), to_ms: Math.ceil(to), bucket_ms: Math.ceil(to) - Math.floor(from) });
+    const [report, cmp, volume, volRecent, volBase, statusRes, eventsRes] = await Promise.all([
+      rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
+      rpc('monitor_report', { from_ms: Math.floor(cs.from), to_ms: Math.ceil(cs.to), bucket_ms: cs.bucket, tz_offset_min: tz }),
+      rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
+      rpc('monitor_volume_agg', one(now - HOUR, now + 1)),
+      rpc('monitor_volume_agg', one(now - 4 * HOUR, now - HOUR)),
       sb.from('monitor_status').select('updated_at,status').maybeSingle(),
+      sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
     ]);
     if (statusRes.error) throw statusRes.error;
-    view = buildView({ recent, base, series, volume, volRecent, volBase, spec, now });
+    view = buildReport({ report, cmp, volume, volRecent, volBase, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
-    loading = false;
-    renderDashboard();
+    events = eventsRes.error ? [] : eventsRes.data ?? [];
+    loadError = null;
   } catch (e) {
-    loading = false;
-    renderDashboard();
-    root.insertBefore(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${e.message || e}` }), root.children[1] || null);
+    loadError = e.message || String(e);
   }
+  loading = false;
+  renderDashboard();
 }
 
 function setRange(k) {
   rangeKey = k;
-  try { localStorage.setItem('pulse.range', k); } catch {}
+  store.set('pulse.range', k);
+  windowMin = pickWindow(rangeKey, windowMin);
+  view = null;
+  load();
+}
+function setWindow(m) {
+  windowMin = pickWindow(rangeKey, m);
+  store.set('pulse.window', String(windowMin));
   view = null;
   load();
 }

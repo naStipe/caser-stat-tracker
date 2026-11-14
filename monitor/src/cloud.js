@@ -28,17 +28,53 @@ export function createCloud({ fetch, url, key }) {
     }
   }
 
-  async function insert(table, conflict, list) {
+  async function insert(table, conflict, list, resolution) {
     for (let i = 0; i < list.length; i += BATCH) {
-      await call('POST', `/rest/v1/${table}?on_conflict=${conflict}`, list.slice(i, i + BATCH), 'resolution=ignore-duplicates,return=minimal');
+      await call('POST', `/rest/v1/${table}?on_conflict=${conflict}`, list.slice(i, i + BATCH), `resolution=${resolution},return=minimal`);
     }
   }
 
   return {
-    /** Adds rows and volume samples; ones already there are left as they are. */
+    /**
+     * Adds rows and volume samples. A row read again replaces the stored one (that fills in columns
+     * older versions did not send); a volume sample already there is left as it is.
+     */
     async push(rows, volume) {
-      if (rows.length) await insert('monitor_rows', 'id', rows.map((r) => ({ id: r.id, kind: r.kind, ts: Math.round(r.ts), u: r.u, stake: r.stake, returned: r.returned, chance: r.chance ?? null, back: !!r.back })));
-      if (volume.length) await insert('monitor_volume', 'ts', volume.map((v) => ({ ts: Math.round(v.ts), cases: Math.round(v.cases), upgrades: Math.round(v.upgrades), online: Math.round(v.online) || null })));
+      if (rows.length) {
+        // One request must not hold the same id twice (Postgres refuses to update a row twice).
+        const byId = new Map(rows.map((r) => [r.id, r]));
+        await insert(
+          'monitor_rows',
+          'id',
+          [...byId.values()].map((r) => ({
+            id: r.id,
+            kind: r.kind,
+            ts: Math.round(r.ts),
+            u: r.u,
+            stake: r.stake,
+            returned: r.returned,
+            chance: r.chance ?? null,
+            back: !!r.back,
+            slug: r.slug ?? null,
+            tier: r.tier ?? null,
+            won: typeof r.won === 'boolean' ? r.won : null,
+          })),
+          'merge-duplicates',
+        );
+      }
+      if (volume.length) {
+        const byTs = new Map(volume.map((v) => [Math.round(v.ts), v]));
+        await insert('monitor_volume', 'ts', [...byTs].map(([ts, v]) => ({ ts, cases: Math.round(v.cases), upgrades: Math.round(v.upgrades), online: Math.round(v.online) || null })), 'ignore-duplicates');
+      }
+    },
+    /** Adds events to the log the dashboard shows: [{level, code, message, at?}]. */
+    async events(list) {
+      if (!list.length) return;
+      await call('POST', '/rest/v1/monitor_events', list.map((e) => ({ level: e.level, code: String(e.code).slice(0, 40), message: String(e.message).slice(0, 1000), ...(e.at ? { at: new Date(e.at).toISOString() } : {}) })), 'return=minimal');
+    },
+    /** A setting only the monitor and the database can read (monitor_private), e.g. the alert URL. */
+    async setPrivate(key, value) {
+      await call('POST', '/rest/v1/monitor_private?on_conflict=key', { key, value }, 'resolution=merge-duplicates,return=minimal');
     },
     /** What the dashboard shows about the monitor itself. */
     async status(status) {
@@ -49,6 +85,7 @@ export function createCloud({ fetch, url, key }) {
       const t = Math.floor(before);
       await call('DELETE', `/rest/v1/monitor_rows?ts=lt.${t}`, undefined, 'return=minimal');
       await call('DELETE', `/rest/v1/monitor_volume?ts=lt.${t}`, undefined, 'return=minimal');
+      await call('DELETE', `/rest/v1/monitor_events?at=lt.${encodeURIComponent(new Date(t).toISOString())}`, undefined, 'return=minimal');
     },
   };
 }

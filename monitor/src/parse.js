@@ -1,6 +1,7 @@
 // Turns the site's public history pages into small anonymous rows. Pure: no network, no files.
 // A row is one paid case open or one settled upgrade:
 //   {id, kind: 'upgrade' | 'case', ts, u, stake, returned, chance, back}
+//   upgrades also: won; cases also: slug (the case), tier (the dropped item's rarity code)
 // u is a salted hash of the player's site id; no names, items or inventories are kept.
 // Every field read is defensive because the API can change.
 
@@ -28,11 +29,16 @@ export function numOrNull(v) {
   return n === 0 && !(v === 0 || v === '0' || /^0+(\.0+)?$/.test(String(v))) ? null : n;
 }
 
-/** Any item-like object -> {name, price}. */
+/** Any item-like object -> {name, price, tier}. tier is the site's rarity code, as text. */
 function item(raw) {
   const o = obj(raw) ?? {};
   const inner = obj(o.item) ?? {};
-  return { name: String(o.marketName ?? o.market_name ?? o.name ?? inner.marketName ?? inner.name ?? ''), price: num(o.price ?? inner.price) };
+  const rarity = o.rarity ?? inner.rarity;
+  return {
+    name: String(o.marketName ?? o.market_name ?? o.name ?? inner.marketName ?? inner.name ?? ''),
+    price: num(o.price ?? inner.price),
+    tier: rarity == null || typeof rarity === 'object' ? null : String(rarity).slice(0, 32),
+  };
 }
 
 /** The site multiplies the fair upgrade chance by this before showing it. */
@@ -142,7 +148,7 @@ export function upgradeRows(body, u, { skip, back = false } = {}) {
     const e = parseUpgrade(rec);
     if (!e) continue;
     if (skip?.size && e.won && e.names.some((n) => skip.has(n))) continue;
-    out.push({ id: e.id, kind: 'upgrade', ts: e.ts, u, stake: e.stake, returned: e.returned, chance: e.chance, back });
+    out.push({ id: e.id, kind: 'upgrade', ts: e.ts, u, stake: e.stake, returned: e.returned, chance: e.chance, won: e.won, back });
   }
   return out;
 }
@@ -167,7 +173,7 @@ export function caseRows(body, prices, u, { unknownSlugs, skip, back = false } =
     }
     const drop = item({ ...obj(r.item), price: r.price ?? obj(r.item)?.price });
     if (skip?.size && skip.has(drop.name)) continue;
-    out.push({ id: `case:${r.id}`, kind: 'case', ts, u, stake: price, returned: drop.price, chance: null, back });
+    out.push({ id: `case:${r.id}`, kind: 'case', ts, u, stake: price, returned: drop.price, chance: null, slug, tier: drop.tier, back });
   }
   return out;
 }

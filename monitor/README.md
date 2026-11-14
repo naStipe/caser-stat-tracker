@@ -1,59 +1,115 @@
 # Pulse monitor
 
-Shows whether players on caser.gg get back more or less right now than a few hours ago. Two parts:
+Shows whether players on caser.gg get back more or less right now than at other times. Two parts:
 
-- **The monitor** (`src/`, runs in Docker): samples other players' recent upgrades and case drops and writes
-  them to Supabase.
-- **The dashboard** (`dashboard/`, a static page): reads them back for a signed-in viewer and shows
-  - for upgrades and for cases, return per 1 staked in the last hour against the 3 hours before, with a verdict
-    ("Higher now", "Lower now", "No clear change", "Not enough data yet") from a significance test;
-  - return per 1 over 6 hours to 30 days, per bucket with 95% ranges;
-  - the site's own counters of upgrades and case opens per minute;
-  - a table per bucket, and whether the monitor is running.
+- **The monitor** (`src/`, runs in Docker): samples other players' upgrades and case drops and writes them to
+  Supabase, with an event log and alerts when something goes wrong.
+- **The dashboard** (`dashboard/`, a static page): reads them back for a signed-in viewer.
 
 It is not part of the userscript in the parent folder.
 
+## What the dashboard shows
+
+Two measures, for upgrades and for cases:
+
+- **Index**: observed against expected. For upgrades, wins against the wins the shown chances predict. For cases,
+  "hits" (an open worth at least the case price) against the hits the case's normal rate predicts (its rate over
+  the last 7 days). Each upgrade or open counts once, whatever its size, so this settles quickly. 1 means as
+  expected; above 1 is better for players. Its 95% range is binomial: every upgrade or open is a separate draw.
+- **Return per 1**: total value received per 1 staked. What players actually got, but a single big win moves it a
+  lot, so it needs far more data to show a change. Its 95% range is clustered by player.
+
+Sections:
+
+- the monitor's state and its recent events (problems are listed here too);
+- last hour against the 3 hours before, with a significance test;
+- totals for the range (6 hours to 30 days), including the share of players who ended up in profit;
+- **one chart for upgrades and one for cases, per 10 to 60-minute window** (index or return per 1), with each
+  window's 95% range, a smoothed hourly line, the range average, sample sizes, and the best and worst windows;
+- a weekday × hour heat map (local time);
+- upgrades by shown chance (where the shown odds are off the most), cases one by one, stake sizes;
+- site activity from the site's public counters.
+
 ## How it samples
 
-- `GET /api/live-drops` every 30 s finds active players. The feed shows big wins, so the sample leans towards big
-  spenders.
-- A newly found player's latest page of upgrades and case drops (`/api/game/upgrade/public-history/{id}`,
-  `/api/users/{id}/inventory/history`) is read at once. The feed wins that found them are left out, or every
-  player would start with a big win. Rows older than 24 hours are left out.
-- Then the player is followed for up to 2 hours (one of the two lists about every 90 s), the same for winners and
-  losers, and dropped after 40 minutes without new rows. At most 30 players are followed at once.
-- `GET /api/statistics` every 60 s for the site-wide counters, `GET /api/game/cases` every 6 hours for case prices.
+One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does the most urgent thing that is due:
 
-Return per 1 = total value received / total staked. Its 95% range treats each player's rows as one cluster, since
-one player's rows are not independent. Players are stored only as a salted hash of their site id; no names, items
-or inventories are kept.
+1. `GET /api/game/cases` every 6 hours (case prices), `GET /api/live-drops` every 30 s (finds active players; the
+   feed shows big wins, so the sample leans towards big spenders), `GET /api/statistics` every 60 s.
+2. A newly found player's latest page of upgrades and case drops (`/api/game/upgrade/public-history/{id}`,
+   `/api/users/{id}/inventory/history`). The feed wins that found them are left out, or every player would start
+   with a big win.
+3. Following: one of the two lists of a followed player about every 90 s, for 2 hours after they were found.
+4. When nothing above is due:
+   - **history**: older pages of each new player's lists, back 7 days (`HISTORY_DAYS`), at most 10 pages each
+     (`HISTORY_PAGES`);
+   - **revisits**: players seen in the feed in the last 7 days are checked again every 3 hours (`REVISIT_HOURS`)
+     for new rows.
+
+Pages: the site's own pages ask for 50 rows. The monitor asks for 100 once and keeps that if the site sends more
+than 50, or falls back to 50; the event log says which.
+
+Players are stored in Supabase only as a salted hash of their site id. The real ids of known players stay in the
+monitor's own state file on the server (they are needed for revisits).
 
 ## Account and requests
 
 The profile history endpoints need a signed-in account, so the monitor uses one: set one aside for it that you can
 lose. The site can see that this account reads many profiles, and may limit or ban it.
 
-- One request every 8 seconds by default (`PULSE_GAP_MS`), about 450 an hour.
 - Requests say they come from a script (`User-Agent: pulse-collector/<version> node/<version>`). The monitor
   does not disguise itself or work around blocks.
 - HTTP 429 pauses it for 5 minutes, doubling up to 30.
-- A refused login, HTTP 403 or a challenge page stops the collector, and the dashboard shows why. No more requests
-  go to the site, so the restart policy does not retry in a loop.
+- HTTP 401 (the login is refused) or 403 / a challenge page (blocked) stops the collector. No more requests go to
+  the site, so the restart policy does not retry in a loop.
 
 Login: the site keeps a short-lived access token and a refresh token in the browser's `localStorage`. The monitor
 needs only the refresh token and renews the access token itself (`POST /api/users/auth/refresh`), the way the
 site's web app does. The site may hand out a new refresh token on each renewal; the monitor saves the latest one in
 `data/state.json`, so restarts keep working.
 
+## Problems and alerts
+
+Every problem is written to the event log (`monitor_events`, shown on the dashboard) and, with `ALERT_URL` set,
+sent to your phone or chat:
+
+| What | Level |
+|---|---|
+| the site refuses the login (token expired or revoked): collector stops | error |
+| the site blocks the account or server (403, challenge page): collector stops | error |
+| the site asks to slow down (429) | warning, error once the pause reaches 30 min |
+| 5 failed turns in a row (network, site errors), and when it recovers | warning / note |
+| writing to Supabase fails 5 times in a row (rows wait on the server), and when it recovers | alert only / note |
+| the monitor crashed (it restarts by itself) | error |
+| the monitor was killed without shutting down (out of memory, server restart) | error, on the next start |
+| **no report for 10 minutes** (container gone, server down): from the database watchdog | error, and a note when it is back |
+| still stopped, every 6 hours | reminder |
+
+The same problem is sent at most once per 30 minutes. A stopped collector reports `running: false` and the
+watchdog leaves it alone (it already alerted).
+
+`ALERT_URL` formats:
+
+- **ntfy** (easiest): install the ntfy app, subscribe to a long random topic name, use `https://ntfy.sh/<topic>`.
+  Anyone who knows the topic name can read it, so make it hard to guess.
+- **Discord**: a channel's webhook URL, `https://discord.com/api/webhooks/...`.
+- **Telegram**: `https://api.telegram.org/bot<token>/sendMessage?chat_id=<chat id>`.
+
+When `ALERT_URL` is set or changed, the monitor sends "alerts are set up" once, so you know it works. It also
+saves the URL in Supabase (`monitor_private`, readable only by the secret key and the database) for the
+watchdog, a `pg_cron` job that runs every 5 minutes.
+
 ## Supabase
 
 Tables and functions: `supabase/migrations/*_monitor*.sql` in the parent folder (already applied to the project).
 
-- `monitor_rows`, `monitor_volume`, `monitor_status`: written only by the monitor, with the project's **secret key**
-  (it bypasses row level security, so it stays on the server, in `.env`).
+- `monitor_rows`, `monitor_volume`, `monitor_status`, `monitor_events`: written only by the monitor, with the
+  project's **secret key** (it bypasses row level security, so it stays on the server, in `.env`).
 - `monitor_viewers`: Supabase Auth users allowed to read. Everyone else, signed in or not, reads nothing.
-- `monitor_agg`, `monitor_volume_agg`: sums per time bucket for the dashboard, for viewers only.
-- The monitor deletes rows older than `RETENTION_DAYS` (default 30) once an hour.
+- `monitor_report`, `monitor_volume_agg`: what the dashboard reads, for viewers only.
+- `monitor_private`, `monitor_watchdog`, `monitor_send_alert`: the alert URL and the watchdog; no one else can
+  read or call them.
+- The monitor deletes rows and events older than `RETENTION_DAYS` (default 30) once an hour.
 
 ## Run the monitor
 
@@ -63,38 +119,61 @@ Tables and functions: `supabase/migrations/*_monitor*.sql` in the parent folder 
    browser (or do not open caser.gg there again). Logging out may end the token, and a browser renewing the same
    token may end the monitor's session.
 3. Get the secret key: Supabase dashboard, Project Settings, API Keys, "Secret keys" (`sb_secret_…`).
-4. Copy `.env.example` to `.env` and fill in `CASER_REFRESH_TOKEN` and `SUPABASE_SECRET_KEY`. Never commit `.env`.
+4. Copy `.env.example` to `.env` and fill in `CASER_REFRESH_TOKEN`, `SUPABASE_SECRET_KEY` and `ALERT_URL`. Never
+   commit `.env`.
 5. Start it:
    - Docker: `docker compose up -d --build`, logs with `docker compose logs -f`.
    - Plain Node (20.6+): `node --env-file=.env src/main.js`.
 
-When the refresh token stops working, the log and the dashboard say the collector stopped: put a new token in `.env`
-and run `docker compose up -d`. A changed `CASER_REFRESH_TOKEN` replaces the saved tokens.
+When the refresh token stops working, you get an alert and the dashboard says why: put a new token in `.env` and
+run `docker compose up -d`. A changed `CASER_REFRESH_TOKEN` replaces the saved tokens.
+
+## Update the monitor
+
+On the server, in this folder:
+
+```
+sh update.sh
+```
+
+It pulls the latest code, builds the new image while the old container keeps collecting, then swaps them. The old
+one stops gracefully (it sends its unsent rows and saves its state first), and the new one continues with the same
+login, player hashes and known players. Downtime is a few seconds. Keep settings in `.env` only; changes to tracked
+files on the server make `git pull` refuse.
+
+Database changes for a new version are applied to Supabase before the code is pushed, and are additive, so the
+running monitor keeps working until it is updated.
+
+## Settings
 
 | Variable | Default | |
 |---|---|---|
 | `CASER_REFRESH_TOKEN` | | refresh token of the monitor's account |
 | `SUPABASE_SECRET_KEY` | | the project's secret key |
+| `ALERT_URL` | | ntfy, Discord or Telegram webhook for alerts |
 | `SUPABASE_URL` | the project in `dashboard/config.js` | |
-| `RETENTION_DAYS` | 30 | rows older than this are deleted |
+| `RETENTION_DAYS` | 30 | rows and events older than this are deleted |
+| `HISTORY_DAYS` | 7 | how far back a found player's history is read |
+| `HISTORY_PAGES` | 10 | older pages read per list per player (0: only the latest page) |
+| `REVISIT_HOURS` | 3 | how often known players are checked again |
 | `CASER_BASE` | https://caser.gg | site origin |
 | `PULSE_GAP_MS` | 8000 | pause between requests, at least 2000 |
-| `DATA_DIR` | ./data | state file (tokens, hash salt, rows not yet sent) |
+| `DATA_DIR` | ./data | state file (tokens, hash salt, known players, rows and events not yet sent) |
 | `USER_AGENT` | pulse-collector/… | request User-Agent |
 
 ## The dashboard
 
-`dashboard/` is a static page (HTML and two small modules, plus supabase-js from jsDelivr). Host it anywhere that
-serves static files. `dashboard/config.js` holds the Supabase URL and the publishable key, which are public by
-design: on their own they read nothing.
+`dashboard/` is a static page (HTML and two small modules, plus supabase-js from jsDelivr), hosted on Vercel.
+Redeploy after changes with `vercel deploy --prod` in that folder, or connect the Vercel project to the GitHub repo
+(root directory `monitor/dashboard`) so every push deploys it. `dashboard/config.js` holds the Supabase URL and the
+publishable key, which are public by design: on their own they read nothing.
 
-Give yourself access once:
+Give someone access once:
 
-1. Supabase dashboard, Authentication, Users, "Add user": your email and a password ("Auto Confirm User" on).
+1. Supabase dashboard, Authentication, Users, "Add user": email and password ("Auto Confirm User" on).
 2. Authentication, Sign In / Providers: switch off "Allow new users to sign up", so nobody else can make an account.
-3. Sign in on the dashboard. It shows your user id and the line to run in the SQL editor:
-   `insert into public.monitor_viewers (user_id) values ('<your user id>');`
-4. Reload the page.
+3. They sign in on the dashboard. It shows their user id and the line to run in the SQL editor:
+   `insert into public.monitor_viewers (user_id) values ('<user id>');`
 
 ## Develop
 
@@ -103,5 +182,6 @@ npm test
 ```
 
 Files: `src/parse.js` (history pages to rows), `src/collector.js` (what to read when), `src/site.js` (login token
-and requests), `src/cloud.js` (Supabase writes), `src/main.js` (settings and wiring), `dashboard/stats.js` (return
-per 1, ranges, comparison), `dashboard/view.js` (database answers to what the page shows), `dashboard/index.html`.
+and requests), `src/cloud.js` (Supabase writes), `src/notify.js` (alerts), `src/main.js` (settings, events, crash
+handling), `dashboard/stats.js` (return per 1, index, ranges, comparisons), `dashboard/view.js` (database answers to
+what the page shows), `dashboard/index.html`.

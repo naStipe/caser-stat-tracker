@@ -1,6 +1,6 @@
 {
   "name": "caser-pulse-monitor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Samples players' recent upgrades and case drops on caser.gg and writes them to Supabase for the dashboard page.",
   "type": "module",

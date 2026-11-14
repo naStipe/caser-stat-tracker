@@ -4,11 +4,12 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
-import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildView, monitorHealth, compareWindows } from '../dashboard/view.js';
+import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow } from '../dashboard/view.js';
 import { createCollector, HttpError } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
+import { alertRequest, createNotifier } from '../src/notify.js';
 import { createMonitor } from '../src/main.js';
 
 const T0 = Date.parse('2026-11-14T12:00:00Z');
@@ -40,7 +41,10 @@ test('parse: settled upgrades and paid case drops become anonymous rows', () => 
   const cs = caseRows({ items: [caseRow(5, T0, 'magnum', 7), caseRow(6, T0, 'gone', 3), { id: 7, action: 'sold' }] }, prices(), 'h1', { unknownSlugs: unknown });
   assert.deepEqual(cs.map((r) => [r.id, r.kind, r.stake, r.returned]), [['case:5', 'case', 19, 7]]);
   assert.deepEqual([...unknown], ['gone']);
-  for (const r of [...ups, ...cs]) assert.deepEqual(Object.keys(r).sort(), ['back', 'chance', 'id', 'kind', 'returned', 'stake', 'ts', 'u']);
+  for (const r of ups) assert.deepEqual(Object.keys(r).sort(), ['back', 'chance', 'id', 'kind', 'returned', 'stake', 'ts', 'u', 'won']);
+  for (const r of cs) assert.deepEqual(Object.keys(r).sort(), ['back', 'chance', 'id', 'kind', 'returned', 'slug', 'stake', 'tier', 'ts', 'u']);
+  assert.deepEqual(ups.map((r) => r.won), [true, false]);
+  assert.equal(cs[0].slug, 'magnum');
 });
 
 test('parse: feed wins are skipped by item name, featured upgrades are read once, prices of one case', () => {
@@ -154,7 +158,7 @@ test('collector: a found player is backfilled without the feed win, then followe
   const site = fakeSite();
   site.feed = { liveDrops: [{ user: { id: '42' }, item: { marketName: 'Big Win' } }] };
   const big = { ...upRow(2, T0 - 1000, 100, true, 1000), targetItem: { id: 't', marketName: 'Big Win', price: '1000' } };
-  site.ups[42].push(upRow(0, T0 - 2 * 86400000, 10, true), upRow(1, T0 - 60000, 10, false), big);
+  site.ups[42].push(upRow(0, T0 - 8 * 86400000, 10, true), upRow(1, T0 - 60000, 10, false), big);
   site.inv[42].push(caseRow(10, T0 - 5000, 'magnum', 50));
   const { c, saved, now } = harness(site);
   let added = false;
@@ -162,7 +166,7 @@ test('collector: a found player is backfilled without the feed win, then followe
   const origGet = site.getJson;
   site.getJson = async (path) => {
     if (--budget === 0) c.stop();
-    if (!added && saved.length) {
+    if (!added && saved.some((r) => r.kind === 'case')) {
       added = true;
       site.ups[42].push(upRow(3, now(), 10, false), upRow(4, now(), 10, true));
       site.inv[42].push(caseRow(11, now(), 'magnum', 5));
@@ -172,7 +176,7 @@ test('collector: a found player is backfilled without the feed win, then followe
   await c.start();
   const by = Object.fromEntries(saved.map((r) => [r.id, r]));
   assert.ok(!by['upgrade:2'], 'the feed win is never counted');
-  assert.ok(!by['upgrade:0'], 'rows older than 24 h are not backfilled');
+  assert.ok(!by['upgrade:0'], 'rows older than 7 days are not read');
   assert.equal(by['upgrade:1'].back, true);
   assert.equal(by['case:10'].back, true);
   assert.equal(by['upgrade:3'].back, false);
@@ -226,7 +230,7 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
 /** Fake site behind fetch, with rotating refresh tokens. */
 function fakeWorld(clock) {
   const w = { issued: 0, refreshTokens: new Set(['r0']), access: new Set(), calls: [], htmlNext: false, killAccess: false };
-  w.db = { rows: new Map(), volume: new Map(), status: null, deletes: [], fail: 0 };
+  w.db = { rows: new Map(), volume: new Map(), status: null, events: [], private: {}, deletes: [], fail: 0 };
   w.fetch = async (url, init = {}) => {
     const u = new URL(url);
     if (u.host === 'db.supabase.test') return fakeSupabase(w.db, u, init);
@@ -307,11 +311,22 @@ function fakeSupabase(db, u, init) {
     db.status = body;
     return new Response(null, { status: 201 });
   }
-  assert.match(init.headers.prefer, /ignore-duplicates/);
-  const into = table === 'monitor_rows' ? db.rows : db.volume;
-  for (const r of body) {
-    const k = table === 'monitor_rows' ? r.id : r.ts;
-    if (!into.has(k)) into.set(k, r);
+  if (table === 'monitor_events') {
+    db.events.push(...body);
+    return new Response(null, { status: 201 });
+  }
+  if (table === 'monitor_private') {
+    db.private[body.key] = body.value;
+    return new Response(null, { status: 201 });
+  }
+  if (table === 'monitor_rows') {
+    assert.match(init.headers.prefer, /merge-duplicates/);
+    const ids = body.map((r) => r.id);
+    assert.equal(new Set(ids).size, ids.length, 'no id twice in one request');
+    for (const r of body) db.rows.set(r.id, r);
+  } else {
+    assert.match(init.headers.prefer, /ignore-duplicates/);
+    for (const r of body) if (!db.volume.has(r.ts)) db.volume.set(r.ts, r);
   }
   return new Response(null, { status: 201 });
 }
@@ -359,7 +374,15 @@ test('monitor: sends rows, volume and its status to Supabase, keeps tokens and s
     const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
     assert.equal(state.tokens.refresh, `r${w.issued}`);
     assert.equal(state.pendingRows.length, 0);
-    assert.ok(!JSON.stringify(state).includes('"42"'), 'no player ids in the state');
+    // Real player ids stay in the local state (for revisits) and never reach Supabase.
+    assert.deepEqual(state.collector.known.map((k) => k.id), ['42']);
+    const sent = JSON.stringify({ rows: [...w.db.rows.values()], events: w.db.events, status: w.db.status, private: w.db.private });
+    assert.ok(!sent.includes('"42"') && !sent.includes(':42,') && !sent.includes(':42}'), 'no player ids in Supabase');
+    assert.ok(w.db.events.some((e) => e.code === 'start'), 'the start is logged');
+    assert.equal(w.db.private.alert_url, '', 'no alert URL set');
+    assert.equal(state.alive, true, 'still marked alive until shutdown()');
+    await first.shutdown();
+    assert.equal(JSON.parse(await readFile(join(dir, 'state.json'), 'utf8')).alive, false);
 
     t += 20 * 60000; // the saved access token has run out
     const issued = w.issued;
@@ -404,9 +427,10 @@ test('monitor: a dead refresh token stops the collector before any data request'
     const w = fakeWorld(() => t);
     w.refreshTokens.clear();
     const m = await startMonitor(w, { ...ENV, CASER_REFRESH_TOKEN: 'gone', DATA_DIR: dir }, { now: () => t, advance: (ms) => (t += ms) }, 100);
-    assert.match((await m.run()).error, /signed out/);
+    assert.match((await m.run()).error, /login/);
     assert.deepEqual(w.calls, ['POST /api/users/auth/refresh']);
-    assert.match(w.db.status.status.error, /signed out/, 'the dashboard learns why');
+    assert.match(w.db.status.status.error, /login/, 'the dashboard learns why');
+    assert.ok(w.db.events.some((e) => e.code === 'login' && e.level === 'error'), 'logged as an event');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -444,41 +468,62 @@ test('cloud: batches inserts, sends a legacy JWT key as Authorization too', asyn
 
 // ---- dashboard ----
 
-test('dashboard view: ranges align to buckets, the comparison and buckets come from the database rows', () => {
+test('dashboard view: windows, comparison, heat map and tables from the report', () => {
   const now = T0 + 25 * 60000;
-  const spec = rangeSpec('24h', now);
-  assert.equal(spec.bucket, HOUR);
-  assert.equal(spec.to, T0 + HOUR);
-  assert.equal(spec.from, T0 + HOUR - 24 * HOUR);
+  const spec = rangeSpec('24h', now, 15);
+  const W = 15 * 60000;
+  assert.equal(spec.window, W);
+  assert.equal(spec.to, Math.floor(now / W) * W + W);
+  assert.equal(spec.coarse.bucket, HOUR);
   assert.equal(rangeSpec('nope', now).key, '24h');
-  const agg = (bucket, kind, players, perPlayer, ret) => {
-    const rows = [];
-    for (let p = 0; p < players; p++) for (let i = 0; i < perPlayer; i++) rows.push({ id: `${p}-${i}-${bucket}`, kind, ts: bucket, u: `p${p}`, stake: 10, returned: ret(p, i) });
-    // The database sends big numbers as strings.
-    return aggregate(rows, { from: bucket, to: bucket + 1, bucketMs: 1 }).map((a) => Object.fromEntries(Object.entries(a).map(([k, v]) => [k, typeof v === 'number' ? String(v) : v])));
+  assert.deepEqual(windowsFor('30d'), [60, 120, 360, 1440]);
+  assert.equal(pickWindow('30d', 15), 60);
+  assert.equal(pickWindow('6h', 20), 20);
+  // Shapes as monitor_report sends them (some numbers as strings, empty sums as null).
+  const up = (bucket, w, extra = {}) => ({ bucket, kind: 'upgrade', n: 40, players: 10, up: 4, sx: '400', sy: 380, gxx: 16000, gyy: 15000, gxy: 15000, nw: 40, w, ew: 10, vw: 8, nh: 0, h: null, eh: null, vh: null, ...extra });
+  const report = {
+    series: [up(spec.to - W, 12), up(spec.to - 2 * HOUR, 8)],
+    heat: [{ dow: 4, hour: 13, kind: 'upgrade', n: 40, sx: 400, sy: 380, nw: 40, w: 12, ew: 10, vw: 8, nh: 0, h: null, eh: null, vh: null }],
+    bands: [{ band: 'b', n: 100, players: 9, sx: 1000, sy: 950, w: 25, ew: 20, vw: 16 }],
+    cases: [{ slug: 'magnum', n: 50, players: 7, sx: 950, sy: 900, h: 20, eh: 17.5, vh: 11, price: 19 }],
+    stakes: [{ kind: 'case', sb: 2, n: 50, players: 7, sx: 950, sy: 900, nw: 0, w: null, ew: null, vw: null, nh: 50, h: 20, eh: 17.5, vh: 11 }],
+    totals: [{ kind: 'upgrade', players: 12, up: 5 }],
   };
-  const v = buildView({
-    recent: agg(0, 'upgrade', 20, 10, (p, i) => (i < 4 ? 30 : 2)),
-    base: agg(0, 'upgrade', 20, 10, (p, i) => (i < 2 ? 30 : 2)),
-    series: [...agg(T0, 'upgrade', 6, 5, () => 9), ...agg(T0, 'case', 6, 5, () => 20)],
-    volume: [{ bucket: String(T0), samples: '60', cases_per_min: '9000.5', upgrades_per_min: '6000', online: '2500' }],
-    volRecent: [],
-    volBase: [],
-    spec,
-    now,
-  });
+  const cs = compareSpec(now);
+  const cmp = { series: [0, 1, 2, 3].map((i) => up(cs.from + i * HOUR, i === 3 ? 40 : 25, { nw: 100, ew: 25, vw: 18, n: 100 })) };
+  const v = buildReport({ report, cmp, volume: [{ bucket: String(spec.coarse.to - HOUR), samples: '60', cases_per_min: '9000.5', upgrades_per_min: '6000', online: '2500' }], spec, now });
+  const k = v.kinds.upgrade;
+  assert.equal(k.windows.length, 96);
+  assert.equal(k.windows.at(-1).index.index, 1.2);
+  assert.equal(k.avg.index, 1);
+  assert.equal(k.best[0].start, spec.to - W);
+  assert.equal(k.worst[0].start, spec.to - 2 * HOUR);
+  assert.ok(k.windows.at(-1).smooth != null);
+  assert.equal(k.money.ratio, 0.95);
   assert.equal(v.compare.upgrade.verdict, 'better');
   assert.equal(v.compare.case.verdict, 'few');
-  assert.equal(v.buckets.length, 24);
-  const last = v.buckets.at(-1);
-  assert.equal(last.start, T0);
-  assert.equal(last.upgrade.ratio, 0.9);
-  assert.equal(last.case.ratio, 2);
-  assert.equal(last.volume.casesPerMin, 9000.5);
-  assert.equal(v.buckets[0].volume.casesPerMin, null);
-  assert.equal(v.total.upgrade.n, 30);
-  assert.equal(v.volume.recent.casesPerMin, null);
-  assert.deepEqual(compareWindows(now).base, { from: now - 4 * HOUR, to: now - HOUR });
+  assert.equal(v.heat.upgrade[3][13].index.index, 1.2);
+  assert.equal(v.hours.upgrade[13].index.index, 1.2);
+  assert.equal(v.hours.upgrade[12].index.index, null);
+  assert.equal(v.bands[0].label, '10–30%');
+  assert.equal(v.bands[0].winRate, 0.25);
+  assert.equal(v.cases[0].hitRate, 0.4);
+  assert.equal(v.cases[0].index.index, 20 / 17.5);
+  assert.equal(v.stakes[0].index.index, 20 / 17.5);
+  assert.deepEqual(v.totals.upgrade, { players: 12, up: 5 });
+  assert.equal(v.volume.buckets.length, 24);
+  assert.equal(v.volume.buckets.at(-1).casesPerMin, 9000.5);
+  assert.equal(v.volume.buckets[0].casesPerMin, null);
+});
+
+test('stats: win and hit index with a binomial range, and its comparison', () => {
+  const ix = indexOf({ n: 100, obs: 30, exp: 25, v: 18 });
+  assert.equal(ix.index, 1.2);
+  assert.ok(Math.abs(ix.se - Math.sqrt(18) / 25) < 1e-12);
+  assert.equal(indexOf({ n: 0, obs: 0, exp: 0, v: 0 }).index, null);
+  assert.equal(compareIndex({ n: 100, obs: 40, exp: 25, v: 18 }, { n: 300, obs: 75, exp: 75, v: 55 }).verdict, 'better');
+  assert.equal(compareIndex({ n: 100, obs: 26, exp: 25, v: 18 }, { n: 300, obs: 75, exp: 75, v: 55 }).verdict, 'same');
+  assert.equal(compareIndex({ n: 10, obs: 9, exp: 2, v: 1.6 }, { n: 300, obs: 75, exp: 75, v: 55 }).verdict, 'few');
 });
 
 test('dashboard view: monitor health from its last report', () => {
@@ -490,6 +535,7 @@ test('dashboard view: monitor health from its last report', () => {
   assert.match(monitorHealth({ updated_at: at(60000), status: { running: false, error: 'signed out?' } }, now).text, /signed out/);
   assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true, pausedUntil: now + 60000 } }, now).level, 'warn');
   assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true, cloudError: 'x' } }, now).level, 'warn');
+  assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true, errorStreak: 6, error: 'fetch failed' } }, now).level, 'warn');
 });
 
 test('dashboard page: its script parses', async () => {
@@ -504,6 +550,220 @@ test('dashboard page: its script parses', async () => {
     await writeFile(file, script);
     const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- collector: history, revisits, page size, errors ----
+
+/** A site whose history lists page by limit/offset, newest first, with an optional page size cap. */
+function pagedSite({ upgrades = 0, cases = 0, stepMs = 30 * 60000, cap = Infinity, refuseOver = Infinity } = {}) {
+  const site = { calls: [], ups: [], inv: [], feed: { liveDrops: [{ user: { id: '7' }, item: { marketName: 'W' } }] }, fail: null };
+  for (let i = 0; i < upgrades; i++) site.ups.push(upRow(i, T0 - i * stepMs, 10, i % 4 === 0));
+  for (let i = 0; i < cases; i++) site.inv.push(caseRow(1000 + i, T0 - i * stepMs, 'magnum', 9));
+  site.getJson = async (path) => {
+    site.calls.push(path);
+    if (site.fail) throw site.fail;
+    const [p, q] = path.split('?');
+    const qs = new URLSearchParams(q ?? '');
+    const limit = Number(qs.get('limit'));
+    if (limit > refuseOver) throw new HttpError(400, p);
+    const off = Number(qs.get('offset'));
+    const page = (list) => ({ items: list.slice(off, off + Math.min(limit, cap)) });
+    if (p === '/api/game/cases') return { cases: [{ id: '1', slug: 'magnum', price: '19' }] };
+    if (p === '/api/live-drops') return site.feed;
+    if (p === '/api/statistics') return { cases_opened: 1, upgrader_count: 1, online: 1 };
+    if (p.startsWith('/api/game/upgrade/public-history/')) return page(site.ups);
+    if (p.startsWith('/api/users/')) return page(site.inv);
+    throw new HttpError(404, p);
+  };
+  return site;
+}
+
+function run(site, { budget, options = {}, initial } = {}) {
+  let t = T0;
+  const saved = [];
+  const events = [];
+  let left = budget;
+  const c = createCollector({
+    getJson: async (p) => {
+      if (--left === 0) c.stop();
+      return site.getJson(p);
+    },
+    hashUser: async (id) => `h${id}`,
+    saveRows: async (rows) => saved.push(...rows),
+    saveVolume: async () => {},
+    onEvent: (e) => events.push(e),
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    initial,
+    options: { gapMs: 1000, ...options },
+  });
+  return { c, saved, events, done: c.start() };
+}
+
+test('collector: reads a found player history back 7 days with larger pages when the site allows them', async () => {
+  // 600 upgrades every 30 min = 12.5 days; 7 days = 337 rows.
+  const site = pagedSite({ upgrades: 600, cases: 3 });
+  const { c, saved, events, done } = run(site, { budget: 40 });
+  await done;
+  const ups = saved.filter((r) => r.kind === 'upgrade');
+  assert.ok(site.calls.some((p) => p.includes('limit=100')), 'asked for 100 rows');
+  assert.ok(events.some((e) => e.code === 'page-size' && /100/.test(e.message)));
+  assert.equal(c.status().pageSize, 100);
+  assert.ok(ups.length >= 330 && ups.length <= 337, `about 7 days of rows (${ups.length})`);
+  assert.ok(ups.every((r) => r.ts >= T0 - 7 * 24 * 3600e3));
+  assert.equal(new Set(ups.map((r) => r.id)).size, ups.length, 'no row twice');
+  const offsets = site.calls.filter((p) => p.includes('public-history')).map((p) => Number(new URLSearchParams(p.split('?')[1]).get('offset')));
+  assert.deepEqual(offsets.slice(0, 4), [0, 100, 200, 300], 'pages follow each other');
+  assert.deepEqual(c.exportState().known.map((k) => k.id), ['7']);
+  assert.equal(c.exportState().pageProbe, 'ok');
+});
+
+test('collector: falls back to 50-row pages when the site caps or refuses larger ones', async () => {
+  for (const [opts, probe] of [[{ cap: 50 }, 'capped'], [{ refuseOver: 50 }, 'refused']]) {
+    const site = pagedSite({ upgrades: 200, ...opts });
+    const { c, done } = run(site, { budget: 12 });
+    await done;
+    assert.equal(c.status().pageSize, 50, probe);
+    assert.equal(c.exportState().pageProbe, probe);
+    const later = site.calls.filter((p) => p.includes('public-history')).slice(-1)[0];
+    assert.match(later, /limit=50/);
+  }
+  // The decision is kept across restarts.
+  const site = pagedSite({ upgrades: 10 });
+  const { c, done } = run(site, { budget: 6, initial: { pageProbe: 'capped', pageSize: 50 } });
+  await done;
+  assert.ok(site.calls.filter((p) => p.includes('limit=')).every((p) => p.includes('limit=50')));
+  assert.equal(c.status().pageSize, 50);
+});
+
+test('collector: revisits a known player after the revisit time, only for rows newer than the last seen', async () => {
+  const site = pagedSite({ upgrades: 5 });
+  site.feed = { liveDrops: [] };
+  const initial = { known: [{ id: '7', seen: T0, revisited: T0 - 4 * 3600e3, newest: { upgrade: T0 - 2 * 30 * 60000, case: 0 }, deep: true }] };
+  const { c, saved, done } = run(site, { budget: 6, initial });
+  await done;
+  // Rows 0 and 1 are newer than the last seen (row 2's time); nothing older comes back.
+  assert.deepEqual(saved.filter((r) => r.kind === 'upgrade').map((r) => r.id).sort(), ['upgrade:0', 'upgrade:1']);
+  assert.ok(c.exportState().known[0].revisited >= T0, 'marked as revisited');
+});
+
+test('collector: a run of failed turns is reported once, and so is the recovery', async () => {
+  const site = pagedSite({ upgrades: 1 });
+  site.fail = new Error('fetch failed');
+  let calls = 0;
+  const orig = site.getJson;
+  site.getJson = async (p) => {
+    if (++calls === 7) site.fail = null;
+    return orig(p);
+  };
+  const { c, events, done } = run(site, { budget: 10, options: { errorStreak: 5 } });
+  await done;
+  const codes = events.map((e) => e.code);
+  assert.equal(codes.filter((x) => x === 'errors').length, 1);
+  assert.ok(codes.includes('recovered'));
+  assert.equal(c.status().errorStreak, 0);
+});
+
+test('collector: HTTP 403 stops with a block reason', async () => {
+  const site = pagedSite({ upgrades: 1 });
+  site.fail = new HttpError(403, '/api/game/cases');
+  const { c, events, done } = run(site, { budget: 50 });
+  await done;
+  assert.equal(c.status().stopReason, 'blocked');
+  assert.equal(events.at(-1).code, 'blocked');
+  assert.equal(site.calls.length, 1, 'nothing after the block');
+});
+
+// ---- alerts ----
+
+test('alerts: request format per service', () => {
+  const d = alertRequest('https://discord.com/api/webhooks/1/abc', 'T', 'M');
+  assert.deepEqual(d, { url: 'https://discord.com/api/webhooks/1/abc', body: { content: 'T\nM' } });
+  const t = alertRequest('https://api.telegram.org/bot123:XYZ/sendMessage?chat_id=-100', 'T', 'M');
+  assert.deepEqual(t, { url: 'https://api.telegram.org/bot123:XYZ/sendMessage', body: { chat_id: '-100', text: 'T\nM' } });
+  const n = alertRequest('https://ntfy.sh/my-topic', 'T', 'M');
+  assert.deepEqual(n, { url: 'https://ntfy.sh/', body: { topic: 'my-topic', title: 'T', message: 'M', priority: 4 } });
+  const o = alertRequest('https://example.test/hook', 'T', 'M');
+  assert.deepEqual(o.body, { title: 'T', text: 'M' });
+});
+
+test('alerts: the same problem is sent at most once per quiet time, unless forced; failures do not throw', async () => {
+  let t = T0;
+  const sent = [];
+  const okFetch = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return new Response(null, { status: 204 });
+  };
+  const n = createNotifier({ fetch: okFetch, url: 'https://ntfy.sh/x', now: () => t, log: () => {} });
+  assert.equal(await n.send('paused', 'T', 'a'), true);
+  assert.equal(await n.send('paused', 'T', 'b'), false);
+  assert.equal(await n.send('login', 'T', 'c'), true);
+  assert.equal(await n.send('paused', 'T', 'd', { force: true }), true);
+  t += 31 * 60000;
+  assert.equal(await n.send('paused', 'T', 'e'), true);
+  assert.deepEqual(sent.map((b) => b.message), ['a', 'c', 'd', 'e']);
+  const offline = async () => {
+    throw new Error('offline');
+  };
+  assert.equal(await createNotifier({ fetch: offline, url: 'https://ntfy.sh/x', log: () => {} }).send('x', 'T', 'M'), false);
+  assert.equal(await createNotifier({ fetch: offline, url: null }).send('x', 'T', 'M'), false);
+});
+
+test('monitor: alerts on a stop, confirms alert setup once, and reports a restart after a hard kill', async () => {
+  const dir = await tmp();
+  try {
+    let t = T0;
+    const clock = { now: () => t, advance: (ms) => (t += ms) };
+    const w = fakeWorld(() => t);
+    const alerts = [];
+    const env = { ...ENV, DATA_DIR: dir, ALERT_URL: 'https://ntfy.sh/pulse-test' };
+    let m;
+    const make = async (budget) => {
+      let left = budget;
+      m = await createMonitor({
+        env,
+        fetch: async (url, init) => {
+          if (String(url).startsWith('https://ntfy.sh/')) {
+            alerts.push(JSON.parse(init.body));
+            return new Response(null, { status: 200 });
+          }
+          if (!String(url).includes('supabase.test') && --left === 0) m.stop();
+          return w.fetch(url, init);
+        },
+        version: 'test',
+        log: () => {},
+        now: clock.now,
+        sleep: async (ms) => clock.advance(ms),
+      });
+      return m;
+    };
+    await (await make(6)).run();
+    assert.equal(w.db.private.alert_url, 'https://ntfy.sh/pulse-test', 'the watchdog gets the URL');
+    assert.equal(alerts.filter((a) => /set up/.test(a.title)).length, 1, 'setup message once');
+    // No shutdown(): like a killed container. The next start says so, and setup is not sent again.
+    await (await make(6)).run();
+    assert.ok(alerts.some((a) => /without shutting down/.test(a.message)));
+    assert.equal(alerts.filter((a) => /set up/.test(a.title)).length, 1);
+    await m.shutdown();
+    // The login dies: an error event and an alert.
+    w.refreshTokens.clear();
+    w.access.clear();
+    t += 20 * 60000;
+    await make(50);
+    assert.match((await m.run()).error, /login/);
+    assert.ok(alerts.some((a) => /refused the account/.test(a.message)));
+    assert.ok(w.db.events.some((e) => e.code === 'login'));
+    // A crash is remembered and logged on the next start.
+    await m.shutdown({ crash: 'TypeError: boom' });
+    w.refreshTokens.add('again');
+    env.CASER_REFRESH_TOKEN = 'again';
+    await (await make(4)).run();
+    assert.ok(w.db.events.some((e) => e.code === 'restarted' && /boom/.test(e.message)));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

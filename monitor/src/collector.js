@@ -1,38 +1,54 @@
 // Collector: samples other players' public history to measure how profitable play on the site is
 // right now. Signed in to the account the user set aside for it (see site.js).
 //
-// One request at a time, at least `gapMs` apart (default 8 s, about 450 requests an hour):
-//   GET /api/live-drops          every 30 s   finds active players (it shows their big wins)
-//   GET /api/statistics          every 60 s   site-wide counters of case opens and upgrades
-//   GET /api/game/cases          once (and every 6 h) case prices
-//   GET /api/game/upgrade/public-history/{id}, GET /api/users/{id}/inventory/history
-//     backfill: a newly found player's latest page of each (their recent upgrades and case drops),
-//     then follow: one of the two per followed player at most every 90 s, for new rows only.
-// HTTP 429 pauses everything for 5 minutes, doubling up to 30. HTTP 401/403 stops the collector.
+// One request at a time, at least `gapMs` apart (default 8 s, about 450 requests an hour). Each turn
+// does the most urgent thing that is due:
+//   1. GET /api/game/cases        every 6 h      case prices
+//   2. GET /api/live-drops        every 30 s     finds active players (it shows their big wins)
+//   3. GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
+//   4. first look at a found player: the latest page of their upgrades and case drops
+//   5. follow: one of the two lists of a followed player at most every 90 s, for new rows
+//   6. when nothing above is due, alternately:
+//      - history: older pages of a player's lists, back to `historyMs` (7 days), at most `deepPages` each
+//      - revisit: a known player who is no longer followed, every `revisitMs` (3 h), for new rows
+// HTTP 429 pauses everything for 5 minutes, doubling up to 30. HTTP 401 (login refused) and 403 (blocked)
+// stop the collector. Other errors are retried; a run of them is reported.
 //
 // Selection bias: players are found because the feed showed one of their big wins. Those wins
-// (the items the feed showed for that player) are left out of the backfill, or every sampled player
-// would start with a big win. What remains of their recent history is counted and marked `back`.
-// A player is followed for a fixed time after being found, the same for winners and losers.
+// (the items the feed showed for that player) are left out of their history, or every sampled player
+// would start with a big win. History rows are marked `back`. A player is followed for a fixed time
+// after being found, the same for winners and losers.
+//
+// Page size: the site's own pages ask for 50 rows. The collector asks for `tryPageSize` (100) once and
+// keeps it if the site sends more than 50 rows, or falls back to 50.
 
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample } from './parse.js';
+
+const HOUR = 60 * 60 * 1000;
 
 export const DEFAULTS = {
   gapMs: 8000,
   feedEveryMs: 30_000,
   statsEveryMs: 60_000,
-  casesEveryMs: 6 * 60 * 60 * 1000,
-  profileEveryMs: 90 * 1000, // one stream per turn, so each stream about every 3 min
-  watchMs: 2 * 60 * 60 * 1000, // follow time after a player is found; no second backfill within it
+  casesEveryMs: 6 * HOUR,
+  profileEveryMs: 90 * 1000, // one list per turn, so each list about every 3 min
+  watchMs: 2 * HOUR, // follow time after a player is found
   idleDropMs: 40 * 60 * 1000, // stop following a player with no new rows for this long
-  backfillMs: 24 * 60 * 60 * 1000, // backfill keeps rows this recent
+  historyMs: 7 * 24 * HOUR, // history rows kept back to this age
+  deepPages: 10, // older pages read per list per player, after the first
+  maxDeepJobs: 300,
+  revisitMs: 3 * HOUR,
+  knownMax: 3000, // players remembered for revisits
+  knownKeepMs: 7 * 24 * HOUR, // forget players not seen in the feed for this long
   maxPlayers: 30, // followed at once
-  maxQueue: 40, // found players waiting for their backfill (oldest dropped first)
-  backfillsPerFollow: 2, // when both are waiting: this many backfills, then one follow poll
+  maxQueue: 40, // found players waiting for their first look (oldest dropped first)
+  backfillsPerFollow: 2,
   pageSize: 50,
-  maxPages: 3, // per stream per follow poll, only when every row on a page is new
+  tryPageSize: 100,
+  maxPages: 3, // per list per follow or revisit, only while every row on a page is new
   backoffMs: 5 * 60 * 1000,
   maxBackoffMs: 30 * 60 * 1000,
+  errorStreak: 5, // this many failed turns in a row are reported
 };
 
 export class HttpError extends Error {
@@ -42,7 +58,8 @@ export class HttpError extends Error {
   }
 }
 
-const fatal = (e) => e instanceof HttpError && (e.status === 429 || e.status === 401 || e.status === 403);
+const isHttp = (e, ...codes) => e instanceof HttpError && codes.includes(e.status);
+const STREAMS = ['upgrade', 'case'];
 
 /**
  * @param {Object} o
@@ -52,15 +69,33 @@ const fatal = (e) => e instanceof HttpError && (e.status === 429 || e.status ===
  * @param {(sample: any) => Promise<void>} o.saveVolume
  * @param {() => number} [o.now]
  * @param {(ms: number) => Promise<void>} [o.sleep]
- * @param {() => void} [o.onChange]  status changed (for the panel)
+ * @param {() => void} [o.onChange]  status changed
+ * @param {(e: {level: 'info'|'warn'|'error', code: string, message: string}) => void} [o.onEvent]
+ * @param {{known?: any[], pageSize?: number, pageProbe?: string}} [o.initial]  from exportState() of an earlier run
  * @param {Partial<typeof DEFAULTS>} [o.options]
  */
-export function createCollector({ getJson, hashUser, saveRows, saveVolume, now = Date.now, sleep, onChange, options = {} }) {
+export function createCollector({ getJson, hashUser, saveRows, saveVolume, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
   const prices = new CasePrices();
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
-  const queue = []; // found, waiting for backfill: {id, skip: Set<item name>}
-  const backfilled = new Map(); // site id -> when its backfill ran
+  const queue = []; // found, waiting for their first look: {id, skip: Set<item name>}
+  const backfilled = new Map(); // site id -> when their first look ran
+  const deep = []; // older history pages to read: {id, u, stream, offset, pages, skip}
+  // Players seen in the feed: site id -> {seen, revisited, newest: {upgrade, case}, deep: bool}
+  const known = new Map((initial.known ?? []).filter((k) => k && k.id).map((k) => [String(k.id), { seen: k.seen ?? 0, revisited: k.revisited ?? 0, newest: { upgrade: k.newest?.upgrade ?? 0, case: k.newest?.case ?? 0 }, deep: !!k.deep }]));
+  // 'unknown' until a page shows what the site allows; then 'ok' (larger pages work), 'capped' or 'refused'.
+  let pageSize = opt.tryPageSize;
+  let pageProbe = 'unknown';
+  if (opt.tryPageSize <= opt.pageSize) {
+    pageSize = opt.pageSize;
+    pageProbe = 'off';
+  } else if (initial.pageProbe === 'ok') {
+    pageSize = initial.pageSize > opt.pageSize ? initial.pageSize : opt.tryPageSize;
+    pageProbe = 'ok';
+  } else if (initial.pageProbe === 'capped' || initial.pageProbe === 'refused') {
+    pageSize = opt.pageSize;
+    pageProbe = initial.pageProbe;
+  }
   const triedSlugs = new Set();
   let running = false;
   let wake = null;
@@ -70,7 +105,10 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   let pausedUntil = 0;
   let backoff = opt.backoffMs;
   let backfillRun = 0;
+  let idleTurn = 0;
   let error = null;
+  let stopReason = null;
+  let errorStreak = 0;
   const requests = []; // timestamps, last hour
   const counted = []; // [ts, n, back] rows saved, last hour
   const doSleep =
@@ -89,6 +127,11 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       onChange?.();
     } catch {}
   };
+  const event = (level, code, message) => {
+    try {
+      onEvent?.({ level, code, message });
+    } catch {}
+  };
 
   async function get(path) {
     requests.push(now());
@@ -97,16 +140,35 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
 
   function trim() {
     const t = now();
-    const cut = t - 60 * 60 * 1000;
+    const cut = t - HOUR;
     while (requests.length && requests[0] < cut) requests.shift();
     while (counted.length && counted[0][0] < cut) counted.shift();
     for (const [id, p] of players) if (t - p.added > opt.watchMs || t - p.lastRow > opt.idleDropMs) players.delete(id);
     for (const [id, at] of backfilled) if (t - at > opt.watchMs) backfilled.delete(id);
+    for (const [id, k] of known) if (t - k.seen > opt.knownKeepMs) known.delete(id);
+    if (known.size > opt.knownMax) {
+      const oldest = [...known].sort((a, b) => a[1].seen - b[1].seen).slice(0, known.size - opt.knownMax);
+      for (const [id] of oldest) known.delete(id);
+    }
+  }
+
+  function remember(id) {
+    let k = known.get(id);
+    if (!k) known.set(id, (k = { seen: now(), revisited: now(), newest: { upgrade: 0, case: 0 }, deep: false }));
+    k.seen = now();
+    return k;
+  }
+
+  function noteNewest(id, stream, rows) {
+    const k = known.get(id);
+    if (!k) return;
+    for (const r of rows) if (r.ts > k.newest[stream]) k.newest[stream] = r.ts;
   }
 
   async function readFeed() {
     lastFeed = now();
     for (const [id, skip] of feedDrops(await get('/api/live-drops'))) {
+      remember(id);
       if (players.has(id) || backfilled.has(id)) continue;
       const waiting = queue.find((q) => q.id === id);
       if (waiting) {
@@ -137,48 +199,121 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       try {
         prices.learnOne(await get(`/api/game/cases/${encodeURIComponent(slug)}`));
       } catch (e) {
-        if (fatal(e)) throw e;
+        if (isHttp(e, 429, 401, 403)) throw e;
       }
     }
-    return missing.length > 0;
   }
 
-  /** One page of one stream -> {parse(extra) -> rows, pageLen}. Learns missing case prices first. */
-  async function readPage(id, u, stream, page) {
+  function settlePageSize(size, probe) {
+    pageSize = size;
+    pageProbe = probe;
+    event('info', 'page-size', probe === 'ok' ? `The site sends up to ${size} rows per page; using ${size}.` : `The site sends at most ${opt.pageSize} rows per page; using ${opt.pageSize}.`);
+  }
+
+  /** One page of one list -> {parse(extra) -> rows, len, full}. Learns missing case prices first. */
+  async function readPage(id, u, stream, offset) {
     const enc = encodeURIComponent(id);
     const base = stream === 'upgrade' ? `/api/game/upgrade/public-history/${enc}` : `/api/users/${enc}/inventory/history`;
-    const body = await get(`${base}?limit=${opt.pageSize}&offset=${page * opt.pageSize}`);
-    const pageLen = Array.isArray(body?.items) ? body.items.length : 0;
-    if (stream === 'upgrade') return { parse: (extra) => upgradeRows(body, u, extra), pageLen };
+    const size = pageSize;
+    let body;
+    try {
+      body = await get(`${base}?limit=${size}&offset=${offset}`);
+    } catch (e) {
+      if (isHttp(e, 400, 422) && size > opt.pageSize) {
+        settlePageSize(opt.pageSize, 'refused');
+        return readPage(id, u, stream, offset);
+      }
+      throw e;
+    }
+    const len = Array.isArray(body?.items) ? body.items.length : 0;
+    if (pageProbe === 'unknown' && size > opt.pageSize) {
+      if (len > opt.pageSize) settlePageSize(size, 'ok');
+      else if (len === opt.pageSize) settlePageSize(opt.pageSize, 'capped');
+    }
+    const full = len >= pageSize && len > 0;
+    if (stream === 'upgrade') return { parse: (extra) => upgradeRows(body, u, extra), len, full };
     const unknownSlugs = new Set();
     caseRows(body, prices, u, { unknownSlugs });
     if (unknownSlugs.size) await learnCases(unknownSlugs);
-    return { parse: (extra) => caseRows(body, prices, u, extra), pageLen };
+    return { parse: (extra) => caseRows(body, prices, u, extra), len, full };
   }
 
   function record(rows, back) {
     if (rows.length) counted.push([now(), rows.length, back]);
   }
 
-  /** A found player's recent history, minus the feed wins that found them. Then follow them if there is room. */
+  async function save(rows, back) {
+    if (!rows.length) return;
+    record(rows, back);
+    await saveRows(rows);
+  }
+
+  /** A found player's latest page of each list, minus the feed wins that found them. Then follow them if there is room. */
   async function backfill({ id, skip }) {
     const u = await hashUser(id);
+    const k = remember(id);
     const seen = { upgrade: new Set(), case: new Set() };
-    const cut = now() - opt.backfillMs;
-    const keep = [];
-    for (const stream of ['upgrade', 'case']) {
-      const { parse } = await readPage(id, u, stream, 0);
+    const cut = now() - opt.historyMs;
+    for (const stream of STREAMS) {
+      const { parse, len, full } = await readPage(id, u, stream, 0);
       // Every row on the page is "seen", skipped ones too, so following never counts them later.
-      for (const r of parse({})) seen[stream].add(r.id);
-      keep.push(...parse({ skip, back: true }).filter((r) => r.ts >= cut));
+      const all = parse({});
+      for (const r of all) seen[stream].add(r.id);
+      noteNewest(id, stream, all);
+      const keep = parse({ skip, back: true }).filter((r) => r.ts >= cut);
+      await save(keep, true);
+      // Older pages later, when nothing else is due; only once per player.
+      const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
+      if (!k.deep && full && oldest >= cut && opt.deepPages > 0) {
+        deep.push({ id, u, stream, offset: len, pages: 0, skip });
+        if (deep.length > opt.maxDeepJobs) deep.shift();
+      }
       if (stream === 'upgrade') await doSleep(opt.gapMs);
     }
+    k.deep = true;
     backfilled.set(id, now());
-    if (keep.length) {
-      record(keep, true);
-      await saveRows(keep);
-    }
     if (players.size < opt.maxPlayers) players.set(id, { u, added: now(), lastPolled: now(), lastRow: now(), seen, nextStream: 'upgrade' });
+  }
+
+  /** One older page of a player's list. */
+  async function readDeep() {
+    const job = deep.shift();
+    const cut = now() - opt.historyMs;
+    const { parse, len, full } = await readPage(job.id, job.u, job.stream, job.offset);
+    const all = parse({});
+    await save(parse({ skip: job.skip, back: true }).filter((r) => r.ts >= cut), true);
+    const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
+    if (full && oldest >= cut && job.pages + 1 < opt.deepPages) deep.push({ ...job, offset: job.offset + len, pages: job.pages + 1 });
+  }
+
+  /** New rows of a known player who is not followed any more. */
+  async function revisit() {
+    const t = now();
+    let pick = null;
+    for (const [id, k] of known) {
+      if (players.has(id) || backfilled.has(id) || queue.some((q) => q.id === id)) continue;
+      if (t - k.revisited < opt.revisitMs) continue;
+      if (!pick || k.revisited < pick[1].revisited) pick = [id, k];
+    }
+    if (!pick) return false;
+    const [id, k] = pick;
+    k.revisited = t;
+    const u = await hashUser(id);
+    for (const stream of STREAMS) {
+      const since = k.newest[stream] || t - opt.historyMs;
+      for (let page = 0, offset = 0; page < opt.maxPages; page++) {
+        const { parse, len, full } = await readPage(id, u, stream, offset);
+        const rows = parse({ back: true });
+        noteNewest(id, stream, rows);
+        const fresh = rows.filter((r) => r.ts > since);
+        await save(fresh, true);
+        if (fresh.length < rows.length || !full) break;
+        offset += len;
+        await doSleep(opt.gapMs);
+      }
+      if (stream === 'upgrade') await doSleep(opt.gapMs);
+    }
+    return true;
   }
 
   async function follow() {
@@ -193,23 +328,33 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     const stream = p.nextStream;
     const seen = p.seen[stream];
     const fresh = [];
-    for (let page = 0; page < opt.maxPages; page++) {
-      const { parse, pageLen } = await readPage(id, p.u, stream, page);
+    for (let page = 0, offset = 0; page < opt.maxPages; page++) {
+      const { parse, len, full } = await readPage(id, p.u, stream, offset);
       const rows = parse({});
       const news = rows.filter((r) => !seen.has(r.id));
       for (const r of rows) seen.add(r.id);
+      noteNewest(id, stream, rows);
       fresh.push(...news);
       // Keep reading only while the whole page is new (more than a page since the last read).
-      if (news.length < rows.length || pageLen < opt.pageSize) break;
+      if (news.length < rows.length || !full) break;
+      offset += len;
     }
     p.nextStream = stream === 'upgrade' ? 'case' : 'upgrade';
     p.lastPolled = now();
     if (fresh.length) {
       p.lastRow = now();
-      record(fresh, false);
-      await saveRows(fresh);
+      await save(fresh, false);
     }
     return true;
+  }
+
+  async function idle() {
+    // Alternate between older history and revisits, so neither starves the other.
+    const order = idleTurn++ % 2 === 0 ? ['deep', 'revisit'] : ['revisit', 'deep'];
+    for (const what of order) {
+      if (what === 'deep' && deep.length) return readDeep();
+      if (what === 'revisit' && (await revisit())) return;
+    }
   }
 
   async function step() {
@@ -224,6 +369,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     backfillRun = 0;
     if (await follow()) return;
     if (queue.length) return backfill(queue.shift());
+    return idle();
   }
 
   async function loop() {
@@ -234,20 +380,36 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         await doSleep(Math.min(pausedUntil - t, 60_000));
         continue;
       }
+      const before = requests.length;
       try {
         await step();
-        backoff = opt.backoffMs;
-        error = null;
+        // A turn with nothing to do proves nothing: only a turn that made a request ends a run of errors.
+        if (requests.length > before) {
+          backoff = opt.backoffMs;
+          if (errorStreak >= opt.errorStreak) event('info', 'recovered', `Requests work again after ${errorStreak} failed turns in a row.`);
+          errorStreak = 0;
+          error = null;
+        }
       } catch (e) {
-        if (e instanceof HttpError && e.status === 429) {
+        if (isHttp(e, 429)) {
           pausedUntil = now() + backoff;
           error = `The site asked to slow down (HTTP 429). Paused for ${Math.round(backoff / 60000)} min.`;
+          event(backoff >= opt.maxBackoffMs ? 'error' : 'warn', 'paused', error);
           backoff = Math.min(backoff * 2, opt.maxBackoffMs);
-        } else if (e instanceof HttpError && (e.status === 401 || e.status === 403)) {
-          error = 'The site refused the request (signed out?). Collector stopped.';
+        } else if (isHttp(e, 401)) {
+          error = 'The site refused the account’s login (HTTP 401): the refresh token expired or was revoked. Collector stopped. Put a new CASER_REFRESH_TOKEN in .env and restart.';
+          stopReason = 'login';
           running = false;
+          event('error', 'login', error);
+        } else if (isHttp(e, 403)) {
+          error = 'The site refused the request (HTTP 403 or a challenge page): the account or this server may be blocked. Collector stopped. Do not work around it.';
+          stopReason = 'blocked';
+          running = false;
+          event('error', 'blocked', error);
         } else {
+          errorStreak++;
           error = String(e?.message ?? e);
+          if (errorStreak === opt.errorStreak) event('warn', 'errors', `${errorStreak} failed turns in a row. Last error: ${error}`);
         }
       }
       changed();
@@ -262,6 +424,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       if (running) return loopPromise;
       running = true;
       error = null;
+      stopReason = null;
       loopPromise = loop();
       changed();
       return loopPromise;
@@ -272,17 +435,30 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       changed();
       return loopPromise;
     },
+    /** What a restart should carry over (see `initial`). Holds real site ids: keep it local. */
+    exportState() {
+      return {
+        known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, deep: k.deep })),
+        pageSize,
+        pageProbe,
+      };
+    },
     status() {
       trim();
       return {
         running,
+        stopReason,
         players: players.size,
         queued: queue.length,
-        recentPlayers: backfilled.size, // players whose history was read in the last watchMs
+        known: known.size,
+        historyPages: deep.length,
+        recentPlayers: backfilled.size, // players first looked at in the last watchMs
         requestsLastHour: requests.length,
         rowsLastHour: counted.reduce((s, [, n]) => s + n, 0),
         backRowsLastHour: counted.reduce((s, [, n, b]) => s + (b ? n : 0), 0),
         pausedUntil: pausedUntil > now() ? pausedUntil : null,
+        errorStreak,
+        pageSize,
         error,
       };
     },

@@ -174,3 +174,36 @@ export function pulseSummary(aggs, samples, now) {
     volume: { recent: volumeRates(samples, w.recent), base: volumeRates(samples, w.base) },
   };
 }
+
+/**
+ * Observed against expected count, for upgrade wins (expected from the shown chances) and case hits
+ * (expected from each case's normal hit rate). Each upgrade or open is a separate draw with a known
+ * probability, so the count's variance is the sum of p(1 - p) and no clustering is needed.
+ * 1 = as expected, above 1 = better for players.
+ * @param {{n?: number, obs: number, exp: number, v: number}} a
+ */
+export function indexOf({ n = 0, obs, exp, v }) {
+  if (!(exp > 0)) return { n, obs: obs || 0, exp: exp || 0, index: null, se: null, ci: null };
+  const index = obs / exp;
+  const se = v > 0 ? Math.sqrt(v) / exp : null;
+  return { n, obs, exp, index, se, ci: se == null ? null : [Math.max(0, index - Z95 * se), index + Z95 * se] };
+}
+
+/** z of an index against a reference level (e.g. the range's average), or null. */
+export function indexZ(ix, ref) {
+  return ix?.se > 0 && ix.index != null && ref != null ? (ix.index - ref) / ix.se : null;
+}
+
+/** Two windows of an index compared: same verdicts as compareRatios. */
+export function compareIndex(recent, base, { minExp = 5, minN = 30 } = {}) {
+  const r = indexOf(recent);
+  const b = indexOf(base);
+  if (r.n < minN || b.n < minN || !(r.exp >= minExp) || !(b.exp >= minExp) || r.se == null || b.se == null) {
+    return { recent: r, base: b, diff: r.index != null && b.index != null ? r.index - b.index : null, z: null, p: null, verdict: 'few' };
+  }
+  const diff = r.index - b.index;
+  const se = Math.sqrt(r.se * r.se + b.se * b.se);
+  const z = se > 0 ? diff / se : 0;
+  const p = 2 * (1 - normCdf(Math.abs(z)));
+  return { recent: r, base: b, diff, z, p, verdict: p < 0.05 ? (diff > 0 ? 'better' : 'worse') : 'same' };
+}
