@@ -4,7 +4,12 @@
 // One request at a time, at least `gapMs` apart (default 8 s, about 450 requests an hour). Each turn
 // first does what is due on a clock:
 //   GET /api/game/cases        every 6 h      case prices
-//   GET /api/live-drops        every 30 s     finds active players (it shows their big wins)
+//   GET /api/live-drops        every 30-90 s  finds active players (it shows their big wins). It holds the
+//                                             last 20 big drops and turns most of them over in 30 s, so
+//                                             the interval follows what the feed brings: back to 30 s when
+//                                             a read adds `feedBusy` or more players to the look queue (new,
+//                                             or known and not looked at in the last 2 h), 1.5 times longer
+//                                             after a read that adds none, up to `feedMaxMs`.
 //   GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
 // Otherwise the turn goes to the next kind of work in `turns`, a fixed rotation, so each kind gets its
 // share of the requests even when another always has work (a kind with nothing to do passes its turn on):
@@ -36,7 +41,9 @@ const HOUR = 60 * 60 * 1000;
 
 export const DEFAULTS = {
   gapMs: 8000,
-  feedEveryMs: 30_000,
+  feedEveryMs: 30_000, // shortest feed interval
+  feedMaxMs: 90_000, // longest, while the feed shows only players already being looked at
+  feedBusy: 2, // a read that adds this many players to the look queue sets the shortest interval
   statsEveryMs: 60_000,
   casesEveryMs: 6 * HOUR,
   profileEveryMs: 90 * 1000, // one list per turn, so each list about every 3 min
@@ -154,6 +161,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   let running = false;
   let wake = null;
   let lastFeed = -Infinity;
+  let feedGap = opt.feedEveryMs;
   let lastStats = -Infinity;
   let lastCases = -Infinity;
   let pausedUntil = 0;
@@ -241,6 +249,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
 
   async function readFeed() {
     lastFeed = now();
+    let added = 0;
     for (const [id, skip] of feedDrops(await get('/api/live-drops'))) {
       remember(id);
       if (players.has(id) || backfilled.has(id)) continue;
@@ -250,8 +259,12 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         continue;
       }
       queue.push({ id, skip });
+      added++;
       if (queue.length > opt.maxQueue) queue.shift();
     }
+    // Requests go to the feed while it brings players, and to their histories while it does not.
+    if (added >= opt.feedBusy) feedGap = opt.feedEveryMs;
+    else if (!added) feedGap = Math.min(Math.round(feedGap * 1.5), Math.max(opt.feedMaxMs, opt.feedEveryMs));
   }
 
   async function readStats() {
@@ -523,7 +536,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   async function step() {
     const t = now();
     if (t - lastCases >= opt.casesEveryMs) return readCases();
-    if (t - lastFeed >= opt.feedEveryMs) return readFeed();
+    if (t - lastFeed >= feedGap) return readFeed();
     if (t - lastStats >= opt.statsEveryMs) return readStats();
     if (!profileProbed && known.size) return probeProfile();
     const n = opt.turns.length;
@@ -617,6 +630,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         // Lists with older pages still to read (up to `deepPages` each).
         historyPages: [...known.values()].reduce((s, k) => s + STREAMS.filter((st) => k.hist[st]).length, 0),
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
+        feedEveryMs: feedGap, // current feed interval
         counterChecks: !countersOff,
         counterMisses, // counter checks that said "no new play" when the list later showed some
         requestsLastHour: requests.length,

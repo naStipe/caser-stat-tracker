@@ -37,8 +37,14 @@ Sections:
 
 One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does the most urgent thing that is due:
 
-1. On a clock: `GET /api/game/cases` every 6 hours (case prices), `GET /api/live-drops` every 30 s (finds active
-   players; the feed shows big wins, so the sample leans towards big spenders), `GET /api/statistics` every 60 s.
+1. On a clock: `GET /api/game/cases` every 6 hours (case prices), `GET /api/live-drops` every 30 to 90 s (finds
+   active players; the feed shows big wins, so the sample leans towards big spenders), `GET /api/statistics` every
+   60 s. The feed holds the last 20 drops worth about 3,500 or more and replaces 15 to 20 of them in 30 s (measured
+   November 2026), so no interval catches every drop. Since the feed only finds players, its interval follows how
+   many it brings: a read that adds 2 or more players to the look queue (new, or known and not looked at in the
+   last 2 hours) sets 30 s; a read that adds none makes the next wait 1.5 times longer, up to 90 s
+   (`FEED_MAX_SECONDS`). The requests saved go to revisits and history. The cost: a player who reaches the feed
+   only once, during a long wait, can be missed, and a known player's return is seen up to a minute later.
 2. Every other turn goes to the next kind of work in a fixed rotation, so each gets its share of the requests even
    when another always has work (a kind with nothing to do passes its turn on). Per 8 turns:
    - 2 × **first look**: a newly found player's latest page of upgrades and case drops
@@ -67,9 +73,8 @@ reads the history of players who played in the last 7 days again.
 Why revisits rather than the drop board alone: the board only shows drops worth about 3,500 or more, so players
 who play small never appear there. The site has no way to ask whether a given player is online (it only
 publishes the total online count), but a player's own history shows when they last played. So once the board has
-shown a player, revisits keep them in the sample whenever they play, small or big. Polling the board every 30 s
-already catches nearly every entry (it changes by a few entries per 10 s), so its live websocket would add
-little.
+shown a player, revisits keep them in the sample whenever they play, small or big. The board's live websocket
+would catch every entry, but most entries are players already known, whose rows revisits read anyway.
 
 Once per installation the monitor also reads one player's profile and logs only its field names (event
 `profile-fields`), in case the site adds or shows a last-online time there.
@@ -185,6 +190,7 @@ running monitor keeps working until it is updated.
 | `HISTORY_PAGES` | 10 | older pages read per list per player (0: only the latest page) |
 | `REVISIT_HOURS` | 6 | how often known players who last played 1 to 3 days ago are checked again |
 | `REVISIT_STALE_HOURS` | 24 | how often known players who last played more than 3 days ago are checked again |
+| `FEED_MAX_SECONDS` | 90 | longest drop feed interval while it brings no players to look at (30: always 30 s) |
 | `COUNTER_CHECKS` | 1 | 0: check quiet players by reading both lists instead of their counters (2 requests instead of 1) |
 | `CASER_BASE` | https://caser.gg | site origin |
 | `PULSE_GAP_MS` | 8000 | pause between requests, at least 2000 |

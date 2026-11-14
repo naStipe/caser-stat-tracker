@@ -607,7 +607,7 @@ function run(site, { budget, options = {}, initial } = {}) {
     initial,
     options: { gapMs: 1000, ...options },
   });
-  return { c, saved, events, done: c.start() };
+  return { c, saved, events, now: () => t, done: c.start() };
 }
 
 test('collector: reads a found player history back 7 days with larger pages when the site allows them', async () => {
@@ -721,6 +721,31 @@ test('collector: reports counters that said "no new play" when the list later sh
   assert.ok(e && e.level === 'warn', 'reported');
   assert.match(e.message, /2 upgrade row/, 'the row from the check time itself is within the slack');
   assert.equal(c.status().counterMisses, 1);
+});
+
+test('collector: the feed is read less often while it brings no players to look at, and at once again when it does', async () => {
+  const site = pagedSite({ upgrades: 1 });
+  const feedTimes = [];
+  let clock = () => 0;
+  const orig = site.getJson;
+  site.getJson = async (p) => {
+    if (p === '/api/live-drops') {
+      feedTimes.push(clock());
+      // From the 7th read on, two players the monitor has not seen.
+      if (feedTimes.length === 7) site.feed = { liveDrops: ['n1', 'n2'].map((id) => ({ user: { id }, item: { marketName: 'W' } })) };
+    }
+    return orig(p);
+  };
+  // Reads 1-6 show the same player: the first queues them (one player keeps 30 s), the rest add nobody.
+  const r = run(site, { budget: 60, initial: { profileProbed: true } });
+  clock = r.now;
+  await r.done;
+  const gaps = feedTimes.slice(1).map((x, i) => Math.round((x - feedTimes[i]) / 1000));
+  const want = [30, 45, 68, 90, 90, 90, 30];
+  assert.ok(gaps.length >= want.length, `feed read ${feedTimes.length} times`);
+  // Turns are about a second long here, so a read can come a few seconds after it is due.
+  want.forEach((w, i) => assert.ok(gaps[i] >= w && gaps[i] <= w + 4, `gap ${i + 1}: ${gaps[i]} s, want about ${w} s`));
+  assert.ok([30_000, 45_000, 68_000, 90_000].includes(r.c.status().feedEveryMs));
 });
 
 test('collector: falls back to reading lists when stats lose their counters', async () => {

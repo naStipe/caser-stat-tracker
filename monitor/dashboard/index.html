@@ -427,6 +427,7 @@ function problemsSection() {
   const facts = !health || (health.level === 'bad' && !st.running) ? [] : [
     `${fmtInt(st.rowsLastHour)} rows in the last hour (${fmtInt(st.backRowsLastHour)} from players’ history)`,
     `${fmtInt(st.requestsLastHour)} requests`,
+    ...(st.feedEveryMs ? [`drop feed every ${Math.round(st.feedEveryMs / 1000)} s`] : []),
     `${fmtInt(st.activeNow)} known players playing now`,
     `${fmtInt(st.players)} followed, ${fmtInt(st.queued)} waiting, ${fmtInt(st.known)} known, ${fmtInt(st.revisitsDue)} checks due, ${fmtInt(st.historyPages)} lists with history to read`,
   ];
