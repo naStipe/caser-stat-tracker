@@ -5,6 +5,7 @@ import { h, s, createHost, attach, store, debounce, safe } from './dom.js';
 import { BASE_CSS, DASHBOARD_CSS } from './styles.js';
 import { lineChart, diffBars } from './charts.js';
 import { viewOdds, viewMystery, viewMoney } from './views-v2.js';
+import { viewPulse } from './pulseview.js';
 import {
   fmtMoney,
   fmtNumber,
@@ -32,6 +33,7 @@ const TABS = [
   ['mystery', 'Mystery'],
   ['factors', 'Factors'],
   ['money', 'Money'],
+  ['pulse', 'Pulse'],
   ['data', 'Data'],
 ];
 
@@ -403,6 +405,7 @@ export function mountDashboard(opts = {}) {
         mystery: () => viewMystery(ctx),
         factors: viewFactors,
         money: () => viewMoney(ctx),
+        pulse: () => viewPulse(ctx),
         data: viewData,
       };
       try {
@@ -581,6 +584,7 @@ export function mountDashboard(opts = {}) {
     rateCell,
     sigBadge,
     kpi,
+    pulse: o.pulse || null,
   };
 
   // ---------- Overview ----------
@@ -1745,6 +1749,8 @@ export function mountDashboard(opts = {}) {
 
   return {
     refresh,
+    /** Redraw the open tab from data already loaded (no event reload). */
+    rerender: () => render(),
     destroy() {
       refresh.cancel();
       onResize.cancel();
