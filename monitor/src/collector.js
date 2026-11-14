@@ -8,9 +8,13 @@
 //   3. GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
 //   4. first look at a found player: the latest page of their upgrades and case drops
 //   5. follow: one of the two lists of a followed player at most every 90 s, for new rows
-//   6. when nothing above is due, alternately:
+//   6. when nothing above is due:
+//      - revisit: a known player who is no longer followed, for new rows. Players who played in the
+//        last 30 min are checked every 10 min (and before anything else here), then every 30 min,
+//        2 h or 6 h the longer ago they played. So players who play small, and rarely reach the drop
+//        board, stay in the sample once the board has shown them.
 //      - history: older pages of a player's lists, back to `historyMs` (7 days), at most `deepPages` each
-//      - revisit: a known player who is no longer followed, every `revisitMs` (3 h), for new rows
+//      (alternating with revisits that are not urgent)
 // HTTP 429 pauses everything for 5 minutes, doubling up to 30. HTTP 401 (login refused) and 403 (blocked)
 // stop the collector. Other errors are retried; a run of them is reported.
 //
@@ -37,9 +41,14 @@ export const DEFAULTS = {
   historyMs: 7 * 24 * HOUR, // history rows kept back to this age
   deepPages: 10, // older pages read per list per player, after the first
   maxDeepJobs: 300,
-  revisitMs: 3 * HOUR,
-  knownMax: 3000, // players remembered for revisits
-  knownKeepMs: 7 * 24 * HOUR, // forget players not seen in the feed for this long
+  // Known players are checked again for new rows, more often the more recently they played:
+  revisitHotMs: 10 * 60 * 1000, // played in the last `activeMs`: they are on the site now
+  revisitWarmMs: 30 * 60 * 1000, // played in the last 3 hours
+  revisitMs: 2 * HOUR, // played in the last day
+  revisitColdMs: 6 * HOUR, // longer ago, or not seen playing yet
+  activeMs: 30 * 60 * 1000,
+  knownMax: 5000, // players remembered for revisits
+  knownKeepMs: 14 * 24 * HOUR, // forget players neither in the feed nor seen playing for this long
   maxPlayers: 30, // followed at once
   maxQueue: 40, // found players waiting for their first look (oldest dropped first)
   backfillsPerFollow: 2,
@@ -59,6 +68,17 @@ export class HttpError extends Error {
 }
 
 const isHttp = (e, ...codes) => e instanceof HttpError && codes.includes(e.status);
+
+/** Field names of an answer, one level deep (e.g. "user.lastSeen"); never values. */
+export function fieldNames(body) {
+  const out = [];
+  const o = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  for (const [k, v] of Object.entries(o)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) for (const k2 of Object.keys(v)) out.push(`${k}.${k2}`);
+    else out.push(k);
+  }
+  return out.slice(0, 80);
+}
 const STREAMS = ['upgrade', 'case'];
 
 /**
@@ -97,6 +117,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     pageProbe = initial.pageProbe;
   }
   const triedSlugs = new Set();
+  let profileProbed = !!initial.profileProbed;
   let running = false;
   let wake = null;
   let lastFeed = -Infinity;
@@ -145,11 +166,24 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     while (counted.length && counted[0][0] < cut) counted.shift();
     for (const [id, p] of players) if (t - p.added > opt.watchMs || t - p.lastRow > opt.idleDropMs) players.delete(id);
     for (const [id, at] of backfilled) if (t - at > opt.watchMs) backfilled.delete(id);
-    for (const [id, k] of known) if (t - k.seen > opt.knownKeepMs) known.delete(id);
+    const last = (k) => Math.max(k.seen, lastPlayed(k));
+    for (const [id, k] of known) if (t - last(k) > opt.knownKeepMs) known.delete(id);
     if (known.size > opt.knownMax) {
-      const oldest = [...known].sort((a, b) => a[1].seen - b[1].seen).slice(0, known.size - opt.knownMax);
+      const oldest = [...known].sort((a, b) => last(a[1]) - last(b[1])).slice(0, known.size - opt.knownMax);
       for (const [id] of oldest) known.delete(id);
     }
+  }
+
+  /** When a known player last played, from the newest row seen in their lists (0: not seen yet). */
+  const lastPlayed = (k) => Math.max(k.newest.upgrade, k.newest.case);
+
+  /** How long until a known player is checked again: soon if they are playing now, rarely if not. */
+  function revisitEvery(k, t = now()) {
+    const ago = t - lastPlayed(k);
+    if (ago <= opt.activeMs) return opt.revisitHotMs;
+    if (ago <= 3 * HOUR) return opt.revisitWarmMs;
+    if (ago <= 24 * HOUR) return opt.revisitMs;
+    return opt.revisitColdMs;
   }
 
   function remember(id) {
@@ -286,27 +320,40 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     if (full && oldest >= cut && job.pages + 1 < opt.deepPages) deep.push({ ...job, offset: job.offset + len, pages: job.pages + 1 });
   }
 
-  /** New rows of a known player who is not followed any more. */
-  async function revisit() {
+  /** The known player most overdue for a check, with whether they are playing now; null if none is due. */
+  function dueRevisit() {
     const t = now();
     let pick = null;
     for (const [id, k] of known) {
-      if (players.has(id) || backfilled.has(id) || queue.some((q) => q.id === id)) continue;
-      if (t - k.revisited < opt.revisitMs) continue;
-      if (!pick || k.revisited < pick[1].revisited) pick = [id, k];
+      if (players.has(id) || backfilled.has(id)) continue;
+      const due = k.revisited + revisitEvery(k, t);
+      if (due > t) continue;
+      const hot = t - lastPlayed(k) <= opt.activeMs;
+      // Players on the site now first, then the most overdue.
+      if (!pick || (hot && !pick.hot) || (hot === pick.hot && due < pick.due)) pick = { id, k, due, hot };
     }
-    if (!pick) return false;
-    const [id, k] = pick;
+    return pick;
+  }
+
+  /**
+   * New rows of a known player who is not followed: this is how players who play small (and never
+   * reach the drop board) stay in the sample once they have been seen there.
+   */
+  async function revisit(pick) {
+    const { id, k } = pick;
+    const t = now();
     k.revisited = t;
     const u = await hashUser(id);
     for (const stream of STREAMS) {
+      // Rows newer than the last one seen are new play; with nothing seen yet, it is history.
       const since = k.newest[stream] || t - opt.historyMs;
+      const back = !k.newest[stream];
       for (let page = 0, offset = 0; page < opt.maxPages; page++) {
         const { parse, len, full } = await readPage(id, u, stream, offset);
-        const rows = parse({ back: true });
+        const rows = parse({ back });
         noteNewest(id, stream, rows);
         const fresh = rows.filter((r) => r.ts > since);
-        await save(fresh, true);
+        await save(fresh, back);
         if (fresh.length < rows.length || !full) break;
         offset += len;
         await doSleep(opt.gapMs);
@@ -314,6 +361,27 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       if (stream === 'upgrade') await doSleep(opt.gapMs);
     }
     return true;
+  }
+
+  /**
+   * Once per installation: which fields a player's profile has (names only, no values), in case the
+   * site shows when a player was last online. Reported as an event; errors are reported, not fatal.
+   */
+  async function probeProfile() {
+    profileProbed = true;
+    const id = [...known.keys()][0];
+    const fields = [];
+    for (const path of [`/api/users/${encodeURIComponent(id)}`, `/api/users/${encodeURIComponent(id)}/stats`]) {
+      try {
+        const body = await get(path);
+        fields.push(`${path.replace(id, '{id}')}: ${fieldNames(body).join(', ') || '(empty)'}`);
+      } catch (e) {
+        if (isHttp(e, 429, 401)) throw e;
+        fields.push(`${path.replace(id, '{id}')}: ${e?.message ?? e}`);
+      }
+      await doSleep(opt.gapMs);
+    }
+    event('info', 'profile-fields', `Profile fields (names only): ${fields.join(' | ')}`.slice(0, 1000));
   }
 
   async function follow() {
@@ -349,11 +417,15 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   }
 
   async function idle() {
-    // Alternate between older history and revisits, so neither starves the other.
+    if (!profileProbed && known.size) return probeProfile();
+    const due = dueRevisit();
+    // Players on the site now come first: they are what "right now" is made of.
+    if (due?.hot) return revisit(due);
+    // Otherwise alternate between older history and revisits, so neither starves the other.
     const order = idleTurn++ % 2 === 0 ? ['deep', 'revisit'] : ['revisit', 'deep'];
     for (const what of order) {
       if (what === 'deep' && deep.length) return readDeep();
-      if (what === 'revisit' && (await revisit())) return;
+      if (what === 'revisit' && due) return revisit(due);
     }
   }
 
@@ -441,6 +513,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, deep: k.deep })),
         pageSize,
         pageProbe,
+        profileProbed,
       };
     },
     status() {
@@ -451,6 +524,9 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         players: players.size,
         queued: queue.length,
         known: known.size,
+        // Known players seen playing in the last `activeMs`, found through the feed or a revisit.
+        activeNow: [...known.values()].filter((k) => now() - lastPlayed(k) <= opt.activeMs).length,
+        revisitsDue: [...known].filter(([id, k]) => !players.has(id) && !backfilled.has(id) && k.revisited + revisitEvery(k) <= now()).length,
         historyPages: deep.length,
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
         requestsLastHour: requests.length,

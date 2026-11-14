@@ -16,6 +16,9 @@ export const KINDS = ['upgrade', 'case'];
 
 /** Time ranges the page offers, with the bucket size the activity chart and table use. */
 export const RANGES = {
+  '30m': { label: '30 minutes', span: 30 * MIN, bucket: 5 * MIN },
+  '1h': { label: 'hour', span: HOUR, bucket: 5 * MIN },
+  '3h': { label: '3 hours', span: 3 * HOUR, bucket: 15 * MIN },
   '6h': { label: '6 hours', span: 6 * HOUR, bucket: 30 * MIN },
   '24h': { label: '24 hours', span: DAY, bucket: HOUR },
   '3d': { label: '3 days', span: 3 * DAY, bucket: 3 * HOUR },
@@ -24,20 +27,24 @@ export const RANGES = {
 };
 
 /** Window sizes for the two main charts, in minutes. */
-export const WINDOWS = [10, 15, 20, 30, 60, 120, 360, 1440];
+export const WINDOWS = [1, 2, 5, 10, 15, 20, 30, 60, 120, 360, 1440];
 const MAX_WINDOWS = 800;
+const MIN_WINDOWS = 3;
+/** The window each range starts with. */
+export const DEFAULT_WINDOW = { '30m': 1, '1h': 2, '3h': 5, '6h': 10, '24h': 15, '3d': 30, '7d': 60, '30d': 360 };
 
-/** Window sizes that keep a range at most MAX_WINDOWS windows. */
+/** Window sizes that give a range between MIN_WINDOWS and MAX_WINDOWS windows. */
 export function windowsFor(key) {
   const span = (RANGES[key] ?? RANGES['24h']).span;
-  return WINDOWS.filter((m) => span / (m * MIN) <= MAX_WINDOWS);
+  return WINDOWS.filter((m) => span / (m * MIN) <= MAX_WINDOWS && span / (m * MIN) >= MIN_WINDOWS);
 }
 
-/** The window to use: the one asked for if allowed, else 15 min, else the smallest allowed. */
+/** The window to use: the one asked for if allowed, else the range's default. */
 export function pickWindow(key, wanted) {
-  const ok = windowsFor(key);
+  const k = RANGES[key] ? key : '24h';
+  const ok = windowsFor(k);
   if (ok.includes(Number(wanted))) return Number(wanted);
-  return ok.includes(15) ? 15 : ok[0];
+  return ok.includes(DEFAULT_WINDOW[k]) ? DEFAULT_WINDOW[k] : ok[0];
 }
 
 /** Range and windows aligned to the window size, the current (partial) window last. */
@@ -53,9 +60,10 @@ export function rangeSpec(key, now, windowMin = 15) {
   return { key: k, label: r.label, from, to, window: win, coarse: { from: cfrom, to: cto, bucket: r.bucket } };
 }
 
-/** The comparison: the last hour against the 3 hours before it, as one report with hourly buckets. */
-export function compareSpec(now) {
-  return { from: now - 4 * HOUR, to: now, bucket: HOUR };
+/** The comparison: the last `minutes` against the 3 times as long before them, as one report of 4 buckets. */
+export function compareSpec(now, minutes = 60) {
+  const len = minutes * MIN;
+  return { from: now - 4 * len, to: now, bucket: len, minutes };
 }
 
 const n0 = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? 0 : Number(v));
@@ -99,7 +107,7 @@ const EMPTY_VOLUME = { bucket: 0, samples: 0, casesPerMin: null, upgradesPerMin:
  * @param {ReturnType<typeof rangeSpec>} o.spec
  * @param {number} o.now
  */
-export function buildReport({ report, cmp, volume = [], volRecent = [], volBase = [], spec, now }) {
+export function buildReport({ report, cmp, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
   const series = (report?.series ?? []).map(cleanRow);
   const out = { now, spec, kinds: {}, compare: {}, compareMoney: {}, heat: {}, hours: {}, totals: {} };
 
@@ -109,7 +117,8 @@ export function buildReport({ report, cmp, volume = [], volRecent = [], volBase 
     const avg = rowIndex(kind, total);
     const byStart = new Map(rows.map((r) => [Number(r.bucket), r]));
     const windows = [];
-    const steps = Math.max(1, Math.round(HOUR / spec.window)); // smoothing: the last hour of windows
+    // Smoothing: the last hour of windows (a quarter of the range for short ranges).
+    const steps = Math.max(1, Math.round(Math.min(HOUR, (spec.to - spec.from) / 4) / spec.window));
     const roll = [];
     for (let t = spec.from; t < spec.to; t += spec.window) {
       const r = byStart.get(t) ?? null;
@@ -119,7 +128,7 @@ export function buildReport({ report, cmp, volume = [], volRecent = [], volBase 
       const smooth = rowIndex(kind, sumRows(roll.map((x) => cleanRow(x))));
       windows.push({ start: t, end: Math.min(t + spec.window, now), n: n0(r?.n), players: n0(r?.players), up: n0(r?.up), index, z: indexZ(index, avg.index), money: rowMoney(r), smooth: smooth.index });
     }
-    const ranked = windows.filter((w) => w.index.n >= 20 && w.z != null).sort((a, b) => b.z - a.z);
+    const ranked = windows.filter((w) => w.index.n >= 10 && w.z != null).sort((a, b) => b.z - a.z);
     out.kinds[kind] = {
       windows,
       avg,
@@ -130,8 +139,8 @@ export function buildReport({ report, cmp, volume = [], volRecent = [], volBase 
 
     // Last hour against the 3 hours before.
     const c = (cmp?.series ?? []).map(cleanRow).filter((r) => r.kind === kind);
-    const cs = compareSpec(now);
-    const lastStart = cs.from + 3 * HOUR;
+    const cs = compareSpec(now, compareMinutes);
+    const lastStart = cs.from + 3 * cs.bucket;
     const recent = c.filter((r) => Number(r.bucket) >= lastStart);
     const base = c.filter((r) => Number(r.bucket) < lastStart);
     const ri = rowIndex(kind, sumRows(recent));
@@ -145,7 +154,7 @@ export function buildReport({ report, cmp, volume = [], volRecent = [], volBase 
     );
 
     // Weekday x hour, and hour of day over all days.
-    const heat = (report?.heat ?? []).map(cleanRow).filter((r) => r.kind === kind);
+    const heat = ((heatReport ?? report)?.heat ?? []).map(cleanRow).filter((r) => r.kind === kind);
     const cells = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => null));
     for (const r of heat) {
       const d = Number(r.dow) - 1;
@@ -199,6 +208,7 @@ export function buildReport({ report, cmp, volume = [], volRecent = [], volBase 
     base: volBase[0] ? cleanVolume(volBase[0]) : EMPTY_VOLUME,
   };
   for (let t = spec.coarse.from; t < spec.coarse.to; t += spec.coarse.bucket) out.volume.buckets.push(vol.find((v) => v.bucket === t) ?? { ...EMPTY_VOLUME, bucket: t });
+  out.compareMinutes = compareMinutes;
   return out;
 }
 

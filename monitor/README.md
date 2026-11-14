@@ -22,11 +22,14 @@ Two measures, for upgrades and for cases:
 Sections:
 
 - the monitor's state and its recent events (problems are listed here too);
-- last hour against the 3 hours before, with a significance test;
-- totals for the range (6 hours to 30 days), including the share of players who ended up in profit;
-- **one chart for upgrades and one for cases, per 10 to 60-minute window** (index or return per 1), with each
-  window's 95% range, a smoothed hourly line, the range average, sample sizes, and the best and worst windows;
-- a weekday × hour heat map (local time);
+- **right now**: the last 30 minutes against the 90 minutes before, or the last hour against the 3 hours before
+  (a switch), with a significance test;
+- totals for the range (30 minutes to 30 days, opening on the last hour), including the share of players who
+  ended up in profit;
+- **one chart for upgrades and one for cases, per window** (1 minute to 1 day, depending on the range; index or
+  return per 1), with each window's 95% range, a smoothed line, the range average, sample sizes, and the best and
+  worst windows;
+- a weekday × hour heat map (local time) over the last 7 days, whatever the range;
 - upgrades by shown chance (where the shown odds are off the most), cases one by one, stake sizes;
 - site activity from the site's public counters.
 
@@ -41,10 +44,22 @@ One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does 
    with a big win.
 3. Following: one of the two lists of a followed player about every 90 s, for 2 hours after they were found.
 4. When nothing above is due:
+   - **revisits**: every player the feed has shown is remembered (up to 5,000, for 14 days after they were last
+     seen) and checked again for new rows: every 10 minutes while they played in the last 30 minutes (these
+     come before anything else here), every 30 minutes if they played in the last 3 hours, every 2 hours within a
+     day, else every 6 hours (`REVISIT_HOURS`). The dashboard shows how many known players are playing now.
    - **history**: older pages of each new player's lists, back 7 days (`HISTORY_DAYS`), at most 10 pages each
-     (`HISTORY_PAGES`);
-   - **revisits**: players seen in the feed in the last 7 days are checked again every 3 hours (`REVISIT_HOURS`)
-     for new rows.
+     (`HISTORY_PAGES`).
+
+Why revisits rather than the drop board alone: the board only shows drops worth about 3,500 or more, so players
+who play small never appear there. The site has no way to ask whether a given player is online (it only
+publishes the total online count), but a player's own history shows when they last played. So once the board has
+shown a player, revisits keep them in the sample whenever they play, small or big. Polling the board every 30 s
+already catches nearly every entry (it changes by a few entries per 10 s), so its live websocket would add
+little.
+
+Once per installation the monitor also reads one player's profile and logs only its field names (event
+`profile-fields`), in case the site adds or shows a last-online time there.
 
 Pages: the site's own pages ask for 50 rows. The monitor asks for 100 once and keeps that if the site sends more
 than 50, or falls back to 50; the event log says which.
@@ -155,7 +170,7 @@ running monitor keeps working until it is updated.
 | `RETENTION_DAYS` | 30 | rows and events older than this are deleted |
 | `HISTORY_DAYS` | 7 | how far back a found player's history is read |
 | `HISTORY_PAGES` | 10 | older pages read per list per player (0: only the latest page) |
-| `REVISIT_HOURS` | 3 | how often known players are checked again |
+| `REVISIT_HOURS` | 6 | how often known players who have not played for a day are checked again |
 | `CASER_BASE` | https://caser.gg | site origin |
 | `PULSE_GAP_MS` | 8000 | pause between requests, at least 2000 |
 | `DATA_DIR` | ./data | state file (tokens, hash salt, known players, rows and events not yet sent) |

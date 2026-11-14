@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
 import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow } from '../dashboard/view.js';
-import { createCollector, HttpError } from '../src/collector.js';
+import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
 import { alertRequest, createNotifier } from '../src/notify.js';
@@ -477,7 +477,11 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(spec.coarse.bucket, HOUR);
   assert.equal(rangeSpec('nope', now).key, '24h');
   assert.deepEqual(windowsFor('30d'), [60, 120, 360, 1440]);
-  assert.equal(pickWindow('30d', 15), 60);
+  assert.equal(pickWindow('30d', 15), 360, 'the range default');
+  assert.deepEqual(windowsFor('30m'), [1, 2, 5, 10]);
+  assert.equal(pickWindow('30m', 15), 1);
+  assert.equal(pickWindow('1h', 5), 5);
+  assert.deepEqual(compareSpec(now, 30), { from: now - 120 * 60000, to: now, bucket: 30 * 60000, minutes: 30 });
   assert.equal(pickWindow('6h', 20), 20);
   // Shapes as monitor_report sends them (some numbers as strings, empty sums as null).
   const up = (bucket, w, extra = {}) => ({ bucket, kind: 'upgrade', n: 40, players: 10, up: 4, sx: '400', sy: 380, gxx: 16000, gyy: 15000, gxy: 15000, nw: 40, w, ew: 10, vw: 8, nh: 0, h: null, eh: null, vh: null, ...extra });
@@ -644,7 +648,7 @@ test('collector: falls back to 50-row pages when the site caps or refuses larger
 test('collector: revisits a known player after the revisit time, only for rows newer than the last seen', async () => {
   const site = pagedSite({ upgrades: 5 });
   site.feed = { liveDrops: [] };
-  const initial = { known: [{ id: '7', seen: T0, revisited: T0 - 4 * 3600e3, newest: { upgrade: T0 - 2 * 30 * 60000, case: 0 }, deep: true }] };
+  const initial = { profileProbed: true, known: [{ id: '7', seen: T0, revisited: T0 - 4 * 3600e3, newest: { upgrade: T0 - 2 * 30 * 60000, case: 0 }, deep: true }] };
   const { c, saved, done } = run(site, { budget: 6, initial });
   await done;
   // Rows 0 and 1 are newer than the last seen (row 2's time); nothing older comes back.
@@ -767,4 +771,48 @@ test('monitor: alerts on a stop, confirms alert setup once, and reports a restar
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('collector: players playing now are revisited first and often, quiet ones rarely', async () => {
+  const site = pagedSite({ upgrades: 3 });
+  site.feed = { liveDrops: [] };
+  const M = 60000;
+  const initial = {
+    profileProbed: true,
+    known: [
+      { id: 'quiet', seen: T0 - 2 * 24 * 3600e3, revisited: T0 - 3600e3, newest: { upgrade: T0 - 2 * 24 * 3600e3, case: 0 }, deep: true },
+      { id: 'warm', seen: T0 - 3600e3, revisited: T0 - 40 * M, newest: { upgrade: T0 - 2 * 3600e3, case: 0 }, deep: true },
+      { id: 'hot', seen: T0 - 3600e3, revisited: T0 - 15 * M, newest: { upgrade: T0 - 10 * M, case: 0 }, deep: true },
+    ],
+  };
+  const { c, done } = run(site, { budget: 12, initial });
+  await done;
+  const order = site.calls.filter((p) => p.includes('public-history')).map((p) => p.split('/').pop().split('?')[0]);
+  assert.deepEqual(order.slice(0, 2), ['hot', 'warm'], 'playing now first, then recently');
+  assert.ok(!order.includes('quiet'), 'not due yet');
+  assert.equal(c.status().activeNow, 2, 'hot, and warm once its revisit found a row from now');
+  assert.equal(c.exportState().profileProbed, true);
+});
+
+test('collector: probes profile field names once, and a refused profile does not stop it', async () => {
+  const site = pagedSite({ upgrades: 1 });
+  site.feed = { liveDrops: [] };
+  const orig = site.getJson;
+  site.getJson = async (p) => {
+    if (/^\/api\/users\/[^/]+$/.test(p)) return { user: { id: '7', nickname: 'secret-name', lastSeenAt: '2026-11-14T12:00:00Z' }, online: true };
+    if (/\/stats$/.test(p)) throw new HttpError(403, p);
+    return orig(p);
+  };
+  const initial = { known: [{ id: '7', seen: T0, revisited: T0, newest: { upgrade: T0, case: 0 }, deep: true }] };
+  const { c, events, done } = run(site, { budget: 8, initial });
+  await done;
+  const e = events.find((x) => x.code === 'profile-fields');
+  assert.ok(e, 'reported');
+  assert.match(e.message, /user\.lastSeenAt/);
+  assert.match(e.message, /online/);
+  assert.ok(!e.message.includes('secret-name'), 'names only, never values');
+  assert.match(e.message, /HTTP 403/);
+  assert.equal(c.status().stopReason, null, '403 on the probe does not stop the collector');
+  assert.equal(events.filter((x) => x.code === 'profile-fields').length, 1, 'once');
+  assert.deepEqual(fieldNames({ a: 1, b: { c: 2 }, d: [1] }), ['a', 'b.c', 'd']);
 });
