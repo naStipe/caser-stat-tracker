@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { summarizeSales, createPriceClient, salesUrl, expandPoints, findSplit, CSFLOAT_SELLER_FEE } from '../src/prices/csfloat.js';
 import { replacementItemId, candidatesFromResponse } from '../src/capture/replacements.js';
-import { rankCandidates, sellValue } from '../src/stats/exchange.js';
+import { rankCandidates, sellValue, replaceVerdict } from '../src/stats/exchange.js';
 
 const NOW = Date.parse('2026-11-10T12:00:00Z');
 const DAY = 86_400_000;
@@ -166,4 +166,42 @@ test('price client caches, shares in-flight requests and reports rate limits', a
   const again = createPriceClient({ request, storage, now: () => NOW, gapMs: 0 });
   assert.equal(again.cached('Item').value, 10);
   await assert.rejects(client.get('Limited'), /rate limit/);
+});
+
+test('replaceVerdict compares the best liquid offer by value, whatever the sort', () => {
+  const m = (sales30d) => ({ sales30d });
+  const row = (id, sell, liquid = true) => ({ id, name: id, sell, liquid, market: m(liquid ? 10 : 0) });
+  // Sorted by sales: the first liquid row is not the most valuable one.
+  const rows = [row('a', 90), row('b', 110), row('c', 200, false)];
+  const v = replaceVerdict(rows, 100, m(10));
+  assert.equal(v.kind, 'replace');
+  assert.equal(v.reason, 'value');
+  assert.equal(v.best.id, 'b');
+  assert.equal(v.delta, 10);
+});
+
+test('replaceVerdict says keep when every liquid offer is worth less', () => {
+  const v = replaceVerdict([{ id: 'a', sell: 80, liquid: true }], 100, { sales30d: 10 });
+  assert.equal(v.kind, 'keep');
+  assert.equal(v.reason, 'value');
+  assert.equal(v.delta, -20);
+});
+
+test('replaceVerdict treats differences inside the 2% margin as even', () => {
+  const v = replaceVerdict([{ id: 'a', sell: 101, liquid: true }], 100, { sales30d: 10 });
+  assert.equal(v.kind, 'even');
+  assert.equal(v.margin, 2);
+});
+
+test('replaceVerdict prefers a liquid offer when the current item does not sell', () => {
+  const v = replaceVerdict([{ id: 'a', sell: 99, liquid: true }], 100, { sales30d: 1 }, { minSales: 3 });
+  assert.equal(v.kind, 'replace');
+  assert.equal(v.reason, 'liquidity');
+  assert.equal(v.currentLiquid, false);
+});
+
+test('replaceVerdict handles no liquid offers and a missing current price', () => {
+  assert.equal(replaceVerdict([{ id: 'a', sell: 500, liquid: false }], 100, { sales30d: 10 }).reason, 'no-liquid');
+  assert.equal(replaceVerdict([{ id: 'a', sell: 500, liquid: true }], null, null).kind, 'unknown');
+  assert.equal(replaceVerdict([], null, null).best, null);
 });

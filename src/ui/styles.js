@@ -382,6 +382,16 @@ export const EXCHANGE_CSS = `
 .pad { padding: 12px 14px; font-size: 12px; }
 .error { color: var(--neg); }
 .sum { padding: 10px 12px 10px; border-bottom: 1px solid var(--border); flex: none; }
+.verdict { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--faint); border-radius: 6px; padding: 7px 10px; margin-bottom: 8px; }
+.verdict.good { border-left-color: var(--pos); }
+.verdict.good .vh { color: var(--pos); }
+.verdict.bad { border-left-color: var(--neg); }
+.verdict.bad .vh { color: var(--neg); }
+.verdict .vrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.verdict .vh { font-size: 13px; font-weight: 650; color: var(--text); }
+.verdict .vd { font-size: 11.5px; color: var(--muted); margin-top: 2px; line-height: 1.4; }
+.verdict .vsel { flex: none; background: transparent; border: 1px solid var(--border-strong); border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--text); cursor: pointer; }
+.verdict .vsel:hover { border-color: var(--accent); }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; min-width: 0; }
 .box .k { color: var(--muted); font-size: 11px; }

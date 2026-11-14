@@ -1572,6 +1572,7 @@
     normalCdf: () => normalCdf,
     outlookModel: () => outlookModel,
     rankCandidates: () => rankCandidates,
+    replaceVerdict: () => replaceVerdict,
     sellValue: () => sellValue,
     sessions: () => sessions,
     summarize: () => summarize,
@@ -2758,6 +2759,21 @@
     });
     return rows;
   }
+  function replaceVerdict(rows, currentSell, currentMarket, opts = {}) {
+    const minSales = opts.minSales ?? 3;
+    const liquid = (Array.isArray(rows) ? rows : []).filter((r) => r.liquid && typeof r.sell === "number");
+    const best = liquid.reduce((a, r) => !a || r.sell > a.sell ? r : a, null);
+    const currentLiquid = !!currentMarket && (currentMarket.sales30d ?? 0) >= minSales;
+    const out = (kind, reason, delta2 = null, margin2 = null) => ({ kind, reason, best, delta: delta2, margin: margin2, currentLiquid });
+    if (typeof currentSell !== "number" || !Number.isFinite(currentSell)) return out("unknown", "no-current");
+    if (!best) return out("keep", "no-liquid");
+    const delta = best.sell - currentSell;
+    const margin = Math.max(0.1, currentSell * 0.02);
+    if (delta > margin) return out("replace", "value", delta, margin);
+    if (!currentLiquid && delta >= -margin) return out("replace", "liquidity", delta, margin);
+    if (delta < -margin) return out("keep", "value", delta, margin);
+    return out("even", "close", delta, margin);
+  }
 
   // src/update.js
   function headerVersion(text) {
@@ -3249,6 +3265,16 @@ option { background: var(--surface); color: var(--text); }
 .pad { padding: 12px 14px; font-size: 12px; }
 .error { color: var(--neg); }
 .sum { padding: 10px 12px 10px; border-bottom: 1px solid var(--border); flex: none; }
+.verdict { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--faint); border-radius: 6px; padding: 7px 10px; margin-bottom: 8px; }
+.verdict.good { border-left-color: var(--pos); }
+.verdict.good .vh { color: var(--pos); }
+.verdict.bad { border-left-color: var(--neg); }
+.verdict.bad .vh { color: var(--neg); }
+.verdict .vrow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.verdict .vh { font-size: 13px; font-weight: 650; color: var(--text); }
+.verdict .vd { font-size: 11.5px; color: var(--muted); margin-top: 2px; line-height: 1.4; }
+.verdict .vsel { flex: none; background: transparent; border: 1px solid var(--border-strong); border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--text); cursor: pointer; }
+.verdict .vsel:hover { border-color: var(--accent); }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; min-width: 0; }
 .box .k { color: var(--muted); font-size: 11px; }
@@ -6599,6 +6625,46 @@ option { background: var(--surface); color: var(--text); }
       )
     );
   }
+  function verdictBanner(v, loading, basisWord, onSelect) {
+    if (loading) {
+      return h("div", { class: "verdict neutral", role: "status" }, h("div", { class: "vh", text: "Checking CSFloat prices\u2026" }), h("div", { class: "vd", text: "The answer shows once every offered item has a price." }));
+    }
+    const b = v.best;
+    const more = (d) => `${usd(Math.abs(d))} ${d >= 0 ? "more" : "less"}`;
+    let cls, head, text;
+    if (v.kind === "unknown") {
+      cls = "neutral";
+      head = "Cannot judge";
+      text = "No CSFloat price for your item, so there is nothing to compare against.";
+    } else if (v.kind === "replace" && v.reason === "liquidity") {
+      cls = "good";
+      head = "Worth replacing";
+      text = `Your item rarely sells. ${b.name} sells for ${more(v.delta)} (${basisWord}) and sells reliably.`;
+    } else if (v.kind === "replace") {
+      cls = "good";
+      head = "Worth replacing";
+      text = `${b.name} sells for ${more(v.delta)} than your item (${basisWord}, after fee).`;
+    } else if (v.kind === "keep" && v.reason === "no-liquid") {
+      cls = "bad";
+      head = "Keep your item";
+      text = "No offered item sells often enough to count on its price.";
+    } else if (v.kind === "keep") {
+      cls = "bad";
+      head = "Keep your item";
+      text = `Best liquid offer, ${b.name}, sells for ${more(v.delta)} (${basisWord}, after fee).`;
+    } else {
+      cls = "neutral";
+      head = "About even";
+      text = `${b.name} sells for ${usd(v.delta, { sign: true })} against your item, inside normal price noise. Keeping is fine.`;
+    }
+    const canSelect = v.kind !== "unknown" && !!b;
+    return h(
+      "div",
+      { class: ["verdict", cls], role: "status" },
+      h("div", { class: "vrow" }, h("div", { class: "vh", text: head }), canSelect ? h("button", { type: "button", class: "vsel", title: "Select this item on the site and show its chart. You still confirm on the site.", text: "Show offer", on: { click: onSelect } }) : null),
+      h("div", { class: "vd", text })
+    );
+  }
   function mountExchangePanel(o) {
     const cur = () => {
       try {
@@ -6704,8 +6770,15 @@ option { background: var(--surface); color: var(--text); }
       const rows = o.stats.rankCandidates(state.candidates, (n) => results.get(n), { minSales, sort, basis, currentValue: curSell });
       const names = new Set([curName, ...state.candidates.map((x) => x.name)].filter(Boolean));
       const done = [...names].filter((n) => results.has(n)).length;
-      const best = rows.find((r) => r.liquid) ?? null;
+      const loading = done < names.size;
+      const verdict = o.stats.replaceVerdict(rows, curSell, curMarket, { minSales });
+      const best = verdict.best;
       const basisWord = basis === "fast" ? "fast sale" : "typical";
+      const verdictBox = verdictBanner(verdict, loading, basisWord, () => {
+        if (!best) return;
+        o.selectCandidate?.(best.id);
+        if (openId !== best.id) toggleOpen(best.id);
+      });
       const curOpen = openId === "@current";
       const yourBox = h(
         "button",
@@ -6726,7 +6799,7 @@ option { background: var(--surface); color: var(--text); }
         { class: "box" },
         h("div", { class: "k", text: `Best swap, ${minSales}+ sales / 30 d` }),
         h("div", { class: "v num" }, best ? usd(best.sell) : DASH, best && best.delta !== null ? h("span", { class: ["x", signClass(best.delta)], text: usd(best.delta, { sign: true }) }) : null),
-        h("div", { class: "s", title: best?.name ?? "", text: best ? best.name : done < names.size ? "Loading prices\u2026" : "None liquid enough" })
+        h("div", { class: "s", title: best?.name ?? "", text: best ? best.name : loading ? "Loading prices\u2026" : "None liquid enough" })
       );
       const minSel = h(
         "select",
@@ -6765,7 +6838,7 @@ option { background: var(--surface); color: var(--text); }
         ),
         h("span", { class: "tg" }, "Liquid at", minSel)
       );
-      status.textContent = done < names.size ? `prices ${done}/${names.size}` : `${fmtInt(rows.length)} items`;
+      status.textContent = loading ? `prices ${done}/${names.size}` : `${fmtInt(rows.length)} items`;
       let sepDone = false;
       const items = [];
       rows.forEach((r, i) => {
@@ -6828,6 +6901,7 @@ Click for the sales chart.` : r.name;
         h(
           "div",
           { class: "sum" },
+          verdictBox,
           h("div", { class: "grid" }, yourBox, bestBox),
           curOpen && curName ? h("div", { class: "curdetail" }, detail(curName, curMarket, basis, 388)) : null,
           tools

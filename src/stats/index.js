@@ -9,4 +9,4 @@ export { mysteryStats } from './mystery.js';
 export { moneyFlow } from './money.js';
 export { caseOdds } from './caseodds.js';
 export { wilson, normalCdf, holm, chiSquareSf, fSf } from './math.js';
-export { rankCandidates, sellValue } from './exchange.js';
+export { rankCandidates, sellValue, replaceVerdict } from './exchange.js';

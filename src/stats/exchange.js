@@ -57,3 +57,41 @@ export function rankCandidates(candidates, lookup, opts = {}) {
   });
   return rows;
 }
+
+/**
+ * @typedef {{
+ *   kind: 'replace'|'keep'|'even'|'unknown',
+ *   reason: 'value'|'liquidity'|'no-liquid'|'no-current'|'close',
+ *   best: ExchangeRow|null,
+ *   delta: number|null,
+ *   margin: number|null,
+ *   currentLiquid: boolean,
+ * }} Verdict
+ */
+
+/**
+ * Whether swapping is worth it: compares the best liquid offer (by sell value) against the item being replaced.
+ * Differences inside the margin (2% of the current value, at least $0.10) count as even, since recent sale
+ * prices are noisy. When the current item itself does not sell (under minSales), an even or better liquid
+ * offer is worth taking for liquidity alone.
+ * @param {ExchangeRow[]} rows from rankCandidates (same basis as currentSell)
+ * @param {number|null} currentSell
+ * @param {{sales30d?: number}|null} currentMarket
+ * @param {{minSales?: number}} [opts]
+ * @returns {Verdict}
+ */
+export function replaceVerdict(rows, currentSell, currentMarket, opts = {}) {
+  const minSales = opts.minSales ?? 3;
+  const liquid = (Array.isArray(rows) ? rows : []).filter((r) => r.liquid && typeof r.sell === 'number');
+  const best = liquid.reduce((a, r) => (!a || r.sell > a.sell ? r : a), null);
+  const currentLiquid = !!currentMarket && (currentMarket.sales30d ?? 0) >= minSales;
+  const out = (kind, reason, delta = null, margin = null) => ({ kind, reason, best, delta, margin, currentLiquid });
+  if (typeof currentSell !== 'number' || !Number.isFinite(currentSell)) return out('unknown', 'no-current');
+  if (!best) return out('keep', 'no-liquid');
+  const delta = best.sell - currentSell;
+  const margin = Math.max(0.1, currentSell * 0.02);
+  if (delta > margin) return out('replace', 'value', delta, margin);
+  if (!currentLiquid && delta >= -margin) return out('replace', 'liquidity', delta, margin);
+  if (delta < -margin) return out('keep', 'value', delta, margin);
+  return out('even', 'close', delta, margin);
+}
