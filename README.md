@@ -40,16 +40,6 @@ and shows:
   confirm on the site. Only the 50 items the site offers are ranked. Float and stickers change a real item's price,
   so check the listing.
 
-- Pulse tab (optional, off by default): how much players across the site get back right now, compared with a few
-  hours ago. A collector, switched on in the Pulse tab of one browser, finds active players in the live-drop feed and
-  reads their recent upgrades and case drops through the site's profile endpoints, then follows them for up to two
-  hours. The tab shows return per 1 staked for the last hour against the 3 hours before (with a significance test),
-  an hourly chart with 95% ranges, and the site's own counters of case opens and upgrades per minute. The feed wins
-  that brought a player in are left out. Players are stored only as a salted hash. The collector sends about one
-  request every 4 seconds with the signed-in account's login, so run it only on an account you can lose: the site can
-  see it and may limit or ban that account. It pauses on HTTP 429 and stops on 401/403. With cloud sync on, its rows go
-  to the cloud and every browser with the same sync key shows them.
-
 All data stays in your browser (IndexedDB on the site's origin, plus Tampermonkey's own script storage). The only outside request is to CSFloat's
 public sales history, and it sends only item names (no cookies, nothing about you). Prices are cached for 6 hours.
 The script only reads the site's API responses; it never changes requests or places bets.
@@ -95,6 +85,13 @@ in, unless "Stay unlocked while … is signed in" is ticked; "Lock now" undoes t
 password is built in and stored only as a salted PBKDF2 hash (`OWNER_LOCK` in `src/store/lock.js`). The lock only
 hides data in the tracker's panels: the events are not encrypted, and anyone with the browser's developer tools can
 still read them.
+
+## Pulse monitor
+
+`monitor/` is a separate tool, not part of the userscript: a Node service (or Docker container) that samples other
+players' recent upgrades and case drops and shows, on its own password-protected page, whether play on the site is
+more profitable now than a few hours ago. See `monitor/README.md`. The `pulse_*` tables in the Supabase migrations
+belong to an earlier version of it inside the userscript and are no longer used.
 
 ## Develop
 

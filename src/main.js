@@ -15,7 +15,6 @@ import { pickLegacyOwner, filterByAccount, resolveSelection, listAccounts, accou
 import { OWNER_LOCK, checkPassword, isGuest } from './store/lock.js';
 import * as stats from './stats/index.js';
 import { checkForUpdate, compareVersions } from './update.js';
-import { createPulse } from './pulse/index.js';
 import { mountDashboard, mountUpgradeOverlay, mountCasePanel, mountExchangePanel } from './ui/index.js';
 import { store as uiStore } from './ui/dom.js';
 
@@ -818,22 +817,6 @@ const { origFetch } = installHook(pageWindow, async (ex) => {
   }
 });
 
-// ---- Site pulse (see src/pulse/) ----
-// Samples other players' public history to show how profitable play on the site is right now.
-// Off unless switched on in the Pulse tab, in this browser and on this domain.
-const pulse = createPulse({
-  fetch: (...a) => origFetch(...a),
-  getAuth: () => getAuth(),
-  prefs: browserPrefs,
-  local: uiStore,
-  request: (req) => gmRequest(req),
-  cloudKey: () => cloudKey(),
-  requireOwner: () => requireOwner(),
-  onChange: () => {
-    if (uiStore.get('cst.ui.tab', null) === 'pulse') dashboard?.rerender();
-  },
-});
-
 function download(name, text, type) {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const a = document.createElement('a');
@@ -945,13 +928,7 @@ function mount() {
     setSetting: (key, value) => {
       if (key === 'upgradeOverlay') setUpgradeOverlay(!!value);
     },
-    pulse,
   });
-  pulse.boot();
-  // Keeps the Pulse tab current while it is open (the tab reloads its data when it is a minute old).
-  setInterval(() => {
-    if (uiStore.get('cst.ui.tab', null) === 'pulse') dashboard?.rerender();
-  }, 30 * 1000);
   setUpgradeOverlay(uiStore.get(OVERLAY_ON_KEY, true) !== false);
   mountCasePanel({
     getSlug: () => caseSlugFromPath(location.pathname),

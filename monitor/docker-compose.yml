@@ -1,0 +1,16 @@
+# Run from this folder:  docker compose up -d --build
+# Settings go in .env (copy .env.example). Logs: docker compose logs -f
+services:
+  pulse:
+    build: .
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - pulse-data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 256m
+
+volumes:
+  pulse-data:

@@ -1,7 +1,7 @@
-// Site pulse collector: samples other players' public history to measure how profitable play on
-// the site is right now. Runs in one browser tab, signed in to the account the user chose for it.
+// Collector: samples other players' public history to measure how profitable play on the site is
+// right now. Signed in to the account the user set aside for it (see site.js).
 //
-// One request at a time, at least `gapMs` apart (default 4 s, about 900 requests an hour):
+// One request at a time, at least `gapMs` apart (default 8 s, about 450 requests an hour):
 //   GET /api/live-drops          every 30 s   finds active players (it shows their big wins)
 //   GET /api/statistics          every 60 s   site-wide counters of case opens and upgrades
 //   GET /api/game/cases          once (and every 6 h) case prices
@@ -15,11 +15,10 @@
 // would start with a big win. What remains of their recent history is counted and marked `back`.
 // A player is followed for a fixed time after being found, the same for winners and losers.
 
-import { Context } from '../capture/parsers.js';
-import { upgradeRows, caseRows, feedDrops, volumeSample } from './rows.js';
+import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample } from './parse.js';
 
 export const DEFAULTS = {
-  gapMs: 4000,
+  gapMs: 8000,
   feedEveryMs: 30_000,
   statsEveryMs: 60_000,
   casesEveryMs: 6 * 60 * 60 * 1000,
@@ -58,7 +57,7 @@ const fatal = (e) => e instanceof HttpError && (e.status === 429 || e.status ===
  */
 export function createCollector({ getJson, hashUser, saveRows, saveVolume, now = Date.now, sleep, onChange, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
-  const ctx = new Context();
+  const prices = new CasePrices();
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
   const queue = []; // found, waiting for backfill: {id, skip: Set<item name>}
   const backfilled = new Map(); // site id -> when its backfill ran
@@ -127,7 +126,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
 
   async function readCases() {
     lastCases = now();
-    ctx.learn({ method: 'GET', path: '/game/cases', status: 200, resBody: await get('/api/game/cases') });
+    prices.learnList(await get('/api/game/cases'));
   }
 
   /** Loads prices of cases seen in drops but missing from the case list (at most 3 per page). */
@@ -136,7 +135,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     for (const slug of missing) {
       triedSlugs.add(slug);
       try {
-        ctx.learn({ method: 'GET', path: `/game/cases/${slug}`, status: 200, resBody: await get(`/api/game/cases/${encodeURIComponent(slug)}`) });
+        prices.learnOne(await get(`/api/game/cases/${encodeURIComponent(slug)}`));
       } catch (e) {
         if (fatal(e)) throw e;
       }
@@ -150,11 +149,11 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     const base = stream === 'upgrade' ? `/api/game/upgrade/public-history/${enc}` : `/api/users/${enc}/inventory/history`;
     const body = await get(`${base}?limit=${opt.pageSize}&offset=${page * opt.pageSize}`);
     const pageLen = Array.isArray(body?.items) ? body.items.length : 0;
-    if (stream === 'upgrade') return { parse: (extra) => upgradeRows(body, ctx, u, extra), pageLen };
+    if (stream === 'upgrade') return { parse: (extra) => upgradeRows(body, u, extra), pageLen };
     const unknownSlugs = new Set();
-    caseRows(body, ctx, u, { unknownSlugs });
+    caseRows(body, prices, u, { unknownSlugs });
     if (unknownSlugs.size) await learnCases(unknownSlugs);
-    return { parse: (extra) => caseRows(body, ctx, u, extra), pageLen };
+    return { parse: (extra) => caseRows(body, prices, u, extra), pageLen };
   }
 
   function record(rows, back) {

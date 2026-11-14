@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse monitor</title>
+<style>
+  :root {
+    --bg: #0f1114;
+    --panel: #15181c;
+    --line: #22272e;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --faint: #6b7480;
+    --pos: #45c486;
+    --neg: #ef6b6b;
+    --accent: #7ea6f6;
+    --warn: #d8a650;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; margin-bottom: 20px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; font-weight: 600; margin: 0 0 10px; color: var(--text); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); }
+  .hint { color: var(--faint); font-size: 12.5px; margin: 10px 0 0; }
+  .warn { color: var(--warn); }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  .num { font-variant-numeric: tabular-nums; }
+  .verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .verdicts section { margin: 0; border-left-width: 3px; }
+  .verdicts .good { border-left-color: var(--pos); }
+  .verdicts .bad { border-left-color: var(--neg); }
+  .verdicts .neutral { border-left-color: var(--line); }
+  .headline { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .kpi .k { color: var(--muted); font-size: 12.5px; }
+  .kpi .v { font-size: 22px; font-weight: 600; }
+  .kpi .s { color: var(--faint); font-size: 12.5px; }
+  .chart svg { display: block; width: 100%; height: auto; }
+  .chart text { fill: var(--faint); font-size: 11px; font-family: inherit; }
+  .readout { min-height: 21px; font-size: 13px; margin-bottom: 6px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left; }
+  td .ci { display: block; color: var(--faint); font-size: 11.5px; }
+  #error { display: none; border-color: var(--neg); color: var(--neg); }
+  .fade { animation: fade 160ms ease-out; }
+  @keyframes fade { from { opacity: 0.4; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .fade { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Pulse monitor</h1>
+    <span id="updated" class="faint">Loading…</span>
+  </header>
+  <section id="error"></section>
+  <div id="app"></div>
+</main>
+<script>
+'use strict';
+const COLORS = { line: '#7ea6f6', grid: '#22272e', zero: '#3a414b', pos: '#45c486', neg: '#ef6b6b', whisker: '#c3c8cf', marker: '#e6e8eb', diag: '#6b7480', bg: '#15181c' };
+const DASH = '–';
+const ok = (v) => typeof v === 'number' && Number.isFinite(v);
+const fmt = (v, d = 0) => (ok(v) ? v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) : DASH);
+const fmtR = (v) => fmt(v, 3);
+const fmtInt = (v) => fmt(v, 0);
+const fmtTime = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const fmtAgo = (t) => {
+  const s = Math.round((Date.now() - t) / 1000);
+  return s < 60 ? `${s} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+};
+const sign = (v) => (!ok(v) ? 'faint' : v > 1e-9 ? 'pos' : v < -1e-9 ? 'neg' : '');
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'text') el.textContent = v;
+    else if (k === 'class') el.className = Array.isArray(v) ? v.filter(Boolean).join(' ') : v;
+    else el.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null) el.append(c);
+  return el;
+}
+function s(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'text') el.textContent = v;
+    else el.setAttribute(k, v);
+  }
+  return el;
+}
+
+function niceTicks(min, max, count = 4) {
+  if (min === max) { const d = Math.abs(min) || 1; min -= d; max += d; }
+  const raw = (max - min) / count;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / p;
+  const step = (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+  const lo = Math.floor(min / step) * step;
+  const hi = Math.ceil(max / step) * step;
+  const ticks = [];
+  for (let v = lo; v <= hi + step / 2; v += step) ticks.push(Math.abs(v) < step / 1e6 ? 0 : v);
+  return { lo, hi, ticks };
+}
+
+const VERDICT = { better: ['good', 'Higher now'], worse: ['bad', 'Lower now'], same: ['neutral', 'No clear change'], few: ['neutral', 'Not enough data yet'] };
+
+function verdictCard(label, c) {
+  const [cls, word] = VERDICT[c.verdict] || VERDICT.few;
+  const r = c.recent, b = c.base;
+  const detail = c.verdict === 'few'
+    ? `Needs at least 30 ${label.toLowerCase()} from 5 or more players in each window. Last hour: ${fmtInt(r.n)} from ${fmtInt(r.players)} players; the 3 hours before: ${fmtInt(b.n)}.`
+    : `Players got back ${fmtR(r.ratio)} per 1 staked in the last hour (${fmtInt(r.n)} from ${fmtInt(r.players)} players), against ${fmtR(b.ratio)} in the 3 hours before (${fmtInt(b.n)}). ${c.verdict === 'same' ? 'The difference is within random noise' : 'The difference is too large to be luck'} (p = ${ok(c.p) ? fmt(c.p, 3) : DASH}).`;
+  return h('section', { class: cls }, h('div', { class: 'headline', text: `${label}: ${word}` }), h('div', { class: 'muted', text: detail }));
+}
+
+function kpi(k, v, sub) {
+  return h('div', { class: 'kpi' }, h('div', { class: 'k', text: k }), h('div', { class: 'v num', text: v }), sub ? h('div', { class: 's', text: sub }) : null);
+}
+
+function chart({ hours, compare, windows, now, width, what }) {
+  const hourMs = 3600000;
+  const W = Math.max(260, Math.floor(width));
+  const H = 200, padL = 40, padR = 10, padT = 10, padB = 22;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const t0 = hours.length ? hours[0].start : now - 12 * hourMs;
+  const t1 = now;
+  // The range follows reliable hours and the two window bands; thin hours are clipped to it.
+  const vals = [1];
+  for (const x of hours) if (ok(x.r?.ratio) && x.r.ci && x.r.n >= 20) vals.push(x.r.ratio);
+  for (const k of ['recent', 'base']) { const r = compare?.[k]; if (ok(r?.ratio)) vals.push(r.ratio, ...(r.ci || [])); }
+  const clipped = vals.filter(ok).map((v) => Math.max(0, Math.min(3, v)));
+  const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
+  const x = (t) => padL + ((Math.max(t0, Math.min(t1, t)) - t0) / (t1 - t0 || 1)) * iw;
+  const y = (v) => padT + ih - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1)) * ih;
+
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `Return per 1 staked on ${what} by hour, with the last hour and the 3 hours before it as bands.` });
+  for (const v of ticks) {
+    const yy = Math.round(y(v)) + 0.5;
+    svg.append(s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid }), s('text', { x: padL - 6, y: yy + 3.5, 'text-anchor': 'end', text: fmt(v, v % 1 ? 2 : 1) }));
+  }
+  for (let t = Math.ceil(t0 / (3 * hourMs)) * 3 * hourMs; t <= t1; t += 3 * hourMs) {
+    const xx = Math.round(x(t)) + 0.5;
+    svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih, stroke: COLORS.grid }));
+    // A label too close to an edge would be cut off.
+    if (xx > padL + 24 && xx < W - padR - 24) svg.append(s('text', { x: xx, y: padT + ih + 14, 'text-anchor': 'middle', text: fmtTime(t) }));
+  }
+  const yb = Math.round(y(1)) + 0.5;
+  svg.append(s('line', { x1: padL, x2: W - padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+
+  const verdictColor = compare?.verdict === 'better' ? COLORS.pos : compare?.verdict === 'worse' ? COLORS.neg : COLORS.line;
+  for (const [k, color] of [['base', COLORS.whisker], ['recent', verdictColor]]) {
+    const r = compare?.[k], win = windows?.[k];
+    if (!win || !ok(r?.ratio)) continue;
+    const xa = x(win.from), xb = x(Math.min(win.to, t1));
+    if (r.ci) { const ya = y(r.ci[1]); svg.append(s('rect', { x: xa, y: ya, width: Math.max(1, xb - xa), height: Math.max(1, y(r.ci[0]) - ya), fill: color, 'fill-opacity': 0.14 })); }
+    svg.append(s('line', { x1: xa, x2: xb, y1: y(r.ratio), y2: y(r.ratio), stroke: color, 'stroke-width': 2 }));
+  }
+
+  const marks = [];
+  for (const row of hours) {
+    const r = row.r;
+    if (!r || !r.n || !ok(r.ratio)) continue;
+    const cx = x(row.start + hourMs / 2);
+    if (r.ci) svg.append(s('line', { x1: cx, x2: cx, y1: y(r.ci[0]), y2: y(r.ci[1]), stroke: COLORS.zero }));
+    svg.append(s('circle', { cx, cy: y(r.ratio), r: 3, fill: r.ci ? COLORS.line : COLORS.bg, stroke: COLORS.line, 'stroke-width': 1.5 }));
+    marks.push({ cx, row });
+  }
+
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap an hour for details. Hollow dots: fewer than 5 players.' : 'No hourly data yet.' }));
+  idle();
+  if (marks.length) {
+    const ring = s('circle', { r: 6, fill: 'none', stroke: COLORS.marker, visibility: 'hidden' });
+    const hit = s('rect', { x: padL, y: padT, width: iw, height: ih, fill: 'transparent' });
+    svg.append(ring, hit);
+    const move = (e) => {
+      const box = svg.getBoundingClientRect();
+      const px = ((e.clientX - box.left) / (box.width || 1)) * W;
+      let best = marks[0];
+      for (const m of marks) if (Math.abs(m.cx - px) < Math.abs(best.cx - px)) best = m;
+      const r = best.row.r;
+      ring.setAttribute('cx', best.cx);
+      ring.setAttribute('cy', y(r.ratio));
+      ring.setAttribute('visibility', 'visible');
+      readout.replaceChildren(`${fmtTime(best.row.start)}: `, h('span', { class: ['num', sign(r.ratio - 1)], text: fmtR(r.ratio) }),
+        h('span', { class: 'faint', text: `  ${r.ci ? `range ${fmtR(r.ci[0])}–${fmtR(r.ci[1])}, ` : ''}${fmtInt(r.n)} ${what}, ${fmtInt(r.players)} players` }));
+    };
+    hit.addEventListener('pointermove', move);
+    hit.addEventListener('pointerdown', move);
+    hit.addEventListener('pointerleave', () => { ring.setAttribute('visibility', 'hidden'); idle(); });
+  }
+  return h('div', { class: 'chart' }, readout, svg);
+}
+
+function ratioCell(r) {
+  return h('td', { class: 'num' }, h('span', { class: ok(r?.ratio) ? sign(r.ratio - 1) : 'faint', text: fmtR(r?.ratio) }), r?.ci ? h('span', { class: 'ci', text: `${fmtR(r.ci[0])} ${DASH} ${fmtR(r.ci[1])}` }) : null);
+}
+
+function statusText(st, info) {
+  if (st.pausedUntil) return `Paused by the site until ${fmtTime(st.pausedUntil)}.`;
+  if (!st.running) return `Stopped: ${st.error || 'not running'}`;
+  return `Running since ${new Date(info.startedAt).toLocaleString()}. In the last hour: ${fmtInt(st.rowsLastHour)} rows (${fmtInt(st.backRowsLastHour)} from players’ recent history), ${fmtInt(st.requestsLastHour)} requests. ${fmtInt(st.recentPlayers)} players read in the last 2 hours, ${fmtInt(st.players)} followed now, ${fmtInt(st.queued)} waiting.`;
+}
+
+let last = null;
+function render() {
+  if (!last) return;
+  const { summary: sm, status: st, info } = last;
+  const app = document.getElementById('app');
+  const width = Math.min(app.clientWidth || 900, 928) - 34;
+  const out = [];
+  out.push(h('div', { class: 'verdicts' }, verdictCard('Upgrades', sm.compare.upgrade), verdictCard('Cases', sm.compare.case)));
+  const v = sm.volume;
+  out.push(h('section', null, h('h2', { text: 'Last hour against the 3 hours before' }),
+    h('div', { class: 'kpis' },
+      kpi('Upgrades, return per 1', fmtR(sm.compare.upgrade.recent.ratio), `before ${fmtR(sm.compare.upgrade.base.ratio)}`),
+      kpi('Cases, return per 1', fmtR(sm.compare.case.recent.ratio), `before ${fmtR(sm.compare.case.base.ratio)}`),
+      kpi('Site upgrades / min', fmtInt(v.recent.upgradesPerMin), `before ${fmtInt(v.base.upgradesPerMin)}`),
+      kpi('Site case opens / min', fmtInt(v.recent.casesPerMin), `before ${fmtInt(v.base.casesPerMin)}`)),
+    h('p', { class: 'hint', text: 'Return per 1 is total value received divided by total staked, over every sampled upgrade or case open. 1.000 means players broke even at site prices. The site-wide rates come from the site’s public counters.' })));
+
+  const oldestFirst = [...sm.hours].reverse().slice(-12);
+  for (const [kind, label, what] of [['upgrade', 'Upgrades', 'upgrades'], ['case', 'Cases', 'case opens']]) {
+    out.push(h('section', null, h('h2', { text: `${label}: return per 1 staked by hour, last 12 hours` }),
+      chart({ hours: oldestFirst.map((r) => ({ start: r.start, r: r[kind] })), compare: sm.compare[kind], windows: sm.windows, now: sm.now, width, what }),
+      kind === 'case' ? h('p', { class: 'hint', text: 'Dots are hours with their 95% range; hollow dots have too few players for a range. The bands are the last hour (right) and the 3 hours before it, each with its 95% range: when the bands overlap a lot, the change is noise. The dashed line at 1 is break-even at site prices.' }) : null));
+  }
+
+  const rows = sm.hours.filter((r) => r.upgrade.n || r.case.n || ok(r.volume.casesPerMin));
+  out.push(h('section', null, h('h2', { text: 'By hour, last 24 hours' }),
+    rows.length
+      ? h('div', { class: 'table-wrap' }, h('table', null,
+          h('thead', null, h('tr', null, ...['Hour', 'Upgrades', 'Return', 'Cases', 'Return', 'Staked', 'Site / min', 'Online'].map((t) => h('th', { text: t })))),
+          h('tbody', null, rows.map((r) => h('tr', null,
+            h('td', { class: 'num', text: fmtTime(r.start) }),
+            h('td', { class: 'num', text: fmtInt(r.upgrade.n) }), ratioCell(r.upgrade),
+            h('td', { class: 'num', text: fmtInt(r.case.n) }), ratioCell(r.case),
+            h('td', { class: 'num', text: fmt(r.upgrade.staked + r.case.staked, 0) }),
+            h('td', { class: 'num', text: ok(r.volume.upgradesPerMin) ? `${fmtInt(r.volume.upgradesPerMin)} / ${fmtInt(r.volume.casesPerMin)}` : DASH }),
+            h('td', { class: 'num', text: fmtInt(r.volume.online) }))))))
+      : h('p', { class: 'muted', text: 'Nothing collected in the last 24 hours.' }),
+    h('p', { class: 'hint', text: 'Return: second line is the 95% range, clustered by player. Site / min: site-wide upgrades / case opens per minute.' })));
+
+  out.push(h('section', null, h('h2', { text: 'Collector' }),
+    h('p', { class: st.running && !st.pausedUntil ? 'muted' : 'warn', text: statusText(st, info) }),
+    st.error && st.running ? h('p', { class: 'warn', text: `Last error: ${st.error}` }) : null,
+    h('p', { class: 'faint', text: `${info.base}, one request every ${info.gapMs / 1000} s. ${fmtInt(info.stored)} rows from the last 26 hours in memory. Version ${info.version}.` }),
+    h('p', { class: 'hint', text: 'How it samples: players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their latest page of upgrades and case drops is read at once, leaving out the feed wins that found them. Then they are followed for up to 2 hours for new rows, the same for winners and losers. Players still playing now are more likely to be found, so the earlier hours come from people who kept going. Players are stored as a salted hash, never by name.' })));
+  app.replaceChildren(...out);
+}
+
+async function load() {
+  const err = document.getElementById('error');
+  try {
+    const res = await fetch('api/summary', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`The monitor answered ${res.status}`);
+    const first = !last;
+    last = await res.json();
+    err.style.display = 'none';
+    render();
+    if (first) document.getElementById('app').classList.add('fade');
+    document.getElementById('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    err.textContent = `Could not load the numbers: ${e.message}. Retrying.`;
+    err.style.display = 'block';
+  }
+}
+load();
+setInterval(load, 30000);
+let resizeTimer = null;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
+</script>
+</body>
+</html>

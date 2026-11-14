@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.10.0
+// @version      0.11.0
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -302,9 +302,9 @@
   }
   function parseWithdrawalRequest(ex, ctx2, site2) {
     if (ex.status >= 400) return [];
-    const req3 = obj(ex.reqBody) ?? {};
+    const req2 = obj(ex.reqBody) ?? {};
     const ids = [];
-    for (const [k, v] of Object.entries(req3)) {
+    for (const [k, v] of Object.entries(req2)) {
       if (!/item/i.test(k)) continue;
       for (const x of Array.isArray(v) ? v : [v]) if (typeof x === "string" || typeof x === "number") ids.push(x);
     }
@@ -389,13 +389,13 @@
     if (ex.status >= 400) return null;
     const body = unwrap(ex.resBody);
     if (!obj(body)) return null;
-    const req3 = obj(ex.reqBody) ?? {};
+    const req2 = obj(ex.reqBody) ?? {};
     const ev = upgradeFromRecord(body, ctx2, site2, {
-      betItemIds: arr(req3.betInventoryItemIds).map(String),
-      addedBalance: req3.addedBalance,
-      targetItemId: req3.targetItemId,
-      mystery: req3.isMystery,
-      gameMode: req3.gameMode
+      betItemIds: arr(req2.betInventoryItemIds).map(String),
+      addedBalance: req2.addedBalance,
+      targetItemId: req2.targetItemId,
+      mystery: req2.isMystery,
+      gameMode: req2.gameMode
     });
     if (!ev) return null;
     ev.ts = Date.now();
@@ -1004,9 +1004,9 @@
     open() {
       if (!this.dbPromise) {
         this.dbPromise = new Promise((resolve, reject) => {
-          const req3 = this.idb.open(DB_NAME, DB_VERSION);
-          req3.onupgradeneeded = () => {
-            const db = req3.result;
+          const req2 = this.idb.open(DB_NAME, DB_VERSION);
+          req2.onupgradeneeded = () => {
+            const db = req2.result;
             if (!db.objectStoreNames.contains("events")) {
               const s2 = db.createObjectStore("events", { keyPath: "id" });
               s2.createIndex("ts", "ts");
@@ -1014,8 +1014,8 @@
             if (!db.objectStoreNames.contains("raw")) db.createObjectStore("raw", { autoIncrement: true });
             if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
           };
-          req3.onsuccess = () => resolve(req3.result);
-          req3.onerror = () => reject(req3.error);
+          req2.onsuccess = () => resolve(req2.result);
+          req2.onerror = () => reject(req2.error);
         });
       }
       return this.dbPromise;
@@ -2781,741 +2781,6 @@
     return { latest, newer: compareVersions(latest, current) > 0, checkedAt: Date.now() };
   }
 
-  // src/pulse/rows.js
-  var obj4 = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : null;
-  var arr3 = (v) => Array.isArray(v) ? v : [];
-  function upgradeRows(body, ctx2, u, { skip, back = false } = {}) {
-    const out = [];
-    for (const r of upgradeHistoryRows(body)) {
-      const e = upgradeFromRecord(r, ctx2, "");
-      if (!e || e.status === "pending" || !(e.stake > 0) || !e.ts) continue;
-      if (skip?.size && e.won && (skip.has(e.target?.name) || skip.has(e.superDrop?.item?.name))) continue;
-      out.push({ id: e.id, kind: "upgrade", ts: e.ts, u, stake: e.stake, returned: e.returned, chance: e.chanceShown ?? null, back });
-    }
-    return out;
-  }
-  function caseRows(body, ctx2, u, { unknownSlugs, skip, back = false } = {}) {
-    const out = [];
-    for (const r of historyRows(body)) {
-      if (obj4(r)?.action !== "won_case") continue;
-      const e = caseFromInventoryRecord(r, ctx2, "");
-      if (!e) {
-        const slug = obj4(obj4(r.source)?.case)?.slug;
-        if (slug && unknownSlugs) unknownSlugs.add(String(slug));
-        continue;
-      }
-      if (skip?.size && skip.has(e.item.name)) continue;
-      out.push({ id: e.id, kind: "case", ts: e.ts, u, stake: e.casePrice, returned: e.item.price, chance: null, back });
-    }
-    return out;
-  }
-  function feedDrops(body) {
-    const o = obj4(body) ?? {};
-    const out = /* @__PURE__ */ new Map();
-    for (const d of [...arr3(o.liveDrops), ...arr3(o.hotDrops), ...arr3(o.items)]) {
-      const id = obj4(obj4(d)?.user)?.id;
-      if (id == null || !/^[A-Za-z0-9_-]{1,64}$/.test(String(id))) continue;
-      const name = obj4(d.item)?.marketName ?? obj4(d.item)?.name;
-      if (!out.has(String(id))) out.set(String(id), /* @__PURE__ */ new Set());
-      if (typeof name === "string") out.get(String(id)).add(name);
-    }
-    return out;
-  }
-  function volumeSample(body, ts) {
-    const o = obj4(body);
-    if (!o || o.cases_opened == null || o.upgrader_count == null) return null;
-    return { ts, cases: num(o.cases_opened), upgrades: num(o.upgrader_count), online: num(o.online) };
-  }
-  async function hashUser(id, salt, subtle = globalThis.crypto?.subtle) {
-    const data = new TextEncoder().encode(`${salt}:${id}`);
-    const buf = await subtle.digest("SHA-256", data);
-    return [...new Uint8Array(buf)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  // src/pulse/collector.js
-  var DEFAULTS = {
-    gapMs: 4e3,
-    feedEveryMs: 3e4,
-    statsEveryMs: 6e4,
-    casesEveryMs: 6 * 60 * 60 * 1e3,
-    profileEveryMs: 90 * 1e3,
-    // one stream per turn, so each stream about every 3 min
-    watchMs: 2 * 60 * 60 * 1e3,
-    // follow time after a player is found; no second backfill within it
-    idleDropMs: 40 * 60 * 1e3,
-    // stop following a player with no new rows for this long
-    backfillMs: 24 * 60 * 60 * 1e3,
-    // backfill keeps rows this recent
-    maxPlayers: 30,
-    // followed at once
-    maxQueue: 40,
-    // found players waiting for their backfill (oldest dropped first)
-    backfillsPerFollow: 2,
-    // when both are waiting: this many backfills, then one follow poll
-    pageSize: 50,
-    maxPages: 3,
-    // per stream per follow poll, only when every row on a page is new
-    backoffMs: 5 * 60 * 1e3,
-    maxBackoffMs: 30 * 60 * 1e3
-  };
-  var HttpError = class extends Error {
-    constructor(status, path) {
-      super(`HTTP ${status} for ${path}`);
-      this.status = status;
-    }
-  };
-  var fatal = (e) => e instanceof HttpError && (e.status === 429 || e.status === 401 || e.status === 403);
-  function createCollector({ getJson: getJson2, hashUser: hashUser2, saveRows, saveVolume, now = Date.now, sleep: sleep3, onChange, options = {} }) {
-    const opt = { ...DEFAULTS, ...options };
-    const ctx2 = new Context();
-    const players = /* @__PURE__ */ new Map();
-    const queue = [];
-    const backfilled = /* @__PURE__ */ new Map();
-    const triedSlugs = /* @__PURE__ */ new Set();
-    let running = false;
-    let wake = null;
-    let lastFeed = -Infinity;
-    let lastStats = -Infinity;
-    let lastCases = -Infinity;
-    let pausedUntil = 0;
-    let backoff = opt.backoffMs;
-    let backfillRun = 0;
-    let error = null;
-    const requests = [];
-    const counted = [];
-    const doSleep = sleep3 ?? ((ms) => new Promise((resolve) => {
-      const t = setTimeout(resolve, ms);
-      wake = () => {
-        clearTimeout(t);
-        resolve();
-      };
-    }));
-    const changed = () => {
-      try {
-        onChange?.();
-      } catch {
-      }
-    };
-    async function get(path) {
-      requests.push(now());
-      return getJson2(path);
-    }
-    function trim() {
-      const t = now();
-      const cut = t - 60 * 60 * 1e3;
-      while (requests.length && requests[0] < cut) requests.shift();
-      while (counted.length && counted[0][0] < cut) counted.shift();
-      for (const [id, p] of players) if (t - p.added > opt.watchMs || t - p.lastRow > opt.idleDropMs) players.delete(id);
-      for (const [id, at] of backfilled) if (t - at > opt.watchMs) backfilled.delete(id);
-    }
-    async function readFeed() {
-      lastFeed = now();
-      for (const [id, skip] of feedDrops(await get("/api/live-drops"))) {
-        if (players.has(id) || backfilled.has(id)) continue;
-        const waiting = queue.find((q) => q.id === id);
-        if (waiting) {
-          for (const n of skip) waiting.skip.add(n);
-          continue;
-        }
-        queue.push({ id, skip });
-        if (queue.length > opt.maxQueue) queue.shift();
-      }
-    }
-    async function readStats() {
-      lastStats = now();
-      const s2 = volumeSample(await get("/api/statistics"), now());
-      if (s2) await saveVolume(s2);
-    }
-    async function readCases() {
-      lastCases = now();
-      ctx2.learn({ method: "GET", path: "/game/cases", status: 200, resBody: await get("/api/game/cases") });
-    }
-    async function learnCases(slugs) {
-      const missing = [...slugs].filter((s2) => !triedSlugs.has(s2)).slice(0, 3);
-      for (const slug of missing) {
-        triedSlugs.add(slug);
-        try {
-          ctx2.learn({ method: "GET", path: `/game/cases/${slug}`, status: 200, resBody: await get(`/api/game/cases/${encodeURIComponent(slug)}`) });
-        } catch (e) {
-          if (fatal(e)) throw e;
-        }
-      }
-      return missing.length > 0;
-    }
-    async function readPage(id, u, stream, page) {
-      const enc = encodeURIComponent(id);
-      const base = stream === "upgrade" ? `/api/game/upgrade/public-history/${enc}` : `/api/users/${enc}/inventory/history`;
-      const body = await get(`${base}?limit=${opt.pageSize}&offset=${page * opt.pageSize}`);
-      const pageLen = Array.isArray(body?.items) ? body.items.length : 0;
-      if (stream === "upgrade") return { parse: (extra) => upgradeRows(body, ctx2, u, extra), pageLen };
-      const unknownSlugs = /* @__PURE__ */ new Set();
-      caseRows(body, ctx2, u, { unknownSlugs });
-      if (unknownSlugs.size) await learnCases(unknownSlugs);
-      return { parse: (extra) => caseRows(body, ctx2, u, extra), pageLen };
-    }
-    function record(rows, back) {
-      if (rows.length) counted.push([now(), rows.length, back]);
-    }
-    async function backfill({ id, skip }) {
-      const u = await hashUser2(id);
-      const seen = { upgrade: /* @__PURE__ */ new Set(), case: /* @__PURE__ */ new Set() };
-      const cut = now() - opt.backfillMs;
-      const keep = [];
-      for (const stream of ["upgrade", "case"]) {
-        const { parse } = await readPage(id, u, stream, 0);
-        for (const r of parse({})) seen[stream].add(r.id);
-        keep.push(...parse({ skip, back: true }).filter((r) => r.ts >= cut));
-        if (stream === "upgrade") await doSleep(opt.gapMs);
-      }
-      backfilled.set(id, now());
-      if (keep.length) {
-        record(keep, true);
-        await saveRows(keep);
-      }
-      if (players.size < opt.maxPlayers) players.set(id, { u, added: now(), lastPolled: now(), lastRow: now(), seen, nextStream: "upgrade" });
-    }
-    async function follow() {
-      const t = now();
-      let pick = null;
-      for (const [id2, p2] of players) {
-        if (t - p2.lastPolled < opt.profileEveryMs) continue;
-        if (!pick || p2.lastPolled < pick[1].lastPolled) pick = [id2, p2];
-      }
-      if (!pick) return false;
-      const [id, p] = pick;
-      const stream = p.nextStream;
-      const seen = p.seen[stream];
-      const fresh = [];
-      for (let page = 0; page < opt.maxPages; page++) {
-        const { parse, pageLen } = await readPage(id, p.u, stream, page);
-        const rows = parse({});
-        const news = rows.filter((r) => !seen.has(r.id));
-        for (const r of rows) seen.add(r.id);
-        fresh.push(...news);
-        if (news.length < rows.length || pageLen < opt.pageSize) break;
-      }
-      p.nextStream = stream === "upgrade" ? "case" : "upgrade";
-      p.lastPolled = now();
-      if (fresh.length) {
-        p.lastRow = now();
-        record(fresh, false);
-        await saveRows(fresh);
-      }
-      return true;
-    }
-    async function step() {
-      const t = now();
-      if (t - lastCases >= opt.casesEveryMs) return readCases();
-      if (t - lastFeed >= opt.feedEveryMs) return readFeed();
-      if (t - lastStats >= opt.statsEveryMs) return readStats();
-      if (queue.length && backfillRun < opt.backfillsPerFollow) {
-        backfillRun++;
-        return backfill(queue.shift());
-      }
-      backfillRun = 0;
-      if (await follow()) return;
-      if (queue.length) return backfill(queue.shift());
-    }
-    async function loop() {
-      while (running) {
-        trim();
-        const t = now();
-        if (pausedUntil > t) {
-          await doSleep(Math.min(pausedUntil - t, 6e4));
-          continue;
-        }
-        try {
-          await step();
-          backoff = opt.backoffMs;
-          error = null;
-        } catch (e) {
-          if (e instanceof HttpError && e.status === 429) {
-            pausedUntil = now() + backoff;
-            error = `The site asked to slow down (HTTP 429). Paused for ${Math.round(backoff / 6e4)} min.`;
-            backoff = Math.min(backoff * 2, opt.maxBackoffMs);
-          } else if (e instanceof HttpError && (e.status === 401 || e.status === 403)) {
-            error = "The site refused the request (signed out?). Collector stopped.";
-            running = false;
-          } else {
-            error = String(e?.message ?? e);
-          }
-        }
-        changed();
-        if (running) await doSleep(opt.gapMs);
-      }
-      changed();
-    }
-    let loopPromise = null;
-    return {
-      start() {
-        if (running) return loopPromise;
-        running = true;
-        error = null;
-        loopPromise = loop();
-        changed();
-        return loopPromise;
-      },
-      stop() {
-        running = false;
-        wake?.();
-        changed();
-        return loopPromise;
-      },
-      status() {
-        trim();
-        return {
-          running,
-          players: players.size,
-          queued: queue.length,
-          recentPlayers: backfilled.size,
-          // players whose history was read in the last watchMs
-          requestsLastHour: requests.length,
-          rowsLastHour: counted.reduce((s2, [, n]) => s2 + n, 0),
-          backRowsLastHour: counted.reduce((s2, [, n, b]) => s2 + (b ? n : 0), 0),
-          pausedUntil: pausedUntil > now() ? pausedUntil : null,
-          error
-        };
-      }
-    };
-  }
-
-  // src/pulse/store.js
-  var DB_NAME2 = "caser-pulse";
-  var DB_VERSION2 = 1;
-  var KEEP_MS = 7 * 24 * 60 * 60 * 1e3;
-  var req2 = (r) => new Promise((resolve, reject) => {
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-  function createPulseStore(idb) {
-    let dbp = null;
-    const open = () => dbp ??= new Promise((resolve, reject) => {
-      const r = idb.open(DB_NAME2, DB_VERSION2);
-      r.onupgradeneeded = () => {
-        const db = r.result;
-        if (!db.objectStoreNames.contains("rows")) db.createObjectStore("rows", { keyPath: "id" }).createIndex("ts", "ts");
-        if (!db.objectStoreNames.contains("volume")) db.createObjectStore("volume", { keyPath: "ts" });
-      };
-      r.onsuccess = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
-    });
-    async function tx(stores, mode, fn) {
-      const db = await open();
-      return new Promise((resolve, reject) => {
-        const t = db.transaction(stores, mode);
-        let out;
-        Promise.resolve(fn(t)).then((v) => out = v, reject);
-        t.oncomplete = () => resolve(out);
-        t.onerror = () => reject(t.error);
-        t.onabort = () => reject(t.error);
-      });
-    }
-    return {
-      /** Adds rows not stored yet. Returns how many were new. */
-      putRows(rows) {
-        return tx(["rows"], "readwrite", async (t) => {
-          const s2 = t.objectStore("rows");
-          let added = 0;
-          for (const r of rows) {
-            if (await req2(s2.getKey(r.id))) continue;
-            s2.put(r);
-            added++;
-          }
-          return added;
-        });
-      },
-      putVolume(sample) {
-        return tx(["volume"], "readwrite", (t) => void t.objectStore("volume").put(sample));
-      },
-      /** Rows and volume samples with ts >= since. */
-      async since(since) {
-        return tx(["rows", "volume"], "readonly", async (t) => ({
-          rows: await req2(t.objectStore("rows").index("ts").getAll(IDBKeyRange.lowerBound(since))),
-          volume: await req2(t.objectStore("volume").getAll(IDBKeyRange.lowerBound(since)))
-        }));
-      },
-      /** Deletes everything older than KEEP_MS. */
-      prune(now = Date.now()) {
-        const range2 = IDBKeyRange.upperBound(now - KEEP_MS, true);
-        return tx(["rows", "volume"], "readwrite", (t) => {
-          t.objectStore("volume").delete(range2);
-          const c = t.objectStore("rows").index("ts").openCursor(range2);
-          c.onsuccess = () => {
-            const cur = c.result;
-            if (cur) {
-              cur.delete();
-              cur.continue();
-            }
-          };
-        });
-      },
-      clear() {
-        return tx(["rows", "volume"], "readwrite", (t) => {
-          t.objectStore("rows").clear();
-          t.objectStore("volume").clear();
-        });
-      }
-    };
-  }
-
-  // src/pulse/stats.js
-  var HOUR = 60 * 60 * 1e3;
-  var Z952 = 1.959964;
-  var MIN_PLAYERS = 5;
-  function aggregate(rows, { from, to, bucketMs }) {
-    const buckets = /* @__PURE__ */ new Map();
-    for (const r of rows) {
-      if (!(r.ts >= from && r.ts < to) || !(r.stake > 0)) continue;
-      const bucket = from + Math.floor((r.ts - from) / bucketMs) * bucketMs;
-      const key = `${bucket}|${r.kind}`;
-      let b = buckets.get(key);
-      if (!b) buckets.set(key, b = { bucket, kind: r.kind, rows: [], byUser: /* @__PURE__ */ new Map() });
-      const x = r.stake;
-      const y = r.returned || 0;
-      b.rows.push([x, y]);
-      const g = b.byUser.get(r.u) ?? [0, 0];
-      g[0] += x;
-      g[1] += y;
-      b.byUser.set(r.u, g);
-    }
-    const out = [];
-    for (const b of buckets.values()) {
-      const a = { bucket: b.bucket, kind: b.kind, n: b.rows.length, players: b.byUser.size, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0, gxx: 0, gyy: 0, gxy: 0 };
-      for (const [x, y] of b.rows) {
-        a.sx += x;
-        a.sy += y;
-        a.sxx += x * x;
-        a.syy += y * y;
-        a.sxy += x * y;
-      }
-      for (const [x, y] of b.byUser.values()) {
-        a.gxx += x * x;
-        a.gyy += y * y;
-        a.gxy += x * y;
-      }
-      out.push(a);
-    }
-    return out.sort((p, q) => p.bucket - q.bucket || p.kind.localeCompare(q.kind));
-  }
-  function cleanAggregate(a) {
-    const n = (v) => v == null ? 0 : Number(v) || 0;
-    return {
-      bucket: n(a.bucket),
-      kind: String(a.kind),
-      n: n(a.n),
-      players: n(a.players),
-      sx: n(a.sx),
-      sy: n(a.sy),
-      sxx: n(a.sxx),
-      syy: n(a.syy),
-      sxy: n(a.sxy),
-      gxx: n(a.gxx),
-      gyy: n(a.gyy),
-      gxy: n(a.gxy)
-    };
-  }
-  function ratioOf(a) {
-    if (!a || !(a.sx > 0)) return { n: a?.n ?? 0, players: a?.players ?? 0, staked: 0, returned: 0, ratio: null, se: null, ci: null };
-    const R = a.sy / a.sx;
-    const G = a.players;
-    let se = null;
-    if (G >= MIN_PLAYERS) {
-      const ss = Math.max(0, a.gyy - 2 * R * a.gxy + R * R * a.gxx);
-      se = Math.sqrt(G / (G - 1) * ss) / a.sx;
-    }
-    return { n: a.n, players: G, staked: a.sx, returned: a.sy, ratio: R, se, ci: se == null ? null : [Math.max(0, R - Z952 * se), R + Z952 * se] };
-  }
-  function combine(aggs, kind) {
-    const out = { bucket: 0, kind, n: 0, players: 0, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0, gxx: 0, gyy: 0, gxy: 0 };
-    for (const a of aggs) {
-      if (a.kind !== kind) continue;
-      for (const k of ["n", "players", "sx", "sy", "sxx", "syy", "sxy", "gxx", "gyy", "gxy"]) out[k] += a[k];
-    }
-    return out;
-  }
-  var normCdf = (z) => {
-    const x = Math.abs(z) / Math.SQRT2;
-    const t = 1 / (1 + 0.3275911 * x);
-    const erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
-    return z >= 0 ? (1 + erf) / 2 : (1 - erf) / 2;
-  };
-  function compareRatios(recent, base, { minRows = 30 } = {}) {
-    const r = ratioOf(recent);
-    const b = ratioOf(base);
-    if (r.n < minRows || b.n < minRows || r.se == null || b.se == null) return { recent: r, base: b, diff: r.ratio != null && b.ratio != null ? r.ratio - b.ratio : null, z: null, p: null, verdict: "few" };
-    const diff = r.ratio - b.ratio;
-    const se = Math.sqrt(r.se * r.se + b.se * b.se);
-    const z = se > 0 ? diff / se : 0;
-    const p = 2 * (1 - normCdf(Math.abs(z)));
-    return { recent: r, base: b, diff, z, p, verdict: p < 0.05 ? diff > 0 ? "better" : "worse" : "same" };
-  }
-  function volumeRates(samples, { from, to }) {
-    const inWin = samples.filter((s2) => s2.ts >= from && s2.ts < to).sort((a, b) => a.ts - b.ts);
-    if (inWin.length < 2) return { samples: inWin.length, casesPerMin: null, upgradesPerMin: null, online: inWin[0]?.online ?? null };
-    const first = inWin[0];
-    const last = inWin[inWin.length - 1];
-    const min = (last.ts - first.ts) / 6e4;
-    const rate = (k) => min > 0 && last[k] >= first[k] ? (last[k] - first[k]) / min : null;
-    const online = inWin.reduce((s2, x) => s2 + (x.online || 0), 0) / inWin.length;
-    return { samples: inWin.length, casesPerMin: rate("cases"), upgradesPerMin: rate("upgrades"), online };
-  }
-  function pulseWindows(now) {
-    return {
-      recent: { from: now - HOUR, to: now + 1 },
-      base: { from: now - 4 * HOUR, to: now - HOUR },
-      day: { from: now - 24 * HOUR, to: now + 1 },
-      // Hourly buckets aligned to the clock, the current (partial) hour last.
-      hours: { from: Math.floor(now / HOUR) * HOUR - 23 * HOUR, to: Math.floor(now / HOUR) * HOUR + HOUR, bucketMs: HOUR }
-    };
-  }
-  function pulseSummary(aggs, samples, now) {
-    const w = pulseWindows(now);
-    const kinds = ["upgrade", "case"];
-    const compare = {};
-    for (const k of kinds) compare[k] = compareRatios(combine(aggs.recent, k), combine(aggs.base, k));
-    const day = {};
-    for (const k of kinds) day[k] = ratioOf(combine(aggs.day, k));
-    const hours = [];
-    for (let t = w.hours.from; t < w.hours.to; t += HOUR) {
-      const row = { start: t };
-      for (const k of kinds) row[k] = ratioOf(aggs.hours.find((a) => a.bucket === t && a.kind === k));
-      row.volume = volumeRates(samples, { from: t, to: t + HOUR });
-      hours.push(row);
-    }
-    return {
-      now,
-      windows: { recent: w.recent, base: w.base },
-      compare,
-      day,
-      hours: hours.reverse(),
-      volume: { recent: volumeRates(samples, w.recent), base: volumeRates(samples, w.base) }
-    };
-  }
-
-  // src/pulse/cloud.js
-  var PUSH_BATCH2 = 2e3;
-  var PAGE2 = 1e3;
-  function createPulseCloud({ request, getKey, url = CLOUD_URL, apiKey = CLOUD_KEY }) {
-    async function call(method, path, body) {
-      const key = getKey();
-      if (!isSyncKey(key)) throw new Error("Cloud sync is off");
-      const res = await request({
-        method,
-        url: url + path,
-        headers: { apikey: apiKey, "x-sync-key": key, "content-type": "application/json", accept: "application/json" },
-        body: body === void 0 ? void 0 : JSON.stringify(body)
-      });
-      if (res.status < 200 || res.status >= 300) {
-        const msg = res.json && (res.json.message || res.json.error);
-        throw new Error(`Cloud answered ${res.status}${msg ? `: ${msg}` : ""}`);
-      }
-      return res.json;
-    }
-    return {
-      enabled: () => isSyncKey(getKey()),
-      async push(rows, volume) {
-        let added = 0;
-        for (let i = 0; i < Math.max(rows.length, 1); i += PUSH_BATCH2) {
-          added += Number(await call("POST", "/rest/v1/rpc/pulse_push", { rows: rows.slice(i, i + PUSH_BATCH2), volume: i === 0 ? volume : [] })) || 0;
-        }
-        return added;
-      },
-      async agg(from, to, bucketMs) {
-        const rows = await call("POST", "/rest/v1/rpc/pulse_agg", { from_ms: Math.floor(from), to_ms: Math.ceil(to), bucket_ms: Math.round(bucketMs) });
-        return Array.isArray(rows) ? rows.map(cleanAggregate) : [];
-      },
-      async volume(since) {
-        const out = [];
-        let after = Math.floor(since) - 1;
-        for (; ; ) {
-          const rows = await call("GET", `/rest/v1/pulse_volume?select=ts,cases,upgrades,online&ts=gt.${after}&order=ts.asc&limit=${PAGE2}`);
-          if (!Array.isArray(rows)) break;
-          for (const r of rows) out.push({ ts: Number(r.ts), cases: Number(r.cases), upgrades: Number(r.upgrades), online: Number(r.online) || 0 });
-          if (rows.length < PAGE2) break;
-          after = Number(rows[rows.length - 1].ts);
-        }
-        return out;
-      }
-    };
-  }
-
-  // src/pulse/index.js
-  var ON_KEY = "cst.pulse.on";
-  var FLUSH_EVERY_MS = 60 * 1e3;
-  var LOCK_NAME = "caser-tracker-pulse";
-  function createPulse({ fetch, getAuth: getAuth2, prefs, local, request, cloudKey: cloudKey2, onChange, requireOwner: requireOwner2 }) {
-    const db = createPulseStore(indexedDB);
-    const cloud2 = createPulseCloud({ request, getKey: cloudKey2 });
-    let collector = null;
-    let active = false;
-    let restartAfter = false;
-    let otherTab = false;
-    let summary = null;
-    let error = null;
-    let loading = false;
-    let updatedAt = null;
-    let source = "local";
-    let pendingRows = [];
-    let pendingVolume = [];
-    let flushTimer = null;
-    function salt() {
-      let s2 = prefs.get("pulse:salt");
-      if (typeof s2 !== "string" || s2.length < 16) {
-        const b = new Uint8Array(16);
-        crypto.getRandomValues(b);
-        s2 = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-        prefs.set("pulse:salt", s2);
-      }
-      return s2;
-    }
-    async function getJson2(path) {
-      const headers = { accept: "application/json" };
-      const auth = getAuth2();
-      if (auth) headers.Authorization = auth;
-      const res = await fetch(path, { headers, credentials: "include" });
-      if (!res.ok) throw new HttpError(res.status, path.split("?")[0]);
-      return res.json();
-    }
-    async function flush() {
-      if (!cloud2.enabled() || !pendingRows.length && !pendingVolume.length) return;
-      const rows = pendingRows;
-      const volume = pendingVolume;
-      pendingRows = [];
-      pendingVolume = [];
-      try {
-        await cloud2.push(rows, volume);
-      } catch (e) {
-        pendingRows = [...rows, ...pendingRows].slice(-2e4);
-        pendingVolume = [...volume, ...pendingVolume].slice(-2e3);
-        console.warn("[caser-tracker] pulse cloud push failed", e);
-      }
-    }
-    let lastNotify = 0;
-    let notifyTimer = null;
-    function notify() {
-      const wait = 5e3 - (Date.now() - lastNotify);
-      if (notifyTimer) return;
-      notifyTimer = setTimeout(() => {
-        notifyTimer = null;
-        lastNotify = Date.now();
-        onChange();
-      }, Math.max(0, wait));
-    }
-    function done() {
-      active = false;
-      if (restartAfter && local.get(ON_KEY, false) === true) {
-        restartAfter = false;
-        startCollector();
-      }
-      notify();
-    }
-    function startCollector() {
-      if (active) {
-        if (collector && !collector.status().running) restartAfter = true;
-        return;
-      }
-      active = true;
-      otherTab = false;
-      const s2 = salt();
-      const run = async () => {
-        collector = createCollector({
-          getJson: getJson2,
-          hashUser: (id) => hashUser(id, s2),
-          saveRows: async (rows) => {
-            await db.putRows(rows);
-            pendingRows.push(...rows);
-          },
-          saveVolume: async (v) => {
-            await db.putVolume(v);
-            pendingVolume.push(v);
-          },
-          onChange: notify
-        });
-        flushTimer = setInterval(() => flush(), FLUSH_EVERY_MS);
-        await collector.start();
-        clearInterval(flushTimer);
-        await flush();
-      };
-      if (navigator.locks?.request) {
-        navigator.locks.request(LOCK_NAME, { ifAvailable: true }, async (lock) => {
-          if (!lock) {
-            otherTab = true;
-            notify();
-            return;
-          }
-          otherTab = false;
-          await run();
-        }).catch((e) => console.warn("[caser-tracker] pulse collector failed", e)).finally(done);
-      } else {
-        run().catch((e) => console.warn("[caser-tracker] pulse collector failed", e)).finally(done);
-      }
-    }
-    function stopCollector() {
-      collector?.stop();
-    }
-    async function loadSummary() {
-      const now = Date.now();
-      const w = pulseWindows(now);
-      if (cloud2.enabled()) {
-        source = "cloud";
-        const [recent, base, day, hours, volume2] = await Promise.all([
-          cloud2.agg(w.recent.from, w.recent.to, w.recent.to - w.recent.from),
-          cloud2.agg(w.base.from, w.base.to, w.base.to - w.base.from),
-          cloud2.agg(w.day.from, w.day.to, w.day.to - w.day.from),
-          cloud2.agg(w.hours.from, w.hours.to, HOUR),
-          cloud2.volume(w.hours.from)
-        ]);
-        return pulseSummary({ recent, base, day, hours }, volume2, now);
-      }
-      source = "local";
-      const { rows, volume } = await db.since(w.hours.from);
-      const one = (win) => aggregate(rows, { from: win.from, to: win.to, bucketMs: win.to - win.from });
-      return pulseSummary({ recent: one(w.recent), base: one(w.base), day: one(w.day), hours: aggregate(rows, w.hours) }, volume, now);
-    }
-    return {
-      /** Start the collector if it was left on, and prune old local rows. */
-      boot() {
-        db.prune().catch(() => {
-        });
-        if (local.get(ON_KEY, false) === true) startCollector();
-      },
-      snapshot() {
-        return {
-          enabled: local.get(ON_KEY, false) === true,
-          otherTab,
-          collector: collector ? collector.status() : null,
-          source: cloud2.enabled() ? "cloud" : "local",
-          summary,
-          error,
-          loading,
-          updatedAt
-        };
-      },
-      setEnabled(on) {
-        requireOwner2?.();
-        local.set(ON_KEY, !!on);
-        if (on) startCollector();
-        else stopCollector();
-        notify();
-      },
-      async refresh() {
-        if (loading) return;
-        loading = true;
-        try {
-          if (collector) await flush();
-          summary = await loadSummary();
-          error = null;
-        } catch (e) {
-          error = String(e?.message ?? e);
-        } finally {
-          loading = false;
-          updatedAt = Date.now();
-          onChange();
-        }
-      }
-    };
-  }
-
   // src/ui/dom.js
   var SVG_NS = "http://www.w3.org/2000/svg";
   var PROPS = /* @__PURE__ */ new Set(["value", "checked", "disabled", "selected", "hidden", "tabIndex"]);
@@ -4292,10 +3557,10 @@ option { background: var(--surface); color: var(--text); }
     const x0 = labelW + 8;
     const x1 = W - valueW;
     const H = padT + rows.length * rowH + 4;
-    const ok7 = (v) => typeof v === "number" && Number.isFinite(v);
+    const ok6 = (v) => typeof v === "number" && Number.isFinite(v);
     const vals = [0];
     if (band) vals.push(band[0], band[1]);
-    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok7(v)) vals.push(v);
+    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok6(v)) vals.push(v);
     let lo = Math.max(clamp[0], Math.min(...vals));
     let hi = Math.min(clamp[1], Math.max(...vals));
     if (hi - lo < minSpan) {
@@ -4328,7 +3593,7 @@ option { background: var(--surface); color: var(--text); }
       svg.append(
         s("text", { class: "lbl", x: 0, y: cy + 4, "text-anchor": "start", text: label.length > 16 ? label.slice(0, 15) + "\u2026" : label })
       );
-      if (!ok7(r.value) || !r.n) {
+      if (!ok6(r.value) || !r.n) {
         svg.append(s("text", { x: x1 + valueW, y: cy + 4, "text-anchor": "end", text: "no data" }));
         return;
       }
@@ -4345,7 +3610,7 @@ option { background: var(--surface); color: var(--text); }
           "fill-opacity": r.significant ? 0.95 : 0.45
         })
       );
-      if (ok7(r.lo) && ok7(r.hi)) {
+      if (ok6(r.lo) && ok6(r.hi)) {
         const wl = x(r.lo);
         const wh = x(r.hi);
         svg.append(
@@ -4734,109 +3999,6 @@ option { background: var(--surface); color: var(--text); }
       okNum(base) ? h("span", null, h("i", { class: "ln dot", style: { borderTopColor: COLORS.diag } }), `CSFloat base ${fmt(base)}`) : null
     );
     return h("div", { class: "chart" }, readout, svg, legend);
-  }
-  function pulseChart({ hours, compare, windows, now, width, hourMs = 36e5, what = "upgrades" }) {
-    const W = Math.max(200, Math.floor(width));
-    const H = 190;
-    const padL = 40;
-    const padR = 10;
-    const padT = 10;
-    const padB = 22;
-    const iw = W - padL - padR;
-    const ih = H - padT - padB;
-    const t0 = hours.length ? hours[0].start : now - 24 * hourMs;
-    const t1 = now;
-    const CAP = 3;
-    const vals = [1];
-    for (const x2 of hours) if (okNum(x2.r?.ratio) && x2.r.ci && x2.r.n >= 20) vals.push(x2.r.ratio);
-    for (const k of ["recent", "base"]) {
-      const r = compare?.[k];
-      if (okNum(r?.ratio)) vals.push(r.ratio, ...r.ci ?? []);
-    }
-    const clipped = vals.filter(okNum).map((v) => Math.max(0, Math.min(CAP, v)));
-    const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
-    const x = (t) => padL + (Math.max(t0, Math.min(t1, t)) - t0) / (t1 - t0 || 1) * iw;
-    const y = (v) => padT + ih - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1) * ih;
-    const svg = s("svg", {
-      width: W,
-      height: H,
-      viewBox: `0 0 ${W} ${H}`,
-      role: "img",
-      "aria-label": `Return per 1 staked on ${what} by hour, with the last hour and the 3 hours before it as bands.`
-    });
-    for (const v of ticks) {
-      const yy = Math.round(y(v)) + 0.5;
-      svg.append(
-        s("line", { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid, "stroke-width": 1 }),
-        s("text", { x: padL - 6, y: yy + 3.5, "text-anchor": "end", text: fmtNumber(v, v % 1 ? 2 : 1) })
-      );
-    }
-    for (let t = Math.ceil(t0 / (6 * hourMs)) * 6 * hourMs; t <= t1; t += 6 * hourMs) {
-      const xx = Math.round(x(t)) + 0.5;
-      svg.append(
-        s("line", { x1: xx, x2: xx, y1: padT, y2: padT + ih, stroke: COLORS.grid, "stroke-width": 1 }),
-        s("text", { x: xx, y: padT + ih + 14, "text-anchor": "middle", text: new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })
-      );
-    }
-    const yb = Math.round(y(1)) + 0.5;
-    svg.append(s("line", { x1: padL, x2: W - padR, y1: yb, y2: yb, stroke: COLORS.diag, "stroke-width": 1.25, "stroke-dasharray": "5 4" }));
-    const verdictColor = compare?.verdict === "better" ? COLORS.pos : compare?.verdict === "worse" ? COLORS.neg : COLORS.line;
-    for (const [k, color] of [["base", COLORS.whisker], ["recent", verdictColor]]) {
-      const r = compare?.[k];
-      const win = windows?.[k];
-      if (!win || !okNum(r?.ratio)) continue;
-      const xa = x(win.from);
-      const xb = x(Math.min(win.to, t1));
-      if (r.ci) {
-        const ya = y(r.ci[1]);
-        svg.append(s("rect", { x: xa, y: ya, width: Math.max(1, xb - xa), height: Math.max(1, y(r.ci[0]) - ya), fill: color, "fill-opacity": 0.14 }));
-      }
-      svg.append(s("line", { x1: xa, x2: xb, y1: y(r.ratio), y2: y(r.ratio), stroke: color, "stroke-width": 2 }));
-    }
-    const marks = [];
-    for (const row of hours) {
-      const r = row.r;
-      if (!r || !r.n || !okNum(r.ratio)) continue;
-      const cx = x(row.start + hourMs / 2);
-      if (r.ci) {
-        svg.append(s("line", { x1: cx, x2: cx, y1: y(r.ci[0]), y2: y(r.ci[1]), stroke: COLORS.zero, "stroke-width": 1 }));
-      }
-      const solid = !!r.ci;
-      svg.append(s("circle", { cx, cy: y(r.ratio), r: 3, fill: solid ? COLORS.line : "#0f1114", stroke: COLORS.line, "stroke-width": 1.5 }));
-      marks.push({ cx, row });
-    }
-    const readout = h("div", { class: "readout" });
-    const idle = () => readout.replaceChildren(h("span", { class: "faint", text: marks.length ? "Hover or tap an hour for details. Hollow dots: fewer than 5 players." : "No hourly data yet." }));
-    idle();
-    if (marks.length) {
-      const ring = s("circle", { r: 6, fill: "none", stroke: COLORS.marker, "stroke-width": 1, visibility: "hidden" });
-      svg.append(ring);
-      hoverLayer(svg, {
-        x0: padL,
-        y0: padT,
-        w: iw,
-        h: ih,
-        onMove: (px) => {
-          let best = marks[0];
-          for (const m of marks) if (Math.abs(m.cx - px) < Math.abs(best.cx - px)) best = m;
-          const r = best.row.r;
-          ring.setAttribute("cx", best.cx);
-          ring.setAttribute("cy", y(r.ratio));
-          ring.setAttribute("visibility", "visible");
-          const at = new Date(best.row.start).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          readout.replaceChildren(
-            `${at}: `,
-            h("span", { class: ["num", signClass(r.ratio - 1)], text: fmtNumber(r.ratio, 3) }),
-            h("span", { class: "faint", text: `  ${r.ci ? `range ${fmtNumber(r.ci[0], 3)}\u2013${fmtNumber(r.ci[1], 3)}, ` : ""}${fmtNumber(r.n, 0)} ${what}, ${fmtNumber(r.players, 0)} players` })
-          );
-        },
-        onLeave: () => {
-          ring.setAttribute("visibility", "hidden");
-          idle();
-        }
-      });
-    }
-    return h("div", { class: "chart" }, readout, svg);
   }
 
   // src/ui/views-v2.js
@@ -5266,181 +4428,6 @@ option { background: var(--surface); color: var(--text); }
     return ok3(v) ? v : Number(v) || 0;
   }
 
-  // src/ui/pulseview.js
-  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
-  var STALE_MS = 60 * 1e3;
-  var fmtR = (v) => ok4(v) ? fmtNumber(v, 3) : DASH;
-  var VERDICT = {
-    better: ["good", "Higher now"],
-    worse: ["bad", "Lower now"],
-    same: ["neutral", "No clear change"],
-    few: ["neutral", "Not enough data yet"]
-  };
-  function compareCallout(label, c) {
-    const [cls, word] = VERDICT[c.verdict] ?? VERDICT.few;
-    const r = c.recent;
-    const b = c.base;
-    const detail2 = c.verdict === "few" ? `Needs at least 30 ${label.toLowerCase()} from 5 or more players in each window. Last hour: ${fmtInt(r.n)} from ${fmtInt(r.players)} players; the 3 hours before: ${fmtInt(b.n)}.` : `Players got back ${fmtR(r.ratio)} per 1 staked in the last hour (${fmtInt(r.n)} from ${fmtInt(r.players)} players), against ${fmtR(b.ratio)} in the 3 hours before (${fmtInt(b.n)}). ${c.verdict === "same" ? "The difference is within random noise" : "The difference is too large to be luck"} (p = ${ok4(c.p) ? fmtNumber(c.p, 3) : DASH}).`;
-    return h("div", { class: ["callout", cls] }, h("div", { class: "headline", text: `${label}: ${word}` }), h("div", { class: "detail", text: detail2 }));
-  }
-  function ratioCell(r) {
-    return h(
-      "td",
-      { class: "num" },
-      h("span", { class: ok4(r?.ratio) ? signClass(r.ratio - 1) : "faint", text: fmtR(r?.ratio) }),
-      r?.ci ? h("span", { class: "ci", text: `${fmtR(r.ci[0])} ${DASH} ${fmtR(r.ci[1])}` }) : null
-    );
-  }
-  function kpi(k, v, sub) {
-    return h("div", { class: "kpi" }, h("div", { class: "k", text: k }), h("div", { class: "v num", text: v, title: v }), sub ? h("div", { class: "s", text: sub }) : null);
-  }
-  function statusText(snap) {
-    const c = snap.collector;
-    if (snap.otherTab) return "Collecting in another tab of this browser.";
-    if (!c || !snap.enabled) return "Off in this browser.";
-    if (c.pausedUntil) return `Paused by the site until ${fmtTime(c.pausedUntil)}.`;
-    if (!c.running) return c.error || "Stopped.";
-    return `Running. In the last hour: ${fmtInt(c.rowsLastHour)} rows (${fmtInt(c.backRowsLastHour)} from players\u2019 recent history), ${fmtInt(c.requestsLastHour)} requests. ${fmtInt(c.recentPlayers)} players read in the last 2 hours, ${fmtInt(c.players)} followed now, ${fmtInt(c.queued)} waiting.`;
-  }
-  function viewPulse(ctx2) {
-    const { pulse: pulse2, table, th, errorBox, render, contentWidth } = ctx2;
-    if (!pulse2) return [errorBox("The pulse module is not loaded")];
-    const snap = pulse2.snapshot();
-    if (!snap.loading && (!snap.updatedAt || Date.now() - snap.updatedAt > STALE_MS)) pulse2.refresh();
-    const out = [];
-    const s2 = snap.summary;
-    if (snap.error) out.push(errorBox(snap.error, "Could not load the pulse"));
-    if (!s2) {
-      out.push(h("p", { class: "muted", text: snap.loading ? "Loading\u2026" : "No pulse data yet." }));
-    } else {
-      out.push(h("section", null, compareCallout("Upgrades", s2.compare.upgrade), compareCallout("Cases", s2.compare.case)));
-      const v = s2.volume;
-      out.push(
-        h(
-          "section",
-          null,
-          h("h3", { text: "Last hour against the 3 hours before" }),
-          h(
-            "div",
-            { class: "kpis" },
-            kpi("Upgrades, return per 1", fmtR(s2.compare.upgrade.recent.ratio), `before ${fmtR(s2.compare.upgrade.base.ratio)}`),
-            kpi("Cases, return per 1", fmtR(s2.compare.case.recent.ratio), `before ${fmtR(s2.compare.case.base.ratio)}`),
-            kpi("Site upgrades / min", ok4(v.recent.upgradesPerMin) ? fmtInt(v.recent.upgradesPerMin) : DASH, `before ${ok4(v.base.upgradesPerMin) ? fmtInt(v.base.upgradesPerMin) : DASH}`),
-            kpi("Site case opens / min", ok4(v.recent.casesPerMin) ? fmtInt(v.recent.casesPerMin) : DASH, `before ${ok4(v.base.casesPerMin) ? fmtInt(v.base.casesPerMin) : DASH}`)
-          ),
-          h("p", {
-            class: "hint",
-            text: "Return per 1 is total value received divided by total staked, over every sampled upgrade or case open. 1.000 means players broke even at site prices. The site-wide rates come from the site\u2019s public counters."
-          })
-        )
-      );
-      const oldestFirst = [...s2.hours].reverse().slice(-12);
-      for (const [kind, label, what] of [["upgrade", "Upgrades", "upgrades"], ["case", "Cases", "case opens"]]) {
-        out.push(
-          h(
-            "section",
-            null,
-            h("h3", { text: `${label}: return per 1 staked by hour, last 12 hours` }),
-            pulseChart({
-              hours: oldestFirst.map((r) => ({ start: r.start, r: r[kind] })),
-              compare: s2.compare[kind],
-              windows: s2.windows,
-              now: s2.now,
-              width: contentWidth(),
-              what
-            }),
-            kind === "case" ? h("p", {
-              class: "hint",
-              text: "Dots are hours, with their 95% range; hollow dots have too few players for a range. The bands are the last hour (right) and the 3 hours before it, each with its 95% range: when the bands overlap a lot, the change is noise. The dashed line at 1 is break-even at site prices."
-            }) : null
-          )
-        );
-      }
-      const rows = s2.hours.filter((r) => r.upgrade.n || r.case.n || ok4(r.volume.casesPerMin));
-      out.push(
-        h(
-          "section",
-          null,
-          h("h3", { text: "By hour, last 24 hours" }),
-          rows.length ? table(
-            [
-              th("Hour"),
-              th("Upgrades", "Sampled upgrades"),
-              th("Return", "Upgrades: returned per 1 staked. Second line: 95% range, clustered by player"),
-              th("Cases", "Sampled paid case opens"),
-              th("Return", "Cases: returned per 1 spent. Second line: 95% range, clustered by player"),
-              th("Staked", "Total staked on sampled upgrades and cases"),
-              th("Site / min", "Site-wide upgrades and case opens per minute"),
-              th("Online", "Average users online")
-            ],
-            rows.map(
-              (r) => h(
-                "tr",
-                null,
-                h("td", { class: "num", text: fmtTime(r.start) }),
-                h("td", { class: "num", text: fmtInt(r.upgrade.n) }),
-                ratioCell(r.upgrade),
-                h("td", { class: "num", text: fmtInt(r.case.n) }),
-                ratioCell(r.case),
-                h("td", { class: "num", text: fmtMoney(r.upgrade.staked + r.case.staked) }),
-                h("td", {
-                  class: "num",
-                  text: ok4(r.volume.upgradesPerMin) ? `${fmtInt(r.volume.upgradesPerMin)} / ${fmtInt(r.volume.casesPerMin)}` : DASH
-                }),
-                h("td", { class: "num", text: ok4(r.volume.online) ? fmtInt(r.volume.online) : DASH })
-              )
-            )
-          ) : h("p", { class: "muted", text: "Nothing collected in the last 24 hours." })
-        )
-      );
-    }
-    const c = snap.collector;
-    out.push(
-      h(
-        "section",
-        null,
-        h("h3", { text: "Collector" }),
-        h("p", { class: "muted", text: statusText(snap) }),
-        c?.error && c.running ? h("p", { class: "warnline", text: c.error }) : null,
-        h("p", {
-          class: "muted",
-          text: `Data shown: ${snap.source === "cloud" ? "the cloud (every browser with your sync key)" : "this browser only"}.${snap.updatedAt ? ` Updated ${fmtAgo(snap.updatedAt)}.` : ""}`
-        }),
-        h(
-          "div",
-          { class: "btns" },
-          h("button", {
-            type: "button",
-            class: ["btn", snap.enabled ? "" : "primary"],
-            "data-fk": "pulse-toggle",
-            disabled: snap.otherTab,
-            text: snap.enabled ? "Stop collecting in this browser" : "Start collecting in this browser",
-            on: {
-              click: () => {
-                try {
-                  pulse2.setEnabled(!snap.enabled);
-                } catch (e) {
-                  window.alert(String(e?.message ?? e));
-                }
-                render();
-              }
-            }
-          }),
-          h("button", { type: "button", class: "btn ghost", text: "Reload", disabled: snap.loading, on: { click: () => pulse2.refresh() } })
-        ),
-        h("p", {
-          class: "warnline",
-          text: "Run the collector only on the account you set aside for it. It reads other players\u2019 histories with that account\u2019s login, about one request every 4 seconds. The site can see this, may limit or ban that account, and may link it to your other accounts. If the site starts refusing requests, the collector pauses or stops by itself; do not work around it."
-        }),
-        h("p", {
-          class: "hint",
-          text: "How it samples: players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their latest page of upgrades and case drops is read at once (their recent history), leaving out the feed wins that found them. Then they are followed for up to 2 hours for new rows, the same for winners and losers. Players still playing now are more likely to be found, so the hours before were played by people who kept going. Players are stored as a salted hash, never by name."
-        })
-      )
-    );
-    return out;
-  }
-
   // src/ui/dashboard.js
   var TABS = [
     ["overview", "Overview"],
@@ -5450,7 +4437,6 @@ option { background: var(--surface); color: var(--text); }
     ["mystery", "Mystery"],
     ["factors", "Factors"],
     ["money", "Money"],
-    ["pulse", "Pulse"],
     ["data", "Data"]
   ];
   var FACTORS2 = [
@@ -5478,10 +4464,10 @@ option { background: var(--surface); color: var(--text); }
     chance: { storeKey: "cst.ui.edges.chance", def: [0, 2, 5, 10, 20, 30, 50, 75, 100], allowInf: false },
     stake: { storeKey: "cst.ui.edges.stake", def: [0, 100, 500, 1e3, 5e3, 2e4, Infinity], allowInf: true }
   };
-  var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
-  var num3 = (v) => ok5(v) ? v : Number(v) || 0;
-  function edgesToText(arr4) {
-    return arr4.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
+  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
+  var num3 = (v) => ok4(v) ? v : Number(v) || 0;
+  function edgesToText(arr3) {
+    return arr3.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
   }
   function parseEdges(text, allowInf) {
     const parts = String(text || "").split(/[,;\s]+/).filter(Boolean);
@@ -5779,7 +4765,6 @@ option { background: var(--surface); color: var(--text); }
           mystery: () => viewMystery(ctx2),
           factors: viewFactors,
           money: () => viewMoney(ctx2),
-          pulse: () => viewPulse(ctx2),
           data: viewData
         };
         try {
@@ -5870,7 +4855,7 @@ option { background: var(--surface); color: var(--text); }
       if (!u || !u.available) return v;
       if (u.newer) return `${v}, v${u.latest} available`;
       if (u.error) return `${v}, update check failed: ${u.error}`;
-      if (ok5(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
+      if (ok4(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
       return v;
     }
     function errorBox(err, prefix = "Could not compute this view") {
@@ -5938,8 +4923,7 @@ option { background: var(--surface); color: var(--text); }
       roiCell,
       rateCell,
       sigBadge,
-      kpi: kpi2,
-      pulse: o.pulse || null
+      kpi
     };
     function viewOverview() {
       const ev = state.events;
@@ -5978,10 +4962,10 @@ option { background: var(--surface); color: var(--text); }
           h(
             "div",
             { class: "kpis" },
-            kpi2("Spent", fmtMoney(total.cost, c)),
-            kpi2("Returned", fmtMoney(total.returned, c)),
-            kpi2("Case drops", fmtInt(cases.n || 0)),
-            kpi2("Upgrades", fmtInt(upgrades.n || 0))
+            kpi("Spent", fmtMoney(total.cost, c)),
+            kpi("Returned", fmtMoney(total.returned, c)),
+            kpi("Case drops", fmtInt(cases.n || 0)),
+            kpi("Upgrades", fmtInt(upgrades.n || 0))
           ),
           h(
             "div",
@@ -6005,7 +4989,7 @@ option { background: var(--surface); color: var(--text); }
       out.push(h("section", null, h("h3", { text: "Recent sessions" }), ses.error ? errorBox(ses.error) : sessionsList(ses.value || [], c)));
       return out;
     }
-    function kpi2(k, v) {
+    function kpi(k, v) {
       return h("div", { class: "kpi" }, h("div", { class: "k", text: k }), h("div", { class: "v num", text: v, title: v }));
     }
     function kindBox(label, m, c) {
@@ -6052,7 +5036,7 @@ option { background: var(--surface); color: var(--text); }
           "p",
           { class: "detail" },
           `z = ${fmtZ(r.z)}, ${fmtPEq(r.p)}`,
-          ok5(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
+          ok4(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
         ),
         r.n < 30 ? h("p", { class: "detail", text: "Fewer than 30 upgrades: this check is weak for now." }) : null
       );
@@ -6335,7 +5319,7 @@ option { background: var(--surface); color: var(--text); }
             h(
               "td",
               { class: "num" },
-              h("span", { class: ok5(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
+              h("span", { class: ok4(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
               r.realRtpCI ? h("span", { class: "ci", text: fmtCI(r.realRtpCI) }) : null
             )
           )
@@ -6415,10 +5399,10 @@ option { background: var(--surface); color: var(--text); }
         return out;
       }
       const isUp = kind === "upgrade";
-      const hasAdj = isUp && rows.some((x) => ok5(x.zAdj));
+      const hasAdj = isUp && rows.some((x) => ok4(x.zAdj));
       out.push(h("section", null, testCallout(r.test, kind, fdef)));
       if (hasAdj) {
-        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok5(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
+        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok4(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
         out.push(
           h(
             "section",
@@ -6443,14 +5427,14 @@ option { background: var(--surface); color: var(--text); }
         const bars = rows.map((x) => {
           if (isUp) {
             const e = num3(x.expectedRate);
-            if (!(e > 0) || !ok5(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
+            if (!(e > 0) || !ok4(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
             const ci2 = x.winRateCI || [];
             return {
               label: x.label ?? x.value,
               n: x.n,
               value: x.winRate / e - 1,
-              lo: ok5(ci2[0]) ? ci2[0] / e - 1 : null,
-              hi: ok5(ci2[1]) ? ci2[1] / e - 1 : null,
+              lo: ok4(ci2[0]) ? ci2[0] / e - 1 : null,
+              hi: ok4(ci2[1]) ? ci2[1] / e - 1 : null,
               significant: !!x.significant
             };
           }
@@ -6519,7 +5503,7 @@ option { background: var(--surface); color: var(--text); }
       return out;
     }
     function zCell(z, significant, n) {
-      if (!ok5(z)) return h("td", { class: "num faint", text: DASH });
+      if (!ok4(z)) return h("td", { class: "num faint", text: DASH });
       let badge;
       if (!(n >= 10)) badge = h("span", { class: "badge", text: "Too few" });
       else if (significant) badge = h("span", { class: ["badge", z < 0 ? "bad" : "good"], text: z < 0 ? "Below" : "Above" });
@@ -6527,7 +5511,7 @@ option { background: var(--surface); color: var(--text); }
       return h("td", { class: "num" }, `z ${fmtNumber(z, 2, { sign: true })}`, h("span", { class: "second" }, badge));
     }
     function testCallout(t, kind, fdef) {
-      if (!t || !ok5(t.p)) {
+      if (!t || !ok4(t.p)) {
         return h(
           "div",
           { class: "callout neutral" },
@@ -6537,9 +5521,9 @@ option { background: var(--surface); color: var(--text); }
       }
       const isUp = kind === "upgrade";
       const statName = isUp ? "\u03C7\xB2" : "Test statistic";
-      const dfText = ok5(t.df) ? `, df = ${fmtInt(t.df)}` : "";
+      const dfText = ok4(t.df) ? `, df = ${fmtInt(t.df)}` : "";
       const shownLine = `${statName} = ${fmtNumber(t.statistic, 2)}${dfText}, ${fmtPEq(t.p)}`;
-      const useAdj = isUp && ok5(t.pAdj);
+      const useAdj = isUp && ok4(t.pAdj);
       const sig = useAdj ? typeof t.significantAdj === "boolean" ? t.significantAdj : t.pAdj < 0.05 : !!t.significant;
       const lines = useAdj ? [
         `Adjusted for the real odds curve: ${statName} = ${fmtNumber(t.statisticAdj, 2)}${dfText}, ${fmtPEq(t.pAdj)}.`,
@@ -6652,7 +5636,7 @@ option { background: var(--surface); color: var(--text); }
         );
         return sec;
       }
-      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok5(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
+      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok4(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
       const shown = state.cloudKeyShown ? h("input", {
         type: "text",
         readonly: true,
@@ -6788,7 +5772,7 @@ option { background: var(--surface); color: var(--text); }
       const nDep = ev.filter((e) => e.kind === "deposit").length;
       const nWd = ev.filter((e) => e.kind === "withdrawal").length;
       const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
-      const totalEvents = state.accounts && ok5(state.accounts.total) ? state.accounts.total : ev.length;
+      const totalEvents = state.accounts && ok4(state.accounts.total) ? state.accounts.total : ev.length;
       const busy = !!state.busy;
       const btn = (name, label, cls, onClick, extra = {}) => h("button", {
         type: "button",
@@ -6841,9 +5825,9 @@ option { background: var(--surface); color: var(--text); }
               text: `${fmtInt(ev.length)} (${fmtInt(nCase)} case drops, ${fmtInt(nUp)} upgrades${nDep ? `, ${fmtInt(nDep)} deposits` : ""}${nWd ? `, ${fmtInt(nWd)} withdrawals` : ""})`
             }),
             h("dt", { text: "Last event" }),
-            h("dd", { class: "num", text: ok5(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
+            h("dd", { class: "num", text: ok4(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
             h("dt", { text: "Last sync" }),
-            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok5(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
+            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok4(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
             h("dt", { text: "Storage", title: "Whether the browser promised not to clear the stored history on its own" }),
             h("dd", { text: st.storagePersisted === true ? "Kept by the browser" : st.storagePersisted === false ? "Browser may clear it when space runs low" : DASH }),
             h("dt", { text: "Unknown responses", title: "Site responses the parser did not recognise" }),
@@ -7013,8 +5997,6 @@ option { background: var(--surface); color: var(--text); }
     doRefresh();
     return {
       refresh,
-      /** Redraw the open tab from data already loaded (no event reload). */
-      rerender: () => render(),
       destroy() {
         refresh.cancel();
         onResize.cancel();
@@ -7033,16 +6015,16 @@ option { background: var(--surface); color: var(--text); }
   var MIN_HISTORY = 30;
   var REAL_MIN_N = 100;
   function curveRowFor(rows, chance) {
-    if (!Array.isArray(rows) || !ok6(chance)) return null;
+    if (!Array.isArray(rows) || !ok5(chance)) return null;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
-      if (!r || !ok6(r.lo) || !ok6(r.hi)) continue;
+      if (!r || !ok5(r.lo) || !ok5(r.hi)) continue;
       const last = i === rows.length - 1;
       if (chance >= r.lo && (chance < r.hi || last && chance <= r.hi)) return r;
     }
     return null;
   }
-  var ok6 = (v) => typeof v === "number" && Number.isFinite(v);
+  var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
   function icon(d) {
     return s(
       "svg",
@@ -7055,20 +6037,20 @@ option { background: var(--surface); color: var(--text); }
   var CHEVRON_DOWN = "M4 6l4 4 4-4";
   var CLOSE = "M4.5 4.5l7 7M11.5 4.5l-7 7";
   function verdictFor(q, stake, currency, real = null, targetPrice = null) {
-    if (real && ok6(real.rate) && ok6(targetPrice)) {
+    if (real && ok5(real.rate) && ok5(targetPrice)) {
       const perTry = real.rate * targetPrice - stake;
-      const sub2 = ok6(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
+      const sub2 = ok5(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
-    if (ok6(q.realEdge)) {
+    if (ok5(q.realEdge)) {
       const perTry = q.realEdge * stake;
       const sub2 = "Based on your own upgrades at similar chances.";
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
     const sub = `By the shown odds only. Your real results here are unknown until ${MIN_HISTORY} upgrades at similar chances.`;
-    if (!ok6(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
+    if (!ok5(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
     return q.ev < 0 ? { text: `On average you lose ${fmtMoney(-q.ev, currency)} per try at these odds.`, tone: "neg", sub } : { text: `The shown odds promise ${fmtMoney(q.ev, currency)} per try on average.`, tone: "", sub };
   }
   var pctCapped = (p) => p > 0.99 ? ">99%" : p < 0.01 ? "<1%" : fmtPct(p, 0);
@@ -7082,7 +6064,7 @@ option { background: var(--surface); color: var(--text); }
     const t = OUTLOOK_TEXT[ol.verdict];
     const ctx2 = ol.context || {};
     const kellyEl = kellyLine(ol, currency, balance);
-    const since = ctx2.minutesSinceDeposit === null || !ok6(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
+    const since = ctx2.minutesSinceDeposit === null || !ok5(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
     const rows = [];
     for (const w of ol.windows || []) {
       const cur = w.key === (ol.window && ol.window.key);
@@ -7126,7 +6108,7 @@ option { background: var(--surface); color: var(--text); }
     if (!(k.half > 0)) {
       return h("p", { class: "ol-kelly", text: "Suggested stake: 0 \u2014 skip this one." });
     }
-    const amount = ok6(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
+    const amount = ok5(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
     return h(
       "p",
       { class: "ol-kelly", title: "Half-Kelly: the stake that grows a bankroll fastest for this edge, halved because the real chance is an estimate" },
@@ -7151,7 +6133,7 @@ option { background: var(--surface); color: var(--text); }
     root.append(wrap);
     let collapsed = !!store.get(COLLAPSED_KEY, false);
     let pos = store.get(POS_KEY, null);
-    if (!pos || !ok6(pos.x) || !ok6(pos.y)) pos = null;
+    if (!pos || !ok5(pos.x) || !ok5(pos.y)) pos = null;
     const grip = h("button", { type: "button", class: "iconbtn grip", "aria-label": "Move card. Use arrow keys, hold Shift for bigger steps." }, icon(GRIP));
     const toggle = h("button", {
       type: "button",
@@ -7298,7 +6280,7 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const input = { stake, targetPrice };
-      if (ok6(sel.chanceShown)) input.chanceShown = sel.chanceShown;
+      if (ok5(sel.chanceShown)) input.chanceShown = sel.chanceShown;
       const qKey = `${stake}|${targetPrice}|${input.chanceShown}|${version}`;
       const res = quoteCache && quoteCache.key === qKey ? quoteCache.res : safe(() => {
         if (typeof stats.upgradeQuote !== "function") throw new Error("stats.upgradeQuote is missing");
@@ -7310,9 +6292,9 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const q = res.value;
-      const chance = ok6(q.chanceShown) ? q.chanceShown : ok6(sel.chanceShown) ? sel.chanceShown : null;
+      const chance = ok5(q.chanceShown) ? q.chanceShown : ok5(sel.chanceShown) ? sel.chanceShown : null;
       const row = curveRowFor(curveRows, chance);
-      const real = row && row.n >= REAL_MIN_N && ok6(row.winRate) && ok6(chance) ? {
+      const real = row && row.n >= REAL_MIN_N && ok5(row.winRate) && ok5(chance) ? {
         rate: row.expectedRate > 0 ? Math.min(1, chance / 100 * (row.winRate / row.expectedRate)) : row.winRate,
         bucketRate: row.winRate,
         bucketShown: row.expectedRate,
@@ -7346,7 +6328,7 @@ option { background: var(--surface); color: var(--text); }
           h("span", { class: "ci", text: `${fmtPct(q.evPct, 1, { sign: true })} of stake` })
         ),
         h("dt", { text: "Real edge", title: "From your history at similar chances: real return minus 1" }),
-        ok6(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
+        ok5(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
         h("dt", { text: "Your similar tries", title: "Same chance bucket and same stake bucket" }),
         sim.n ? h(
           "dd",
@@ -7364,7 +6346,7 @@ option { background: var(--surface); color: var(--text); }
           "div",
           { class: "line" },
           h("span", { text: "5\u201395% range" }),
-          h("span", { class: "num", text: ok6(lr.p05) && ok6(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
+          h("span", { class: "num", text: ok5(lr.p05) && ok5(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
         ),
         h("div", { class: "line" }, h("span", { text: "Chance to end in profit" }), h("span", { class: "num", text: fmtPct(lr.probProfit, 0) }))
       );
@@ -7372,7 +6354,7 @@ option { background: var(--surface); color: var(--text); }
       let balance = null;
       try {
         const hv = o.getHoldings ? o.getHoldings() : null;
-        if (hv && ok6(hv.balance)) balance = hv.balance;
+        if (hv && ok5(hv.balance)) balance = hv.balance;
       } catch {
       }
       const olEl = ol.value ? outlookBlock(ol.value, c, balance) : null;
@@ -7912,7 +6894,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.10.0" : "dev";
+  var VERSION = true ? "0.11.0" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
@@ -8539,18 +7521,6 @@ Click for the sales chart.` : r.name;
       console.warn("[caser-tracker] could not save", err);
     }
   });
-  var pulse = createPulse({
-    fetch: (...a) => origFetch(...a),
-    getAuth: () => getAuth(),
-    prefs: browserPrefs,
-    local: store,
-    request: (req3) => gmRequest(req3),
-    cloudKey: () => cloudKey(),
-    requireOwner: () => requireOwner(),
-    onChange: () => {
-      if (store.get("cst.ui.tab", null) === "pulse") dashboard?.rerender();
-    }
-  });
   function download(name, text, type) {
     const url = URL.createObjectURL(new Blob([text], { type }));
     const a = document.createElement("a");
@@ -8649,13 +7619,8 @@ Click for the sales chart.` : r.name;
       getSettings: () => ({ upgradeOverlay: !!overlay }),
       setSetting: (key, value) => {
         if (key === "upgradeOverlay") setUpgradeOverlay(!!value);
-      },
-      pulse
+      }
     });
-    pulse.boot();
-    setInterval(() => {
-      if (store.get("cst.ui.tab", null) === "pulse") dashboard?.rerender();
-    }, 30 * 1e3);
     setUpgradeOverlay(store.get(OVERLAY_ON_KEY, true) !== false);
     mountCasePanel({
       getSlug: () => caseSlugFromPath(location.pathname),

@@ -1,0 +1,12 @@
+{
+  "name": "caser-pulse-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Samples players' recent upgrades and case drops on caser.gg and shows whether play is more profitable now than a few hours ago.",
+  "type": "module",
+  "engines": { "node": ">=20.6" },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test"
+  }
+}
