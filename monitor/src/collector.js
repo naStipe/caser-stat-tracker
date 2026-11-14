@@ -2,19 +2,20 @@
 // right now. Signed in to the account the user set aside for it (see site.js).
 //
 // One request at a time, at least `gapMs` apart (default 8 s, about 450 requests an hour). Each turn
-// does the most urgent thing that is due:
-//   1. GET /api/game/cases        every 6 h      case prices
-//   2. GET /api/live-drops        every 30 s     finds active players (it shows their big wins)
-//   3. GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
-//   4. first look at a found player: the latest page of their upgrades and case drops
-//   5. follow: one of the two lists of a followed player at most every 90 s, for new rows
-//   6. when nothing above is due:
-//      - revisit: a known player who is no longer followed, for new rows. Players who played in the
-//        last 30 min are checked every 10 min (and before anything else here), then every 30 min,
-//        2 h or 6 h the longer ago they played. So players who play small, and rarely reach the drop
-//        board, stay in the sample once the board has shown them.
-//      - history: older pages of a player's lists, back to `historyMs` (7 days), at most `deepPages` each
-//      (alternating with revisits that are not urgent)
+// first does what is due on a clock:
+//   GET /api/game/cases        every 6 h      case prices
+//   GET /api/live-drops        every 30 s     finds active players (it shows their big wins)
+//   GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
+// Otherwise the turn goes to the next kind of work in `turns`, a fixed rotation, so each kind gets its
+// share of the requests even when another always has work (a kind with nothing to do passes its turn on):
+//   look     first look at a found player: the latest page of their upgrades and case drops
+//   follow   one of the two lists of a followed player at most every 90 s, for new rows
+//   hot      revisit a known player who played in the last 30 min (checked every 10 min)
+//   revisit  any known player who is due: every 10 min, 30 min, 2 h or 6 h the longer ago they played.
+//            So players who play small, and rarely reach the drop board, stay in the sample once the
+//            board has shown them.
+//   history  older pages of a known player's lists, back to `historyMs` (7 days), at most `deepPages`
+//            each. Where each player's history stands is kept across restarts.
 // HTTP 429 pauses everything for 5 minutes, doubling up to 30. HTTP 401 (login refused) and 403 (blocked)
 // stop the collector. Other errors are retried; a run of them is reported.
 //
@@ -40,7 +41,6 @@ export const DEFAULTS = {
   idleDropMs: 40 * 60 * 1000, // stop following a player with no new rows for this long
   historyMs: 7 * 24 * HOUR, // history rows kept back to this age
   deepPages: 10, // older pages read per list per player, after the first
-  maxDeepJobs: 300,
   // Known players are checked again for new rows, more often the more recently they played:
   revisitHotMs: 10 * 60 * 1000, // played in the last `activeMs`: they are on the site now
   revisitWarmMs: 30 * 60 * 1000, // played in the last 3 hours
@@ -51,7 +51,9 @@ export const DEFAULTS = {
   knownKeepMs: 14 * 24 * HOUR, // forget players neither in the feed nor seen playing for this long
   maxPlayers: 30, // followed at once
   maxQueue: 40, // found players waiting for their first look (oldest dropped first)
-  backfillsPerFollow: 2,
+  // Rotation of work after the clocked reads: a quarter each for history and first looks, the rest
+  // for new rows of players who play now.
+  turns: ['look', 'follow', 'hot', 'history', 'look', 'follow', 'revisit', 'history'],
   pageSize: 50,
   tryPageSize: 100,
   maxPages: 3, // per list per follow or revisit, only while every row on a page is new
@@ -81,6 +83,23 @@ export function fieldNames(body) {
 }
 const STREAMS = ['upgrade', 'case'];
 
+const histJob = (j) => (j && Number.isFinite(j.offset) && j.offset >= 0 ? { offset: j.offset, pages: Number(j.pages) || 0 } : j === null ? null : undefined);
+
+/** A known player from a saved state. */
+function importKnown(k, t, opt) {
+  const newest = { upgrade: k.newest?.upgrade ?? 0, case: k.newest?.case ?? 0 };
+  let hist;
+  if (k.hist && typeof k.hist === 'object') hist = { upgrade: histJob(k.hist.upgrade), case: histJob(k.hist.case) };
+  else if (k.deep || newest.upgrade || newest.case) {
+    // Saved before 1.4, when older pages waited in a queue that lived in memory only (and dropped jobs
+    // past 300): read the history of players who played in the last 7 days again, after the first page.
+    const recent = Math.max(newest.upgrade, newest.case) >= t - opt.historyMs;
+    const job = () => (recent ? { offset: opt.pageSize, pages: 0 } : null);
+    hist = { upgrade: job(), case: job() };
+  } else hist = { upgrade: undefined, case: undefined };
+  return { seen: k.seen ?? 0, revisited: k.revisited ?? 0, newest, hist };
+}
+
 /**
  * @param {Object} o
  * @param {(path: string) => Promise<any>} o.getJson  same-site GET; throws HttpError on a non-2xx answer
@@ -100,9 +119,10 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
   const queue = []; // found, waiting for their first look: {id, skip: Set<item name>}
   const backfilled = new Map(); // site id -> when their first look ran
-  const deep = []; // older history pages to read: {id, u, stream, offset, pages, skip}
-  // Players seen in the feed: site id -> {seen, revisited, newest: {upgrade, case}, deep: bool}
-  const known = new Map((initial.known ?? []).filter((k) => k && k.id).map((k) => [String(k.id), { seen: k.seen ?? 0, revisited: k.revisited ?? 0, newest: { upgrade: k.newest?.upgrade ?? 0, case: k.newest?.case ?? 0 }, deep: !!k.deep }]));
+  const skips = new Map(); // site id -> names of the feed wins that found them (kept out of their history)
+  // Players seen in the feed: site id -> {seen, revisited, newest: {upgrade, case}, hist: {upgrade, case}}.
+  // hist per list: undefined = not looked at yet, {offset, pages} = older pages still to read, null = done.
+  const known = new Map((initial.known ?? []).filter((k) => k && k.id).map((k) => [String(k.id), importKnown(k, now(), opt)]));
   // 'unknown' until a page shows what the site allows; then 'ok' (larger pages work), 'capped' or 'refused'.
   let pageSize = opt.tryPageSize;
   let pageProbe = 'unknown';
@@ -117,6 +137,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     pageProbe = initial.pageProbe;
   }
   const triedSlugs = new Set();
+  let turn = 0;
   let profileProbed = !!initial.profileProbed;
   let running = false;
   let wake = null;
@@ -125,8 +146,6 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   let lastCases = -Infinity;
   let pausedUntil = 0;
   let backoff = opt.backoffMs;
-  let backfillRun = 0;
-  let idleTurn = 0;
   let error = null;
   let stopReason = null;
   let errorStreak = 0;
@@ -188,7 +207,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
 
   function remember(id) {
     let k = known.get(id);
-    if (!k) known.set(id, (k = { seen: now(), revisited: now(), newest: { upgrade: 0, case: 0 }, deep: false }));
+    if (!k) known.set(id, (k = { seen: now(), revisited: now(), newest: { upgrade: 0, case: 0 }, hist: { upgrade: undefined, case: undefined } }));
     k.seen = now();
     return k;
   }
@@ -286,6 +305,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   async function backfill({ id, skip }) {
     const u = await hashUser(id);
     const k = remember(id);
+    if (skip?.size) skips.set(id, new Set([...(skips.get(id) ?? []), ...skip]));
     const seen = { upgrade: new Set(), case: new Set() };
     const cut = now() - opt.historyMs;
     for (const stream of STREAMS) {
@@ -296,28 +316,36 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       noteNewest(id, stream, all);
       const keep = parse({ skip, back: true }).filter((r) => r.ts >= cut);
       await save(keep, true);
-      // Older pages later, when nothing else is due; only once per player.
-      const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
-      if (!k.deep && full && oldest >= cut && opt.deepPages > 0) {
-        deep.push({ id, u, stream, offset: len, pages: 0, skip });
-        if (deep.length > opt.maxDeepJobs) deep.shift();
-      }
+      // Older pages later, on history turns; only once per player.
+      if (k.hist[stream] === undefined) k.hist[stream] = moreHistory(all, full, cut, len, 0);
       if (stream === 'upgrade') await doSleep(opt.gapMs);
     }
-    k.deep = true;
     backfilled.set(id, now());
     if (players.size < opt.maxPlayers) players.set(id, { u, added: now(), lastPolled: now(), lastRow: now(), seen, nextStream: 'upgrade' });
   }
 
+  /** History still to read after a page: {offset: next, pages} while the pages reach no further back than `cut`, else null. */
+  function moreHistory(rows, full, cut, next, pages) {
+    const oldest = rows.reduce((m, r) => Math.min(m, r.ts), Infinity);
+    return full && oldest >= cut && pages < opt.deepPages ? { offset: next, pages } : null;
+  }
+
+  /** A known player whose history still has pages to read (the earliest found first). */
+  function nextHistory() {
+    for (const [id, k] of known) for (const stream of STREAMS) if (k.hist[stream]) return { id, k, stream };
+    return null;
+  }
+
   /** One older page of a player's list. */
-  async function readDeep() {
-    const job = deep.shift();
+  async function readHistory({ id, k, stream }) {
+    const job = k.hist[stream];
     const cut = now() - opt.historyMs;
-    const { parse, len, full } = await readPage(job.id, job.u, job.stream, job.offset);
+    const u = await hashUser(id);
+    const { parse, len, full } = await readPage(id, u, stream, job.offset);
     const all = parse({});
-    await save(parse({ skip: job.skip, back: true }).filter((r) => r.ts >= cut), true);
-    const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
-    if (full && oldest >= cut && job.pages + 1 < opt.deepPages) deep.push({ ...job, offset: job.offset + len, pages: job.pages + 1 });
+    await save(parse({ skip: skips.get(id), back: true }).filter((r) => r.ts >= cut), true);
+    k.hist[stream] = moreHistory(all, full, cut, job.offset + len, job.pages + 1);
+    return true;
   }
 
   /** The known player most overdue for a check, with whether they are playing now; null if none is due. */
@@ -348,16 +376,19 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
       // Rows newer than the last one seen are new play; with nothing seen yet, it is history.
       const since = k.newest[stream] || t - opt.historyMs;
       const back = !k.newest[stream];
+      let more = null; // with nothing seen yet: older pages still to read after this revisit
       for (let page = 0, offset = 0; page < opt.maxPages; page++) {
         const { parse, len, full } = await readPage(id, u, stream, offset);
         const rows = parse({ back });
         noteNewest(id, stream, rows);
         const fresh = rows.filter((r) => r.ts > since);
         await save(fresh, back);
-        if (fresh.length < rows.length || !full) break;
         offset += len;
+        more = moreHistory(rows, full, t - opt.historyMs, offset, 0);
+        if (fresh.length < rows.length || !full) break;
         await doSleep(opt.gapMs);
       }
+      if (back && k.hist[stream] === undefined) k.hist[stream] = more;
       if (stream === 'upgrade') await doSleep(opt.gapMs);
     }
     return true;
@@ -416,17 +447,20 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     return true;
   }
 
-  async function idle() {
-    if (!profileProbed && known.size) return probeProfile();
-    const due = dueRevisit();
-    // Players on the site now come first: they are what "right now" is made of.
-    if (due?.hot) return revisit(due);
-    // Otherwise alternate between older history and revisits, so neither starves the other.
-    const order = idleTurn++ % 2 === 0 ? ['deep', 'revisit'] : ['revisit', 'deep'];
-    for (const what of order) {
-      if (what === 'deep' && deep.length) return readDeep();
-      if (what === 'revisit' && due) return revisit(due);
+  /** One kind of work from the rotation; false when it has nothing to do. */
+  async function work(kind) {
+    if (kind === 'look') return queue.length ? (await backfill(queue.shift()), true) : false;
+    if (kind === 'follow') return follow();
+    if (kind === 'hot' || kind === 'revisit') {
+      // Players on the site now come first: they are what "right now" is made of.
+      const due = dueRevisit();
+      return due && (due.hot || kind === 'revisit') ? revisit(due) : false;
     }
+    if (kind === 'history') {
+      const job = nextHistory();
+      return job ? readHistory(job) : false;
+    }
+    return false;
   }
 
   async function step() {
@@ -434,14 +468,10 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     if (t - lastCases >= opt.casesEveryMs) return readCases();
     if (t - lastFeed >= opt.feedEveryMs) return readFeed();
     if (t - lastStats >= opt.statsEveryMs) return readStats();
-    if (queue.length && backfillRun < opt.backfillsPerFollow) {
-      backfillRun++;
-      return backfill(queue.shift());
-    }
-    backfillRun = 0;
-    if (await follow()) return;
-    if (queue.length) return backfill(queue.shift());
-    return idle();
+    if (!profileProbed && known.size) return probeProfile();
+    const n = opt.turns.length;
+    const start = turn++ % n;
+    for (let i = 0; i < n; i++) if (await work(opt.turns[(start + i) % n])) return;
   }
 
   async function loop() {
@@ -510,7 +540,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
     /** What a restart should carry over (see `initial`). Holds real site ids: keep it local. */
     exportState() {
       return {
-        known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, deep: k.deep })),
+        known: [...known].map(([id, k]) => ({ id, seen: k.seen, revisited: k.revisited, newest: k.newest, hist: k.hist })),
         pageSize,
         pageProbe,
         profileProbed,
@@ -527,7 +557,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
         // Known players seen playing in the last `activeMs`, found through the feed or a revisit.
         activeNow: [...known.values()].filter((k) => now() - lastPlayed(k) <= opt.activeMs).length,
         revisitsDue: [...known].filter(([id, k]) => !players.has(id) && !backfilled.has(id) && k.revisited + revisitEvery(k) <= now()).length,
-        historyPages: deep.length,
+        // Lists with older pages still to read (up to `deepPages` each).
+        historyPages: [...known.values()].reduce((s, k) => s + STREAMS.filter((st) => k.hist[st]).length, 0),
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
         requestsLastHour: requests.length,
         rowsLastHour: counted.reduce((s, [, n]) => s + n, 0),

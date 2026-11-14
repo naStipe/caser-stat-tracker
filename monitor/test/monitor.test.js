@@ -509,7 +509,7 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(v.heat.upgrade[3][13].index.index, 1.2);
   assert.equal(v.hours.upgrade[13].index.index, 1.2);
   assert.equal(v.hours.upgrade[12].index.index, null);
-  assert.equal(v.bands[0].label, '10–30%');
+  assert.equal(v.bands[0].label, '10–15%');
   assert.equal(v.bands[0].winRate, 0.25);
   assert.equal(v.cases[0].hitRate, 0.4);
   assert.equal(v.cases[0].index.index, 20 / 17.5);
@@ -780,9 +780,9 @@ test('collector: players playing now are revisited first and often, quiet ones r
   const initial = {
     profileProbed: true,
     known: [
-      { id: 'quiet', seen: T0 - 2 * 24 * 3600e3, revisited: T0 - 3600e3, newest: { upgrade: T0 - 2 * 24 * 3600e3, case: 0 }, deep: true },
-      { id: 'warm', seen: T0 - 3600e3, revisited: T0 - 40 * M, newest: { upgrade: T0 - 2 * 3600e3, case: 0 }, deep: true },
-      { id: 'hot', seen: T0 - 3600e3, revisited: T0 - 15 * M, newest: { upgrade: T0 - 10 * M, case: 0 }, deep: true },
+      { id: 'quiet', seen: T0 - 2 * 24 * 3600e3, revisited: T0 - 3600e3, newest: { upgrade: T0 - 2 * 24 * 3600e3, case: 0 }, hist: { upgrade: null, case: null } },
+      { id: 'warm', seen: T0 - 3600e3, revisited: T0 - 40 * M, newest: { upgrade: T0 - 2 * 3600e3, case: 0 }, hist: { upgrade: null, case: null } },
+      { id: 'hot', seen: T0 - 3600e3, revisited: T0 - 15 * M, newest: { upgrade: T0 - 10 * M, case: 0 }, hist: { upgrade: null, case: null } },
     ],
   };
   const { c, done } = run(site, { budget: 12, initial });
@@ -815,4 +815,44 @@ test('collector: probes profile field names once, and a refused profile does not
   assert.equal(c.status().stopReason, null, '403 on the probe does not stop the collector');
   assert.equal(events.filter((x) => x.code === 'profile-fields').length, 1, 'once');
   assert.deepEqual(fieldNames({ a: 1, b: { c: 2 }, d: [1] }), ['a', 'b.c', 'd']);
+});
+
+test('collector: history keeps its share while followed players always have work, and resumes after a restart', async () => {
+  const site = pagedSite({ upgrades: 600, cases: 3 });
+  site.feed = { liveDrops: Array.from({ length: 12 }, (_, i) => ({ user: { id: `p${i}` }, item: { marketName: 'W' } })) };
+  const deepCalls = () => site.calls.filter((p) => p.includes('public-history') && !/offset=0\b/.test(p));
+  const options = { profileEveryMs: 1, revisitHotMs: 1 };
+  const first = run(site, { budget: 80, options, initial: { profileProbed: true } });
+  await first.done;
+  const n = deepCalls().length;
+  assert.ok(n >= 10, `history pages read while follows are busy (${n})`);
+  const state = first.c.exportState();
+  const p0 = state.known.find((k) => k.hist.upgrade && k.hist.upgrade.offset >= 100);
+  assert.ok(p0, 'progress is saved');
+  // A restart picks up where it stopped instead of starting over or forgetting.
+  site.calls.length = 0;
+  site.feed = { liveDrops: [] };
+  const second = run(site, { budget: 20, options, initial: JSON.parse(JSON.stringify(state)) });
+  await second.done;
+  const resumed = deepCalls().find((p) => p.includes(`/${p0.id}?`));
+  assert.ok(resumed, 'its history is read again after the restart');
+  assert.equal(Number(new URLSearchParams(resumed.split('?')[1]).get('offset')), p0.hist.upgrade.offset);
+});
+
+test('collector: a state saved before 1.4 reads recent players history again', async () => {
+  const site = pagedSite({ upgrades: 600 });
+  site.feed = { liveDrops: [] };
+  const initial = {
+    profileProbed: true,
+    known: [
+      { id: 'old', seen: T0 - 9 * 24 * 3600e3, revisited: T0, newest: { upgrade: T0 - 9 * 24 * 3600e3, case: 0 }, deep: true },
+      { id: 'recent', seen: T0, revisited: T0, newest: { upgrade: T0 - 3600e3, case: 0 }, deep: true },
+    ],
+  };
+  const { c, done } = run(site, { budget: 4, initial });
+  await done;
+  const hist = site.calls.filter((p) => p.includes('public-history'));
+  assert.ok(hist.length && hist.every((p) => p.includes('/recent?')), 'only the player who played in the last 7 days');
+  assert.match(hist[0], /offset=50\b/);
+  assert.equal(c.exportState().known.find((k) => k.id === 'old').hist.upgrade, null);
 });

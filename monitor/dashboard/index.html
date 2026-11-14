@@ -428,7 +428,7 @@ function problemsSection() {
     `${fmtInt(st.rowsLastHour)} rows in the last hour (${fmtInt(st.backRowsLastHour)} from players’ history)`,
     `${fmtInt(st.requestsLastHour)} requests`,
     `${fmtInt(st.activeNow)} known players playing now`,
-    `${fmtInt(st.players)} followed, ${fmtInt(st.queued)} waiting, ${fmtInt(st.known)} known, ${fmtInt(st.revisitsDue)} checks due, ${fmtInt(st.historyPages)} history pages to read`,
+    `${fmtInt(st.players)} followed, ${fmtInt(st.queued)} waiting, ${fmtInt(st.known)} known, ${fmtInt(st.revisitsDue)} checks due, ${fmtInt(st.historyPages)} lists with history to read`,
   ];
   const recent = events.slice(0, 12);
   return h('section', { class: ['health', health?.level ?? 'warn'] },

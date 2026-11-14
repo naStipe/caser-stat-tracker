@@ -173,7 +173,7 @@ export function buildReport({ report, cmp, heatReport = null, compareMinutes = 6
 
   out.bands = (report?.bands ?? []).map(cleanRow).sort((a, b) => String(a.band).localeCompare(String(b.band))).map((b) => ({
     band: b.band,
-    label: { a: 'under 10%', b: '10–30%', c: '30–60%', d: '60% and up' }[b.band] ?? b.band,
+    label: { a: 'under 10%', b: '10–15%', c: '15–25%', d: '25–35%', e: '35–55%', f: '55–70%', g: '70% and up' }[b.band] ?? b.band,
     n: b.n,
     players: b.players,
     index: indexOf({ n: b.n, obs: b.w, exp: b.ew, v: b.vw }),

@@ -37,19 +37,26 @@ Sections:
 
 One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does the most urgent thing that is due:
 
-1. `GET /api/game/cases` every 6 hours (case prices), `GET /api/live-drops` every 30 s (finds active players; the
-   feed shows big wins, so the sample leans towards big spenders), `GET /api/statistics` every 60 s.
-2. A newly found player's latest page of upgrades and case drops (`/api/game/upgrade/public-history/{id}`,
-   `/api/users/{id}/inventory/history`). The feed wins that found them are left out, or every player would start
-   with a big win.
-3. Following: one of the two lists of a followed player about every 90 s, for 2 hours after they were found.
-4. When nothing above is due:
-   - **revisits**: every player the feed has shown is remembered (up to 5,000, for 14 days after they were last
-     seen) and checked again for new rows: every 10 minutes while they played in the last 30 minutes (these
-     come before anything else here), every 30 minutes if they played in the last 3 hours, every 2 hours within a
-     day, else every 6 hours (`REVISIT_HOURS`). The dashboard shows how many known players are playing now.
-   - **history**: older pages of each new player's lists, back 7 days (`HISTORY_DAYS`), at most 10 pages each
-     (`HISTORY_PAGES`).
+1. On a clock: `GET /api/game/cases` every 6 hours (case prices), `GET /api/live-drops` every 30 s (finds active
+   players; the feed shows big wins, so the sample leans towards big spenders), `GET /api/statistics` every 60 s.
+2. Every other turn goes to the next kind of work in a fixed rotation, so each gets its share of the requests even
+   when another always has work (a kind with nothing to do passes its turn on). Per 8 turns:
+   - 2 × **first look**: a newly found player's latest page of upgrades and case drops
+     (`/api/game/upgrade/public-history/{id}`, `/api/users/{id}/inventory/history`). The feed wins that found
+     them are left out, or every player would start with a big win.
+   - 2 × **follow**: one of the two lists of a followed player about every 90 s, for 2 hours after they were found.
+   - 1 × **revisit a player playing now**, 1 × **any revisit that is due**: every player the feed has shown is
+     remembered (up to 5,000, for 14 days after they were last seen) and checked again for new rows: every 10
+     minutes while they played in the last 30 minutes (these come first), every 30 minutes if they played in the
+     last 3 hours, every 2 hours within a day, else every 6 hours (`REVISIT_HOURS`). The dashboard shows how many
+     known players are playing now.
+   - 2 × **history**: older pages of each known player's lists, back 7 days (`HISTORY_DAYS`), at most 10 pages
+     each (`HISTORY_PAGES`). This is what fills the time before the monitor ran. Where each player's history
+     stands is saved with the monitor's state, so a restart carries on instead of losing it.
+
+Before 1.4 history came last, after following, and following 30 players took every free turn, so older pages
+were hardly ever read (and their queue was capped and lost on restart). A state saved by an older version
+reads the history of players who played in the last 7 days again.
 
 Why revisits rather than the drop board alone: the board only shows drops worth about 3,500 or more, so players
 who play small never appear there. The site has no way to ask whether a given player is online (it only
