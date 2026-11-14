@@ -88,10 +88,10 @@ still read them.
 
 ## Pulse monitor
 
-`monitor/` is a separate tool, not part of the userscript: a Node service (or Docker container) that samples other
-players' recent upgrades and case drops and shows, on its own password-protected page, whether play on the site is
-more profitable now than a few hours ago. See `monitor/README.md`. The `pulse_*` tables in the Supabase migrations
-belong to an earlier version of it inside the userscript and are no longer used.
+`monitor/` is a separate tool, not part of the userscript: a Docker service that samples other players' recent
+upgrades and case drops on the site and writes them to Supabase, and a login-protected dashboard page that shows
+whether play is more profitable now than a few hours ago. See `monitor/README.md`. The `pulse_*` tables in the
+Supabase migrations belong to an earlier version of it inside the userscript and are no longer used.
 
 ## Develop
 

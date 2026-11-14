@@ -1,7 +1,7 @@
-// Site pulse statistics. Pure: rows or aggregates in, plain objects out.
+// Pulse statistics for the dashboard page (and the tests). Pure: rows or aggregates in, plain objects out.
 //
 // An aggregate holds sums over the rows of one time bucket and one kind, so the same numbers can
-// come from local rows (aggregate()) or from the database (pulse_agg in the pulse migration):
+// come from rows (aggregate()) or from the database (monitor_agg in supabase/migrations/*_monitor.sql):
 //   {bucket, kind, n, players, sx, sy, sxx, syy, sxy, gxx, gyy, gxy}
 //   x = stake, y = returned. g* are the same sums over per-player totals (one term per player),
 //   used for a standard error that treats each player's rows as one cluster: rows of one player

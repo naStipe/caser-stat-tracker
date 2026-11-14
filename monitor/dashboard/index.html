@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Pulse monitor</title>
+<style>
+  :root {
+    --bg: #0f1114;
+    --panel: #15181c;
+    --line: #22272e;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --faint: #6b7480;
+    --pos: #45c486;
+    --neg: #ef6b6b;
+    --accent: #7ea6f6;
+    --warn: #d8a650;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; margin-bottom: 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); }
+  .hint { color: var(--faint); font-size: 12.5px; margin: 10px 0 0; }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  .num { font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  button, input { font: inherit; color: inherit; }
+  button { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 5px 11px; cursor: pointer; transition: border-color 120ms, background 120ms; }
+  button:hover { border-color: var(--faint); }
+  button.on { background: var(--text); color: var(--bg); border-color: var(--text); }
+  button.primary { background: var(--accent); color: #0b0d10; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  label { display: block; color: var(--muted); font-size: 12.5px; margin: 12px 0 4px; }
+  .login { max-width: 360px; margin: 10vh auto 0; }
+  .login button { width: 100%; margin-top: 16px; padding: 9px; }
+  .error { color: var(--neg); margin: 10px 0 0; }
+  .health { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; border-left: 3px solid var(--line); }
+  .health.ok { border-left-color: var(--pos); }
+  .health.warn { border-left-color: var(--warn); }
+  .health.bad { border-left-color: var(--neg); }
+  .health .state { font-weight: 600; }
+  .health.warn .state { color: var(--warn); }
+  .health.bad .state { color: var(--neg); }
+  .verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .verdicts section { margin: 0; border-left-width: 3px; }
+  .verdicts .good { border-left-color: var(--pos); }
+  .verdicts .bad { border-left-color: var(--neg); }
+  .headline { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .kpi .k { color: var(--muted); font-size: 12.5px; }
+  .kpi .v { font-size: 22px; font-weight: 600; }
+  .kpi .s { color: var(--faint); font-size: 12.5px; }
+  .chart svg { display: block; width: 100%; height: auto; }
+  .chart text { fill: var(--faint); font-size: 11px; font-family: inherit; }
+  .readout { min-height: 21px; font-size: 13px; margin-bottom: 6px; }
+  .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  .legend i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 6px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left; }
+  td .ci { display: block; color: var(--faint); font-size: 11.5px; }
+  .fade { animation: fade 160ms ease-out; }
+  @keyframes fade { from { opacity: 0.4; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .fade { animation: none; } button { transition: none; } }
+</style>
+</head>
+<body>
+<main id="root"><p class="faint">Loading…</p></main>
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
+import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
+import { RANGES, rangeSpec, compareWindows, buildView, monitorHealth } from './view.js';
+
+const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
+const root = document.getElementById('root');
+const HOUR = 3600000;
+const COLORS = { line: '#7ea6f6', grid: '#22272e', zero: '#3a414b', pos: '#45c486', neg: '#ef6b6b', whisker: '#c3c8cf', marker: '#e6e8eb', diag: '#6b7480', bg: '#15181c', warn: '#d8a650' };
+const DASH = '–';
+const ok = (v) => typeof v === 'number' && Number.isFinite(v);
+const fmt = (v, d = 0) => (ok(v) ? v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) : DASH);
+const fmtR = (v) => fmt(v, 3);
+const fmtInt = (v) => fmt(v, 0);
+const fmtAgo = (t) => {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return s < 60 ? `${s} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} days ago`;
+};
+const sign = (v) => (!ok(v) ? 'faint' : v > 1e-9 ? 'pos' : v < -1e-9 ? 'neg' : '');
+
+let rangeKey = (() => { try { return localStorage.getItem('pulse.range') || '24h'; } catch { return '24h'; } })();
+if (!RANGES[rangeKey]) rangeKey = '24h';
+let view = null;
+let health = null;
+let session = null;
+let loading = false;
+let firstPaint = true;
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'text') el.textContent = v;
+    else if (k === 'class') el.className = Array.isArray(v) ? v.filter(Boolean).join(' ') : v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of kids.flat()) if (c != null) el.append(c);
+  return el;
+}
+function s(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'text') el.textContent = v;
+    else el.setAttribute(k, v);
+  }
+  return el;
+}
+
+function timeLabel(t, span) {
+  const d = new Date(t);
+  if (span <= 24 * HOUR) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (span <= 7 * 24 * HOUR) return d.toLocaleString([], { weekday: 'short', hour: '2-digit' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+function bucketLabel(t, bucket) {
+  const d = new Date(t);
+  return bucket >= 24 * HOUR ? d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function niceTicks(min, max, count = 4) {
+  if (min === max) { const d = Math.abs(min) || 1; min -= d; max += d; }
+  const raw = (max - min) / count;
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / p;
+  const step = (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+  const lo = Math.floor(min / step) * step;
+  const hi = Math.ceil(max / step) * step;
+  const ticks = [];
+  for (let v = lo; v <= hi + step / 2; v += step) ticks.push(Math.abs(v) < step / 1e6 ? 0 : v);
+  return { lo, hi, ticks };
+}
+
+/** Time axis shared by both chart kinds. */
+function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label }) {
+  const W = Math.max(260, Math.floor(width));
+  const H = 200, padL = 46, padR = 10, padT = 10, padB = 22;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const x = (t) => padL + ((Math.max(t0, Math.min(t1, t)) - t0) / (t1 - t0 || 1)) * iw;
+  const y = (v) => padT + ih - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo || 1)) * ih;
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': label });
+  for (const v of ticks) {
+    const yy = Math.round(y(v)) + 0.5;
+    svg.append(s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid }), s('text', { x: padL - 6, y: yy + 3.5, 'text-anchor': 'end', text: tickFmt(v) }));
+  }
+  const steps = [HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR, 2 * 24 * HOUR, 7 * 24 * HOUR];
+  const step = steps.find((st) => (t1 - t0) / st <= 6) ?? steps.at(-1);
+  const offset = new Date().getTimezoneOffset() * 60000;
+  for (let t = Math.ceil((t0 - offset) / step) * step + offset; t <= t1; t += step) {
+    const xx = Math.round(x(t)) + 0.5;
+    svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih, stroke: COLORS.grid }));
+    if (xx > padL + 28 && xx < W - padR - 28) svg.append(s('text', { x: xx, y: padT + ih + 14, 'text-anchor': 'middle', text: timeLabel(t, span) }));
+  }
+  return { svg, x, y, W, H, padL, padT, iw, ih };
+}
+
+function hover(f, marks, onPick, onIdle) {
+  if (!marks.length) return;
+  const ring = s('circle', { r: 6, fill: 'none', stroke: COLORS.marker, visibility: 'hidden' });
+  const hit = s('rect', { x: f.padL, y: f.padT, width: f.iw, height: f.ih, fill: 'transparent' });
+  f.svg.append(ring, hit);
+  const move = (e) => {
+    const box = f.svg.getBoundingClientRect();
+    const px = ((e.clientX - box.left) / (box.width || 1)) * f.W;
+    let best = marks[0];
+    for (const m of marks) if (Math.abs(m.cx - px) < Math.abs(best.cx - px)) best = m;
+    ring.setAttribute('cx', best.cx);
+    ring.setAttribute('cy', best.cy);
+    ring.setAttribute('visibility', 'visible');
+    onPick(best);
+  };
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
+  hit.addEventListener('pointerleave', () => { ring.setAttribute('visibility', 'hidden'); onIdle(); });
+}
+
+/** Return per 1 by bucket, with 95% ranges; for short ranges also the two comparison windows as bands. */
+function returnChart({ v, kind, what, width }) {
+  const { spec, compare, windows, now } = v;
+  const span = spec.to - spec.from;
+  const rows = v.buckets.map((b) => ({ start: b.start, r: b[kind] }));
+  const c = compare[kind];
+  const bands = span <= 24 * HOUR;
+  const vals = [1];
+  for (const x of rows) if (ok(x.r?.ratio) && x.r.ci && x.r.n >= 20) vals.push(x.r.ratio);
+  if (bands) for (const k of ['recent', 'base']) { const r = c?.[k]; if (ok(r?.ratio)) vals.push(r.ratio, ...(r.ci || [])); }
+  const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(3, q)));
+  const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
+  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, label: `Return per 1 staked on ${what} over the last ${spec.label}.` });
+  const { svg, x, y } = f;
+  const yb = Math.round(y(1)) + 0.5;
+  svg.append(s('line', { x1: f.padL, x2: f.W - 10, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+  if (bands) {
+    const vc = c?.verdict === 'better' ? COLORS.pos : c?.verdict === 'worse' ? COLORS.neg : COLORS.line;
+    for (const [k, color] of [['base', COLORS.whisker], ['recent', vc]]) {
+      const r = c?.[k], win = windows[k];
+      if (!ok(r?.ratio)) continue;
+      const xa = x(win.from), xb = x(Math.min(win.to, now));
+      if (r.ci) { const ya = y(r.ci[1]); svg.append(s('rect', { x: xa, y: ya, width: Math.max(1, xb - xa), height: Math.max(1, y(r.ci[0]) - ya), fill: color, 'fill-opacity': 0.14 })); }
+      svg.append(s('line', { x1: xa, x2: xb, y1: y(r.ratio), y2: y(r.ratio), stroke: color, 'stroke-width': 2 }));
+    }
+  }
+  const marks = [];
+  for (const row of rows) {
+    const r = row.r;
+    if (!r || !r.n || !ok(r.ratio)) continue;
+    const cx = x(row.start + spec.bucket / 2);
+    if (r.ci) svg.append(s('line', { x1: cx, x2: cx, y1: y(r.ci[0]), y2: y(r.ci[1]), stroke: COLORS.zero }));
+    svg.append(s('circle', { cx, cy: y(r.ratio), r: 3, fill: r.ci ? COLORS.line : COLORS.bg, stroke: COLORS.line, 'stroke-width': 1.5 }));
+    marks.push({ cx, cy: y(r.ratio), row });
+  }
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a point for details. Hollow dots: fewer than 5 players.' : 'No data in this range yet.' }));
+  idle();
+  hover(f, marks, ({ row }) => {
+    const r = row.r;
+    readout.replaceChildren(`${bucketLabel(row.start, spec.bucket)}: `, h('span', { class: ['num', sign(r.ratio - 1)], text: fmtR(r.ratio) }),
+      h('span', { class: 'faint', text: `  ${r.ci ? `range ${fmtR(r.ci[0])}–${fmtR(r.ci[1])}, ` : ''}${fmtInt(r.n)} ${what}, ${fmtInt(r.players)} players` }));
+  }, idle);
+  return h('div', { class: 'chart' }, readout, svg);
+}
+
+/** Site-wide upgrades and case opens per minute. */
+function activityChart({ v, width }) {
+  const { spec, now } = v;
+  const series = [['upgradesPerMin', 'Upgrades / min', COLORS.line], ['casesPerMin', 'Case opens / min', COLORS.warn]];
+  const vals = [];
+  for (const b of v.buckets) for (const [k] of series) if (ok(b.volume[k])) vals.push(b.volume[k]);
+  const { lo, hi, ticks } = niceTicks(0, Math.max(10, ...vals), 4);
+  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => (q >= 1000 ? `${fmt(q / 1000, q % 1000 ? 1 : 0)}k` : fmt(q)), span: spec.to - spec.from, label: `Site-wide upgrades and case opens per minute over the last ${spec.label}.` });
+  const marks = [];
+  for (const [k, , color] of series) {
+    let d = '';
+    for (const b of v.buckets) {
+      if (!ok(b.volume[k])) { d += ' '; continue; }
+      const cx = f.x(b.start + spec.bucket / 2), cy = f.y(b.volume[k]);
+      d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${cx.toFixed(1)},${cy.toFixed(1)}`;
+      if (k === 'upgradesPerMin') marks.push({ cx, cy, b });
+    }
+    f.svg.append(s('path', { d: d.trim(), fill: 'none', stroke: color, 'stroke-width': 1.75, 'stroke-linejoin': 'round' }));
+  }
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'From the site’s public counters. Hover or tap for details.' : 'No counter samples in this range yet.' }));
+  idle();
+  hover(f, marks, ({ b }) => readout.replaceChildren(`${bucketLabel(b.start, spec.bucket)}: `,
+    h('span', { class: 'num', text: `${fmtInt(b.volume.upgradesPerMin)} upgrades / min, ${fmtInt(b.volume.casesPerMin)} case opens / min, ${fmtInt(b.volume.online)} online` })), idle);
+  const legend = h('div', { class: 'legend' }, series.map(([, label, color]) => h('span', null, h('i', { style: `background:${color}` }), label)));
+  return h('div', { class: 'chart' }, legend, readout, f.svg);
+}
+
+const VERDICT = { better: ['good', 'Higher now'], worse: ['bad', 'Lower now'], same: ['', 'No clear change'], few: ['', 'Not enough data yet'] };
+function verdictCard(label, c) {
+  const [cls, word] = VERDICT[c.verdict] || VERDICT.few;
+  const r = c.recent, b = c.base;
+  const detail = c.verdict === 'few'
+    ? `Needs at least 30 ${label.toLowerCase()} from 5 or more players in each window. Last hour: ${fmtInt(r.n)} from ${fmtInt(r.players)} players; the 3 hours before: ${fmtInt(b.n)}.`
+    : `Players got back ${fmtR(r.ratio)} per 1 staked in the last hour (${fmtInt(r.n)} from ${fmtInt(r.players)} players), against ${fmtR(b.ratio)} in the 3 hours before (${fmtInt(b.n)}). ${c.verdict === 'same' ? 'The difference is within random noise' : 'The difference is too large to be luck'} (p = ${ok(c.p) ? fmt(c.p, 3) : DASH}).`;
+  return h('section', { class: cls }, h('div', { class: 'headline', text: `${label}: ${word}` }), h('div', { class: 'muted', text: detail }));
+}
+const kpi = (k, val, sub) => h('div', { class: 'kpi' }, h('div', { class: 'k', text: k }), h('div', { class: 'v num', text: val }), sub ? h('div', { class: 's', text: sub }) : null);
+const ratioCell = (r) => h('td', { class: 'num' }, h('span', { class: ok(r?.ratio) ? sign(r.ratio - 1) : 'faint', text: fmtR(r?.ratio) }), r?.ci ? h('span', { class: 'ci', text: `${fmtR(r.ci[0])} ${DASH} ${fmtR(r.ci[1])}` }) : null);
+
+function healthSection() {
+  if (!health) return null;
+  const st = health.status ?? {};
+  const facts = health.level === 'bad' && !st.running ? [] : [
+    `${fmtInt(st.rowsLastHour)} rows in the last hour (${fmtInt(st.backRowsLastHour)} from players’ history)`,
+    `${fmtInt(st.requestsLastHour)} requests`,
+    `${fmtInt(st.players)} players followed, ${fmtInt(st.queued)} waiting`,
+  ];
+  return h('section', { class: ['health', health.level] },
+    h('span', { class: 'state', text: health.text }),
+    ...facts.map((t) => h('span', { class: 'muted', text: t })),
+    health.at ? h('span', { class: 'faint', text: `Last report ${fmtAgo(health.at)}${st.version ? `, monitor ${st.version}` : ''}.` }) : null);
+}
+
+function header() {
+  return h('header', null, h('h1', { text: 'Pulse monitor' }),
+    h('div', { class: 'row' },
+      ...Object.entries(RANGES).map(([k, r]) => h('button', { type: 'button', class: k === rangeKey ? 'on' : '', 'aria-pressed': String(k === rangeKey), text: k, title: r.label, onclick: () => setRange(k) })),
+      h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
+      h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
+}
+
+function renderDashboard() {
+  const v = view;
+  const width = Math.min(root.clientWidth || 960, 968) - 34;
+  const out = [header()];
+  const hs = healthSection();
+  if (hs) out.push(hs);
+  if (!v) { out.push(h('p', { class: 'faint', text: 'Loading…' })); root.replaceChildren(...out); return; }
+  out.push(h('div', { class: 'verdicts' }, verdictCard('Upgrades', v.compare.upgrade), verdictCard('Cases', v.compare.case)));
+  const vol = v.volume;
+  out.push(h('section', null, h('h2', { text: 'Last hour against the 3 hours before' }),
+    h('div', { class: 'kpis' },
+      kpi('Upgrades, return per 1', fmtR(v.compare.upgrade.recent.ratio), `before ${fmtR(v.compare.upgrade.base.ratio)}`),
+      kpi('Cases, return per 1', fmtR(v.compare.case.recent.ratio), `before ${fmtR(v.compare.case.base.ratio)}`),
+      kpi('Site upgrades / min', fmtInt(vol.recent.upgradesPerMin), `before ${fmtInt(vol.base.upgradesPerMin)}`),
+      kpi('Site case opens / min', fmtInt(vol.recent.casesPerMin), `before ${fmtInt(vol.base.casesPerMin)}`)),
+    h('p', { class: 'hint', text: 'Return per 1 is total value received divided by total staked, over every sampled upgrade or case open. 1.000 means players broke even at site prices.' })));
+
+  const t = v.total;
+  out.push(h('section', null, h('h2', { text: `Whole range: last ${v.spec.label}` }),
+    h('div', { class: 'kpis' },
+      kpi('Upgrades, return per 1', fmtR(t.upgrade.ratio), t.upgrade.ci ? `range ${fmtR(t.upgrade.ci[0])}–${fmtR(t.upgrade.ci[1])}` : null),
+      kpi('Sampled upgrades', fmtInt(t.upgrade.n), `${fmtInt(t.upgrade.staked)} staked`),
+      kpi('Cases, return per 1', fmtR(t.case.ratio), t.case.ci ? `range ${fmtR(t.case.ci[0])}–${fmtR(t.case.ci[1])}` : null),
+      kpi('Sampled case opens', fmtInt(t.case.n), `${fmtInt(t.case.staked)} spent`))));
+
+  const step = v.spec.bucket >= 24 * HOUR ? 'day' : v.spec.bucket >= HOUR ? `${v.spec.bucket / HOUR} h` : `${v.spec.bucket / 60000} min`;
+  for (const [kind, label, what] of [['upgrade', 'Upgrades', 'upgrades'], ['case', 'Cases', 'case opens']]) {
+    out.push(h('section', null, h('h2', { text: `${label}: return per 1 staked, per ${step}` }), returnChart({ v, kind, what, width }),
+      kind === 'case' ? h('p', { class: 'hint', text: `Dots are ${step} buckets with their 95% range; hollow dots have too few players for a range. The dashed line at 1 is break-even at site prices.${v.spec.to - v.spec.from <= 24 * HOUR ? ' The bands are the last hour (right) and the 3 hours before it: when they overlap a lot, the change is noise.' : ''}` }) : null));
+  }
+  out.push(h('section', null, h('h2', { text: `Site activity, per ${step}` }), activityChart({ v, width })));
+
+  const rows = [...v.buckets].reverse().filter((b) => b.upgrade.n || b.case.n || ok(b.volume.casesPerMin));
+  out.push(h('section', null, h('h2', { text: `By ${step}, newest first` }),
+    rows.length
+      ? h('div', { class: 'table-wrap' }, h('table', null,
+          h('thead', null, h('tr', null, ...['Time', 'Upgrades', 'Return', 'Cases', 'Return', 'Staked', 'Site / min', 'Online'].map((x) => h('th', { text: x })))),
+          h('tbody', null, rows.map((b) => h('tr', null,
+            h('td', { class: 'num', text: bucketLabel(b.start, v.spec.bucket) }),
+            h('td', { class: 'num', text: fmtInt(b.upgrade.n) }), ratioCell(b.upgrade),
+            h('td', { class: 'num', text: fmtInt(b.case.n) }), ratioCell(b.case),
+            h('td', { class: 'num', text: fmtInt(b.upgrade.staked + b.case.staked) }),
+            h('td', { class: 'num', text: ok(b.volume.upgradesPerMin) ? `${fmtInt(b.volume.upgradesPerMin)} / ${fmtInt(b.volume.casesPerMin)}` : DASH }),
+            h('td', { class: 'num', text: fmtInt(b.volume.online) }))))))
+      : h('p', { class: 'muted', text: 'Nothing collected in this range yet.' }),
+    h('p', { class: 'hint', text: 'Return: second line is the 95% range, clustered by player. Site / min: site-wide upgrades / case opens per minute.' })));
+
+  out.push(h('section', null, h('h2', { text: 'How the sample is taken' }),
+    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their latest page of upgrades and case drops is read at once, leaving out the feed wins that found them. Then they are followed for up to 2 hours for new rows, the same for winners and losers. Players still playing now are more likely to be found, so the earlier hours come from people who kept going. Players are stored as a salted hash, never by name.' })));
+  root.replaceChildren(...out);
+  if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
+}
+
+function renderLogin(message) {
+  const email = h('input', { type: 'email', id: 'email', autocomplete: 'username', required: true });
+  const password = h('input', { type: 'password', id: 'password', autocomplete: 'current-password', required: true });
+  const err = h('p', { class: 'error', role: 'alert', text: message || '' });
+  const submit = h('button', { type: 'submit', class: 'primary', text: 'Sign in' });
+  const form = h('form', { onsubmit: async (e) => {
+    e.preventDefault();
+    submit.disabled = true;
+    err.textContent = '';
+    const { error } = await sb.auth.signInWithPassword({ email: email.value.trim(), password: password.value });
+    submit.disabled = false;
+    if (error) err.textContent = error.message;
+  } }, h('label', { for: 'email', text: 'Email' }), email, h('label', { for: 'password', text: 'Password' }), password, submit, err);
+  root.replaceChildren(h('section', { class: 'login' }, h('h1', { text: 'Pulse monitor' }), h('p', { class: 'muted', text: 'Sign in to see the data.' }), form));
+  email.focus();
+}
+
+function renderNotViewer() {
+  const id = session.user.id;
+  root.replaceChildren(header(), h('section', null,
+    h('h2', { text: 'This account cannot read the monitor data' }),
+    h('p', { class: 'muted', text: `Signed in as ${session.user.email}. Add the account as a viewer in Supabase (SQL editor):` }),
+    h('pre', { class: 'num', style: 'white-space:pre-wrap;color:var(--text)', text: `insert into public.monitor_viewers (user_id) values ('${id}');` })));
+}
+
+async function rpc(name, args) {
+  const { data, error } = await sb.rpc(name, args);
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function load() {
+  if (!session || loading) return;
+  loading = true;
+  if (view) renderDashboard();
+  try {
+    const isViewer = await rpc('monitor_is_viewer', {});
+    if (!isViewer) { loading = false; renderNotViewer(); return; }
+    const now = Date.now();
+    const spec = rangeSpec(rangeKey, now);
+    const w = compareWindows(now);
+    const one = (win) => ({ from_ms: Math.floor(win.from), to_ms: Math.ceil(win.to), bucket_ms: Math.ceil(win.to) - Math.floor(win.from) });
+    const [recent, base, series, volume, volRecent, volBase, statusRes] = await Promise.all([
+      rpc('monitor_agg', one(w.recent)),
+      rpc('monitor_agg', one(w.base)),
+      rpc('monitor_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket }),
+      rpc('monitor_volume_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket }),
+      rpc('monitor_volume_agg', one(w.recent)),
+      rpc('monitor_volume_agg', one(w.base)),
+      sb.from('monitor_status').select('updated_at,status').maybeSingle(),
+    ]);
+    if (statusRes.error) throw statusRes.error;
+    view = buildView({ recent, base, series, volume, volRecent, volBase, spec, now });
+    health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
+    loading = false;
+    renderDashboard();
+  } catch (e) {
+    loading = false;
+    renderDashboard();
+    root.insertBefore(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${e.message || e}` }), root.children[1] || null);
+  }
+}
+
+function setRange(k) {
+  rangeKey = k;
+  try { localStorage.setItem('pulse.range', k); } catch {}
+  view = null;
+  load();
+}
+
+sb.auth.onAuthStateChange((_event, s2) => {
+  const was = session?.user?.id;
+  session = s2;
+  if (!session) { view = null; health = null; renderLogin(); return; }
+  if (session.user.id !== was) { view = null; renderDashboard(); setTimeout(load, 0); }
+});
+setInterval(() => { if (session && !document.hidden) load(); }, 60000);
+let resizeTimer = null;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (session && view) renderDashboard(); }, 150); });
+</script>
+</body>
+</html>

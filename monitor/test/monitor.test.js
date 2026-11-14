@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
-import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, HOUR } from '../src/stats.js';
+import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, HOUR } from '../dashboard/stats.js';
+import { rangeSpec, buildView, monitorHealth, compareWindows } from '../dashboard/view.js';
 import { createCollector, HttpError } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
-import { createStore } from '../src/store.js';
-import { createServer, authorized } from '../src/server.js';
+import { createCloud } from '../src/cloud.js';
 import { createMonitor } from '../src/main.js';
 
 const T0 = Date.parse('2026-11-14T12:00:00Z');
@@ -217,29 +217,6 @@ test('collector: caps and expiry', async () => {
   assert.equal(c.status().players, 0);
 });
 
-// ---- store ----
-
-test('store: rows are unique by id, survive a restart, old files are pruned', async () => {
-  const dir = await tmp();
-  try {
-    let t = T0;
-    const a = await createStore({ dir, now: () => t });
-    assert.equal(await a.putRows([{ id: 'x', ts: T0 - 1000 }, { id: 'y', ts: T0 - 2000 }]), 2);
-    assert.equal(await a.putRows([{ id: 'x', ts: T0 - 1000 }]), 0);
-    await a.putVolume({ ts: T0, cases: 1, upgrades: 1, online: 1 });
-    const b = await createStore({ dir, now: () => t });
-    assert.equal(b.count(), 2);
-    assert.equal(await b.putRows([{ id: 'y', ts: T0 - 2000 }]), 0, 'repeats are spotted after a restart');
-    assert.equal(b.since(T0 - HOUR).volume.length, 1);
-    t += 20 * 24 * HOUR;
-    await b.prune();
-    assert.equal(b.count(), 0);
-    assert.deepEqual(await readdir(dir), []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 // ---- site login ----
 
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
@@ -249,8 +226,10 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
 /** Fake site behind fetch, with rotating refresh tokens. */
 function fakeWorld(clock) {
   const w = { issued: 0, refreshTokens: new Set(['r0']), access: new Set(), calls: [], htmlNext: false, killAccess: false };
+  w.db = { rows: new Map(), volume: new Map(), status: null, deletes: [], fail: 0 };
   w.fetch = async (url, init = {}) => {
     const u = new URL(url);
+    if (u.host === 'db.supabase.test') return fakeSupabase(w.db, u, init);
     w.calls.push(`${init.method || 'GET'} ${u.pathname}`);
     assert.match(init.headers['user-agent'], /^pulse-collector\//);
     if (u.pathname === '/api/users/auth/refresh') {
@@ -311,14 +290,42 @@ test('site: a 401 renews once; a dead refresh token or an HTML page throws', asy
   await assert.rejects(site.getJson('/api/statistics'), (e) => e instanceof HttpError && e.status === 401);
 });
 
+/** The parts of Supabase's REST API the monitor uses. */
+function fakeSupabase(db, u, init) {
+  assert.equal(init.headers.apikey, 'sb_secret_test');
+  if (db.fail) {
+    db.fail--;
+    return json(503, { message: 'down' });
+  }
+  const table = u.pathname.replace('/rest/v1/', '');
+  if (init.method === 'DELETE') {
+    db.deletes.push(`${table}?${u.searchParams}`);
+    return new Response(null, { status: 204 });
+  }
+  const body = JSON.parse(init.body);
+  if (table === 'monitor_status') {
+    db.status = body;
+    return new Response(null, { status: 201 });
+  }
+  assert.match(init.headers.prefer, /ignore-duplicates/);
+  const into = table === 'monitor_rows' ? db.rows : db.volume;
+  for (const r of body) {
+    const k = table === 'monitor_rows' ? r.id : r.ts;
+    if (!into.has(k)) into.set(k, r);
+  }
+  return new Response(null, { status: 201 });
+}
+
 // ---- monitor ----
+
+const ENV = { CASER_REFRESH_TOKEN: 'r0', CASER_BASE: 'https://caser.test', SUPABASE_URL: 'https://db.supabase.test', SUPABASE_SECRET_KEY: 'sb_secret_test' };
 
 async function startMonitor(w, env, clock, budgetN = 12) {
   let budget = budgetN;
   const m = await createMonitor({
     env,
     fetch: async (url, init) => {
-      if (--budget === 0) m.stop();
+      if (!String(url).includes('supabase.test') && --budget === 0) m.stop();
       return w.fetch(url, init);
     },
     version: 'test',
@@ -329,29 +336,35 @@ async function startMonitor(w, env, clock, budgetN = 12) {
   return m;
 }
 
-test('monitor: collects into the store, summarizes, keeps tokens and salt across restarts', async () => {
+test('monitor: sends rows, volume and its status to Supabase, keeps tokens and salt across restarts', async () => {
   const dir = await tmp();
   try {
     let t = T0;
     const clock = { now: () => t, advance: (ms) => (t += ms) };
     const w = fakeWorld(() => t);
-    const env = { CASER_REFRESH_TOKEN: 'r0', CASER_BASE: 'https://caser.test', DATA_DIR: dir };
+    const env = { ...ENV, DATA_DIR: dir };
     const first = await startMonitor(w, env, clock);
     assert.equal(first.config.gapMs, 8000);
+    assert.equal(first.config.retentionDays, 30);
     assert.equal((await first.run()).error, null);
-    const snap = first.snapshot();
-    assert.equal(snap.info.stored, 2);
-    assert.equal(snap.summary.day.upgrade.n, 1);
-    assert.equal(snap.summary.day.case.n, 1);
+    assert.deepEqual([...w.db.rows.keys()].sort(), ['case:9', 'upgrade:7']);
+    const row = w.db.rows.get('upgrade:7');
+    assert.match(row.u, /^[0-9a-f]{16}$/);
+    assert.equal(row.back, true);
+    assert.ok(w.db.volume.size >= 1);
+    assert.equal(w.db.status.id, 1);
+    assert.equal(w.db.status.status.running, false, 'the final report says it stopped');
+    assert.equal(w.db.status.status.version, 'test');
+    assert.ok(w.db.deletes.some((d) => d.startsWith('monitor_rows?ts=lt.')), 'old rows are pruned');
     const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
     assert.equal(state.tokens.refresh, `r${w.issued}`);
+    assert.equal(state.pendingRows.length, 0);
     assert.ok(!JSON.stringify(state).includes('"42"'), 'no player ids in the state');
 
     t += 20 * 60000; // the saved access token has run out
     const issued = w.issued;
     const second = await startMonitor(w, env, clock);
     assert.equal(second.state.salt, state.salt);
-    assert.equal(second.store.count(), 2, 'rows are loaded back');
     await second.run();
     assert.equal(w.issued, issued + 1, 'the rotated refresh token still works');
 
@@ -363,47 +376,135 @@ test('monitor: collects into the store, summarizes, keeps tokens and salt across
   }
 });
 
+test('monitor: rows wait on disk while Supabase is down and go out on the next try', async () => {
+  const dir = await tmp();
+  try {
+    let t = T0;
+    const clock = { now: () => t, advance: (ms) => (t += ms) };
+    const w = fakeWorld(() => t);
+    w.db.fail = 100;
+    const m = await startMonitor(w, { ...ENV, DATA_DIR: dir }, clock);
+    await m.run();
+    assert.equal(w.db.rows.size, 0);
+    const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
+    assert.equal(state.pendingRows.length, 2, 'kept for later');
+    w.db.fail = 0;
+    await m.flush();
+    assert.equal(w.db.rows.size, 2);
+    assert.equal(m.state.pendingRows.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('monitor: a dead refresh token stops the collector before any data request', async () => {
   const dir = await tmp();
   try {
     let t = T0;
     const w = fakeWorld(() => t);
     w.refreshTokens.clear();
-    const m = await startMonitor(w, { CASER_REFRESH_TOKEN: 'gone', CASER_BASE: 'https://caser.test', DATA_DIR: dir }, { now: () => t, advance: (ms) => (t += ms) }, 100);
+    const m = await startMonitor(w, { ...ENV, CASER_REFRESH_TOKEN: 'gone', DATA_DIR: dir }, { now: () => t, advance: (ms) => (t += ms) }, 100);
     assert.match((await m.run()).error, /signed out/);
     assert.deepEqual(w.calls, ['POST /api/users/auth/refresh']);
+    assert.match(w.db.status.status.error, /signed out/, 'the dashboard learns why');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('monitor: refuses to start without a token', async () => {
+test('monitor: refuses to start without a token or a Supabase key', async () => {
   const dir = await tmp();
   try {
-    await assert.rejects(createMonitor({ env: { DATA_DIR: dir }, fetch: async () => {}, version: 't', log: () => {} }), /CASER_REFRESH_TOKEN/);
+    await assert.rejects(createMonitor({ env: { DATA_DIR: dir, SUPABASE_SECRET_KEY: 'k' }, fetch: async () => {}, version: 't', log: () => {} }), /CASER_REFRESH_TOKEN/);
+    await assert.rejects(createMonitor({ env: { DATA_DIR: dir, CASER_REFRESH_TOKEN: 'r' }, fetch: async () => {}, version: 't', log: () => {} }), /SUPABASE_SECRET_KEY/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-// ---- server ----
+// ---- cloud ----
 
-test('server: password on everything but the health check', async () => {
-  assert.equal(authorized(undefined, null), true);
-  assert.equal(authorized(`Basic ${Buffer.from('any:pw').toString('base64')}`, 'pw'), true);
-  assert.equal(authorized(`Basic ${Buffer.from('any:no').toString('base64')}`, 'pw'), false);
-  const server = createServer({ snapshot: () => ({ ok: 1 }), html: '<p>page</p>', password: 'pw' });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const auth = { authorization: `Basic ${Buffer.from('me:pw').toString('base64')}` };
+test('cloud: batches inserts, sends a legacy JWT key as Authorization too', async () => {
+  const calls = [];
+  const fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(null, { status: 201 });
+  };
+  const rows = Array.from({ length: 2500 }, (_, i) => ({ id: `upgrade:${i}`, kind: 'upgrade', ts: T0, u: 'h', stake: 1, returned: 0, chance: null, back: false }));
+  await createCloud({ fetch, url: 'https://x.supabase.co/', key: 'sb_secret_abc' }).push(rows, []);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, 'https://x.supabase.co/rest/v1/monitor_rows?on_conflict=id');
+  assert.equal(calls[0].init.headers.authorization, undefined);
+  calls.length = 0;
+  await createCloud({ fetch, url: 'https://x.supabase.co', key: 'eyJhbGciOi.x.y' }).status({ running: true });
+  assert.equal(calls[0].init.headers.authorization, 'Bearer eyJhbGciOi.x.y');
+  const failing = createCloud({ fetch: async () => json(401, { message: 'Invalid API key' }), url: 'https://x.supabase.co', key: 'bad' });
+  await assert.rejects(failing.push(rows.slice(0, 1), []), /401.*Invalid API key/);
+});
+
+// ---- dashboard ----
+
+test('dashboard view: ranges align to buckets, the comparison and buckets come from the database rows', () => {
+  const now = T0 + 25 * 60000;
+  const spec = rangeSpec('24h', now);
+  assert.equal(spec.bucket, HOUR);
+  assert.equal(spec.to, T0 + HOUR);
+  assert.equal(spec.from, T0 + HOUR - 24 * HOUR);
+  assert.equal(rangeSpec('nope', now).key, '24h');
+  const agg = (bucket, kind, players, perPlayer, ret) => {
+    const rows = [];
+    for (let p = 0; p < players; p++) for (let i = 0; i < perPlayer; i++) rows.push({ id: `${p}-${i}-${bucket}`, kind, ts: bucket, u: `p${p}`, stake: 10, returned: ret(p, i) });
+    // The database sends big numbers as strings.
+    return aggregate(rows, { from: bucket, to: bucket + 1, bucketMs: 1 }).map((a) => Object.fromEntries(Object.entries(a).map(([k, v]) => [k, typeof v === 'number' ? String(v) : v])));
+  };
+  const v = buildView({
+    recent: agg(0, 'upgrade', 20, 10, (p, i) => (i < 4 ? 30 : 2)),
+    base: agg(0, 'upgrade', 20, 10, (p, i) => (i < 2 ? 30 : 2)),
+    series: [...agg(T0, 'upgrade', 6, 5, () => 9), ...agg(T0, 'case', 6, 5, () => 20)],
+    volume: [{ bucket: String(T0), samples: '60', cases_per_min: '9000.5', upgrades_per_min: '6000', online: '2500' }],
+    volRecent: [],
+    volBase: [],
+    spec,
+    now,
+  });
+  assert.equal(v.compare.upgrade.verdict, 'better');
+  assert.equal(v.compare.case.verdict, 'few');
+  assert.equal(v.buckets.length, 24);
+  const last = v.buckets.at(-1);
+  assert.equal(last.start, T0);
+  assert.equal(last.upgrade.ratio, 0.9);
+  assert.equal(last.case.ratio, 2);
+  assert.equal(last.volume.casesPerMin, 9000.5);
+  assert.equal(v.buckets[0].volume.casesPerMin, null);
+  assert.equal(v.total.upgrade.n, 30);
+  assert.equal(v.volume.recent.casesPerMin, null);
+  assert.deepEqual(compareWindows(now).base, { from: now - 4 * HOUR, to: now - HOUR });
+});
+
+test('dashboard view: monitor health from its last report', () => {
+  const now = T0;
+  const at = (ms) => new Date(now - ms).toISOString();
+  assert.equal(monitorHealth(null, now).level, 'warn');
+  assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true } }, now).level, 'ok');
+  assert.equal(monitorHealth({ updated_at: at(10 * 60000), status: { running: true } }, now).level, 'bad');
+  assert.match(monitorHealth({ updated_at: at(60000), status: { running: false, error: 'signed out?' } }, now).text, /signed out/);
+  assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true, pausedUntil: now + 60000 } }, now).level, 'warn');
+  assert.equal(monitorHealth({ updated_at: at(60000), status: { running: true, cloudError: 'x' } }, now).level, 'warn');
+});
+
+test('dashboard page: its script parses', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { writeFile } = await import('node:fs/promises');
+  const html = await readFile(new URL('../dashboard/index.html', import.meta.url), 'utf8');
+  const script = html.match(/<script type="module">([\s\S]*)<\/script>/)?.[1];
+  assert.ok(script, 'module script found');
+  const dir = await tmp();
   try {
-    assert.equal((await fetch(`${base}/healthz`)).status, 200);
-    assert.equal((await fetch(`${base}/`)).status, 401);
-    assert.equal((await fetch(`${base}/api/summary`)).status, 401);
-    assert.equal(await (await fetch(`${base}/`, { headers: auth })).text(), '<p>page</p>');
-    assert.deepEqual(await (await fetch(`${base}/api/summary`, { headers: auth })).json(), { ok: 1 });
-    assert.equal((await fetch(`${base}/nope`, { headers: auth })).status, 404);
+    const file = join(dir, 'page.mjs');
+    await writeFile(file, script);
+    const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
   } finally {
-    server.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });

@@ -1,8 +1,8 @@
 {
   "name": "caser-pulse-monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Samples players' recent upgrades and case drops on caser.gg and shows whether play is more profitable now than a few hours ago.",
+  "description": "Samples players' recent upgrades and case drops on caser.gg and writes them to Supabase for the dashboard page.",
   "type": "module",
   "engines": { "node": ">=20.6" },
   "scripts": {

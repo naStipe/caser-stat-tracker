@@ -4,8 +4,6 @@ services:
   pulse:
     build: .
     env_file: .env
-    ports:
-      - "8080:8080"
     volumes:
       - pulse-data:/data
     restart: unless-stopped
