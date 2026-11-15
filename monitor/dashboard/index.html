@@ -62,10 +62,16 @@
   .events .lv-error { color: var(--neg); }
   .events .lv-warn { color: var(--warn); }
   .events .lv-info { color: var(--faint); }
-  .verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
-  .verdicts section { margin: 0; border-left-width: 3px; }
-  .verdicts .good { border-left-color: var(--pos); }
-  .verdicts .bad { border-left-color: var(--neg); }
+  .glance { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .glance section { margin: 0; border-left-width: 3px; }
+  .glance .good { border-left-color: var(--pos); }
+  .glance .bad { border-left-color: var(--neg); }
+  .glance-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 6px; }
+  .glance .kind { color: var(--muted); font-size: 12.5px; }
+  .glance .chart { margin: 2px 0 6px; }
+  .big { font-size: 30px; font-weight: 600; line-height: 1.1; text-align: right; }
+  .big small { display: block; font-size: 12px; font-weight: 400; color: var(--faint); }
+  .readout.small { min-height: 20px; font-size: 12.5px; margin: 2px 0 0; }
   .headline { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .kpi .k { color: var(--muted); font-size: 12.5px; }
@@ -95,7 +101,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -117,13 +123,20 @@ const store = {
   get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
 };
-const NAMES = { upgrade: ['Upgrades', 'upgrades', 'win index', 'wins against what the shown chances predict'], case: ['Cases', 'case opens', 'hit index', 'opens worth at least the case price, against each case’s normal rate'] };
+const NAMES = { upgrade: ['Upgrades', 'upgrades', 'vs normal', 'wins against the usual rate for the same chance and session phase (last 7 days)'], case: ['Cases', 'case opens', 'hit index', 'opens worth at least the case price, against each case’s usual rate (last 7 days)'] };
+/** What a chart can show, per kind: [value, button text, tooltip]. */
+const METRICS = {
+  upgrade: [['index', 'vs normal', NAMES.upgrade[3]], ['shown', 'vs shown odds', 'wins against what the shown chances predict'], ['money', 'return per 1', 'total received per 1 staked']],
+  case: [['index', 'hit index', NAMES.case[3]], ['money', 'return per 1', 'total received per 1 staked']],
+};
+const metricName = (kind, m) => (METRICS[kind].find(([v]) => v === m) ?? METRICS[kind][0])[1];
 
 let rangeKey = RANGES[store.get('pulse.range')] ? store.get('pulse.range') : '1h';
 let windowMin = pickWindow(rangeKey, store.get(`pulse.window.${rangeKey}`));
 let compareMin = Number(store.get('pulse.compare', 30)) === 60 ? 60 : 30;
 let heatCache = null; // the 7-day report behind the heat map, reused for 10 minutes
-const metric = { upgrade: store.get('pulse.metric.upgrade', 'index'), case: store.get('pulse.metric.case', 'index') };
+const metric = {};
+for (const k of KINDS) { const m = store.get(`pulse.metric.${k}`, 'index'); metric[k] = METRICS[k].some(([v]) => v === m) ? m : 'index'; }
 let heatKind = store.get('pulse.heat', 'upgrade');
 let view = null;
 let health = null;
@@ -196,7 +209,9 @@ function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, st
     svg.append(s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid }), s('text', { x: padL - 6, y: yy + 3.5, 'text-anchor': 'end', text: tickFmt(v) }));
   }
   const steps = [5 * 60000, 10 * 60000, 15 * 60000, 30 * 60000, HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR, 2 * 24 * HOUR, 7 * 24 * HOUR];
-  const step = steps.find((st) => (t1 - t0) / st <= 6) ?? steps.at(-1);
+  // At most one time label per 80 px, so narrow screens do not crowd them.
+  const maxLabels = Math.max(2, Math.min(6, Math.floor(iw / 80)));
+  const step = steps.find((st) => (t1 - t0) / st <= maxLabels) ?? steps.at(-1);
   const offset = new Date().getTimezoneOffset() * 60000;
   for (let t = Math.ceil((t0 - offset) / step) * step + offset; t <= t1; t += step) {
     const xx = Math.round(x(t)) + 0.5;
@@ -230,12 +245,14 @@ function hover(f, marks, onPick, onIdle) {
 function windowChart({ v, kind, width }) {
   const k = v.kinds[kind];
   const m = metric[kind];
-  const { spec, now } = v;
+  const isIndex = m !== 'money';
+  const { spec, now, settled } = v;
   const span = spec.to - spec.from;
   const [, what] = NAMES[kind];
-  const pick = (w) => (m === 'index' ? { val: w.index.index, ci: w.index.ci, n: w.index.n } : { val: w.money.ratio, ci: w.money.ci, n: w.money.n });
-  const ref = m === 'index' ? k.avg.index : k.money.ratio;
-  const cap = m === 'index' ? 2.5 : 3;
+  const ixOf = (w) => (m === 'shown' ? w.shown : w.index);
+  const pick = (w) => (isIndex ? { val: ixOf(w).index, ci: ixOf(w).ci, n: ixOf(w).n } : { val: w.money.ratio, ci: w.money.ci, n: w.money.n });
+  const ref = m === 'index' ? k.avg.index : m === 'shown' ? k.shownAvg.index : k.money.ratio;
+  const cap = isIndex ? 2.5 : 3;
   const vals = [1];
   if (ok(ref)) vals.push(ref);
   for (const w of k.windows) {
@@ -245,8 +262,14 @@ function windowChart({ v, kind, width }) {
   }
   const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(cap, q)));
   const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
-  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, strip: 30, H: 250, label: `${NAMES[kind][0]}: ${m === 'index' ? NAMES[kind][2] : 'return per 1 staked'} per ${windowMin}-minute window over the last ${spec.label}.` });
+  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, strip: 30, H: 250, label: `${NAMES[kind][0]}: ${metricName(kind, m)} per ${windowMin}-minute window over the last ${spec.label}.` });
   const { svg, x, y } = f;
+  // Windows whose rows are still arriving: a flat band behind them.
+  if (settled.at < now) {
+    const sx = x(Math.max(spec.from, settled.at));
+    svg.append(s('rect', { x: sx, y: f.padT, width: Math.max(0, x(now) - sx), height: f.ih, fill: COLORS.bar, 'fill-opacity': 0.45 }));
+    if (x(now) - sx > 70) svg.append(s('text', { x: x(now) - 4, y: f.padT + 12, 'text-anchor': 'end', text: 'still arriving' }));
+  }
   const yb = Math.round(y(1)) + 0.5;
   svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
   if (ok(ref)) {
@@ -268,17 +291,17 @@ function windowChart({ v, kind, width }) {
     const p = pick(w);
     if (!ok(p.val) || !p.n) continue;
     const cx = x(w.start + spec.window / 2);
-    const z = m === 'index' ? w.z : null;
-    const color = z != null && z >= 2 ? COLORS.pos : z != null && z <= -2 ? COLORS.neg : COLORS.line;
+    const z = m === 'index' && !w.provisional ? w.z : null;
+    const color = w.provisional ? COLORS.diag : z != null && z >= 2 ? COLORS.pos : z != null && z <= -2 ? COLORS.neg : COLORS.line;
     if (p.ci && !dense) svg.append(s('line', { x1: cx, x2: cx, y1: y(p.ci[0]), y2: y(p.ci[1]), stroke: COLORS.zero }));
-    const solid = p.n >= 20;
+    const solid = p.n >= 20 && !w.provisional;
     svg.append(s('circle', { cx, cy: y(p.val), r: dense ? 2 : 3, fill: solid ? color : COLORS.bg, stroke: color, 'stroke-width': 1.25 }));
     marks.push({ cx, cy: y(p.val), w, p });
   }
   if (m === 'index') {
     let d = '';
     for (const w of k.windows) {
-      if (!ok(w.smooth)) { d += ' '; continue; }
+      if (!ok(w.smooth) || w.provisional) { d += ' '; continue; }
       const px = x(w.start + spec.window / 2), py = y(w.smooth);
       d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${px.toFixed(1)},${py.toFixed(1)}`;
     }
@@ -290,21 +313,23 @@ function windowChart({ v, kind, width }) {
   const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a window for details.' : empty }));
   idle();
   hover(f, marks, ({ w }) => {
-    const ix = w.index, mo = w.money;
+    const ix = w.index, sh = w.shown, mo = w.money;
     readout.replaceChildren(
       h('div', null, `${spanLabel(w.start, w.start + spec.window)}  `,
-        h('span', { class: ['num', sign((ix.index ?? NaN) - 1)], text: `index ${fmt2(ix.index)}` }),
+        h('span', { class: ['num', sign((ix.index ?? NaN) - 1)], text: `${kind === 'upgrade' ? 'vs normal' : 'hit index'} ${fmt2(ix.index)}` }),
         h('span', { class: 'faint', text: ix.ci ? ` (${fmt2(ix.ci[0])}–${fmt2(ix.ci[1])})` : '' }), '  ',
-        h('span', { class: ['num', sign((mo.ratio ?? NaN) - 1)], text: `return ${fmt3(mo.ratio)}` })),
-      h('div', { class: 'faint', text: `${fmtInt(w.n)} ${what} from ${fmtInt(w.players)} players, ${fmtInt(w.up)} of them up${kind === 'upgrade' ? `; ${fmtInt(ix.obs)} wins where the shown chances predict ${fmt(ix.exp, 1)}` : `; ${fmtInt(ix.obs)} hits where ${fmt(ix.exp, 1)} were expected`}` }));
+        kind === 'upgrade' ? h('span', { class: ['num', sign((sh.index ?? NaN) - 1)], text: `vs shown ${fmt2(sh.index)}  ` }) : null,
+        h('span', { class: ['num', sign((mo.ratio ?? NaN) - 1)], text: `return ${fmt3(mo.ratio)}` }),
+        w.provisional ? h('span', { class: 'warn-text', text: '  still arriving' }) : null),
+      h('div', { class: 'faint', text: `${fmtInt(w.n)} ${what} from ${fmtInt(w.players)} players, ${fmtInt(w.up)} of them up${kind === 'upgrade' ? `; ${fmtInt(ix.obs)} wins where ${fmt(ix.exp, 1)} are normal and the shown chances predict ${fmt(sh.exp, 1)}` : `; ${fmtInt(ix.obs)} hits where ${fmt(ix.exp, 1)} were expected`}` }));
   }, idle);
   const legend = h('div', { class: 'legend' },
-    h('span', null, h('i', { class: 'dot', style: `background:${COLORS.line}` }), m === 'index' ? NAMES[kind][2] : 'return per 1'),
+    h('span', null, h('i', { class: 'dot', style: `background:${COLORS.line}` }), metricName(kind, m)),
     m === 'index' ? h('span', null, h('i', { style: `background:${COLORS.marker}` }), `smoothed over ${Math.min(60, Math.round((spec.to - spec.from) / 4 / 60000))} min`) : null,
     h('span', null, h('i', { style: `background:${COLORS.warn}` }), 'range average'),
-    h('span', null, h('i', { style: `background:${COLORS.diag}` }), m === 'index' ? (kind === 'upgrade' ? '1 = as the shown chances say' : '1 = the case’s normal rate') : '1 = break-even'),
+    h('span', null, h('i', { style: `background:${COLORS.diag}` }), m === 'index' ? (kind === 'upgrade' ? '1 = normal for these chances and session phases' : '1 = the case’s usual rate') : m === 'shown' ? '1 = as the shown chances say' : '1 = break-even'),
     m === 'index' ? h('span', null, h('i', { class: 'dot', style: `background:${COLORS.pos}` }), h('i', { class: 'dot', style: `background:${COLORS.neg};margin-left:-2px` }), 'clearly above / below average') : null,
-    h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'sample size'));
+    h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'sample size; shaded: rows still arriving'));
   return h('div', { class: 'chart' }, legend, readout, svg);
 }
 
@@ -323,7 +348,7 @@ function heatmap({ v, kind, width }) {
   const cells = v.heat[kind];
   const hours = v.hours[kind];
   const m = metric[kind];
-  const val = (c) => (m === 'index' ? c?.index?.index : c?.money?.ratio);
+  const val = (c) => (m !== 'money' ? c?.index?.index : c?.money?.ratio);
   const W = Math.max(300, Math.floor(width));
   const padL = 44, padT = 4, padB = 18;
   const cw = (W - padL - 4) / 24, ch = 20;
@@ -341,7 +366,7 @@ function heatmap({ v, kind, width }) {
       const vv = val(c);
       if (ok(vv) && c.n) {
         const t = Math.max(-1, Math.min(1, (vv - 1) / 0.3));
-        const conf = Math.min(1, (m === 'index' ? c.index.n : c.money.n) / 60);
+        const conf = Math.min(1, (m !== 'money' ? c.index.n : c.money.n) / 60);
         svg.append(s('rect', { x: xx, y: yy, width: cw - 2, height: ch, rx: 2, fill: t >= 0 ? COLORS.pos : COLORS.neg, 'fill-opacity': (0.12 + 0.75 * Math.abs(t)) * (0.25 + 0.75 * conf) }));
       }
       marks.push({ x: xx, y: yy, c, label: `${row.label === 'All' ? 'All days' : row.label} ${String(hr).padStart(2, '0')}:00–${String(hr + 1).padStart(2, '0')}:00` });
@@ -401,24 +426,96 @@ function activityChart({ v, width }) {
   return h('div', { class: 'chart' }, legend, readout, f.svg);
 }
 
-const VERDICT = { better: ['good', 'Better now'], worse: ['bad', 'Worse now'], same: ['', 'No clear change'], few: ['', 'Not enough data yet'] };
+const VERDICT = { better: ['good', 'Paying more than usual'], worse: ['bad', 'Paying less than usual'], same: ['', 'About as usual'], few: ['', 'Not enough data yet'] };
 const durationText = (m) => (m === 60 ? 'hour' : `${m} minutes`);
-function verdictCard(kind) {
+const clock = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+/** The last 6 hours at a glance: the index over the compared length before each 5-minute step. */
+function glanceLine({ kind, width }) {
+  const g = view.glance[kind];
+  const pts = g.points;
+  const vals = [1];
+  for (const p of pts) if (ok(p.index)) vals.push(p.index, ...(p.ci ?? []));
+  const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(2.5, q)));
+  const lo0 = Math.min(0.85, ...clipped), hi0 = Math.max(1.15, ...clipped);
+  const { lo, hi, ticks } = niceTicks(Math.max(0, lo0 - 0.02), hi0 + 0.02, 4);
+  const f = frame({ width, t0: g.from, t1: g.to, lo, hi, ticks, tickFmt: (q) => fmt(q, Math.round(q * 10) === q * 10 ? 1 : 2), span: g.to - g.from, H: 120, label: `${NAMES[kind][0]}: ${kind === 'upgrade' ? 'wins against normal' : 'hit index'} over the last 6 hours.` });
+  const { svg, x, y } = f;
+  const yb = Math.round(y(1)) + 0.5;
+  svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+  // 95% range as a flat band, the line on top: solid while settled, dashed while rows are still arriving.
+  const runs = [];
+  let run = [];
+  for (const p of pts) {
+    if (ok(p.index)) run.push(p);
+    else if (run.length) { runs.push(run); run = []; }
+  }
+  if (run.length) runs.push(run);
+  for (const r of runs) {
+    const band = r.filter((p) => p.ci);
+    if (band.length > 1) {
+      const top = band.map((p) => `${x(p.t).toFixed(1)},${y(Math.min(hi, p.ci[1])).toFixed(1)}`);
+      const bottom = band.slice().reverse().map((p) => `${x(p.t).toFixed(1)},${y(Math.max(lo, p.ci[0])).toFixed(1)}`);
+      svg.append(s('polygon', { points: [...top, ...bottom].join(' '), fill: COLORS.line, 'fill-opacity': 0.12 }));
+    }
+    const path = (list) => list.map((p, i) => `${i ? 'L' : 'M'}${x(p.t).toFixed(1)},${y(p.index).toFixed(1)}`).join('');
+    const solid = r.filter((p) => !p.provisional);
+    const tail = r.filter((p, i) => p.provisional || (r[i + 1] && r[i + 1].provisional));
+    if (solid.length > 1) svg.append(s('path', { d: path(solid), fill: 'none', stroke: COLORS.line, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+    if (tail.length > 1) svg.append(s('path', { d: path(tail), fill: 'none', stroke: COLORS.diag, 'stroke-width': 1.5, 'stroke-dasharray': '3 3' }));
+  }
+  const last = pts.filter((p) => ok(p.index) && !p.provisional).at(-1);
+  if (last) svg.append(s('circle', { cx: x(last.t), cy: y(last.index), r: 3.5, fill: COLORS.line }));
+  const readout = h('div', { class: 'readout small' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: runs.length ? `Each point: the ${durationText(view.compareMinutes)} before it. Dashed: rows still arriving.` : 'Not enough rows in the last 6 hours yet.' }));
+  idle();
+  const marks = pts.filter((p) => ok(p.index)).map((p) => ({ cx: x(p.t), cy: y(p.index), p }));
+  hover(f, marks, ({ p }) => readout.replaceChildren(
+    h('span', null, `${clock(p.t - view.compareMinutes * 60000)}–${clock(p.t)}  `),
+    h('span', { class: ['num', sign(p.index - 1)], text: fmt2(p.index) }),
+    h('span', { class: 'faint', text: `${p.ci ? ` (${fmt2(p.ci[0])}–${fmt2(p.ci[1])})` : ''}, ${fmtInt(p.n)} ${NAMES[kind][1]}${p.provisional ? ', still arriving' : ''}` })), idle);
+  return h('div', { class: 'chart' }, svg, readout);
+}
+
+function glanceCard(kind, width) {
   const c = view.compare[kind];
   const mo = view.compareMoney[kind];
   const [cls, word] = VERDICT[c.verdict] || VERDICT.few;
-  const r = c.recent, b = c.base;
   const m = view.compareMinutes;
-  const last = `the last ${durationText(m)}`;
-  const before = `the ${m === 60 ? '3 hours' : `${3 * m} minutes`} before`;
+  const what = NAMES[kind][1];
+  const lag = view.settled;
   const detail = c.verdict === 'few'
-    ? `Needs at least 30 ${NAMES[kind][1]} in each part. In ${last}: ${fmtInt(r.n)}; in ${before}: ${fmtInt(b.n)}.`
-    : `${NAMES[kind][0]} ${NAMES[kind][2]} ${fmt2(r.index)} in ${last} (${fmtInt(r.n)} ${NAMES[kind][1]}), against ${fmt2(b.index)} in ${before} (${fmtInt(b.n)}). ${c.verdict === 'same' ? 'The difference is within random noise' : 'The difference is too large to be luck'} (p = ${ok(c.p) ? fmt(c.p, 3) : DASH}).`;
-  return h('section', { class: cls }, h('div', { class: 'headline', text: `${NAMES[kind][0]}: ${word}` }), h('div', { class: 'muted', text: detail }),
-    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)} in ${last}, ${fmt3(mo.base.ratio)} before.` }));
+    ? `Needs at least 30 ${what} in the ${durationText(m)} up to ${clock(c.to)}; there are ${fmtInt(c.n)}.`
+    : `${kind === 'upgrade' ? 'Wins' : 'Hits'} at ${fmt2(c.index)} times the usual rate in the ${durationText(m)} up to ${clock(c.to)} (${fmtInt(c.n)} ${what}${c.ci ? `, 95% range ${fmt2(c.ci[0])}–${fmt2(c.ci[1])}` : ''}). ${c.verdict === 'same' ? 'Within random noise.' : 'Too far from 1 to be luck.'}`;
+  const before = c.before.verdict === 'few' ? '' : ` The ${m === 60 ? '3 hours' : `${3 * m} minutes`} before: ${fmt2(c.base.index)}${c.before.verdict === 'same' ? '' : `, a clear ${c.before.verdict === 'better' ? 'rise' : 'drop'} since`}.`;
+  const fr = view.fresh;
+  const fresh = kind === 'upgrade' && fr.now.n >= 30
+    ? h('div', { class: 'hint', text: `First 5 minutes of a session, chances under 15%: won ${fmt2(fr.now.index)}× the shown chance in the last 7 hours (${fmtInt(fr.now.n)} upgrades), usually ${fmt2(fr.usual.index)}×.` })
+    : null;
+  return h('section', { class: cls },
+    h('div', { class: 'glance-top' },
+      h('div', null, h('div', { class: 'kind', text: NAMES[kind][0] }), h('div', { class: 'headline', text: word })),
+      h('div', { class: ['big', 'num', !ok(c.index) ? 'faint' : c.verdict === 'better' ? 'pos' : c.verdict === 'worse' ? 'neg' : ''] }, fmt2(c.index), h('small', { text: kind === 'upgrade' ? '× normal' : '× usual hits' }))),
+    glanceLine({ kind, width }),
+    h('div', { class: 'muted', text: detail + before }),
+    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${lag.known ? `80% arrive within ${Math.round(lag.lagMs / 60000)} min` : `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured`}).` }),
+    fresh);
 }
+
+/** Upgrades by time into the session and shown chance: where the shown odds pay more or less than they say. */
+function phaseTable() {
+  const rows = view.phases.filter((r) => r.cells.some((c) => c.n || c.usual.n));
+  if (!rows.length) return h('p', { class: 'faint', text: 'No upgrades with a session phase in this range yet.' });
+  return tableOf(['Time into session', ...CHANCE_GROUPS.map(([, label]) => `Chance ${label}`)],
+    rows.map((r) => h('tr', null, h('td', { text: r.label }),
+      r.cells.map((c) => h('td', { class: 'num' },
+        h('span', { class: c.n && ok(c.shown.index) ? clearOf1(c.shown.ci) : 'faint', text: c.n ? fmt2(c.shown.index) : DASH }),
+        h('span', { class: 'ci', text: `usual ${fmt2(c.usual.index)} · ${fmtInt(c.n)}` }))))));
+}
+/** Green or red only when the 95% range is clear of 1; noise stays neutral. */
+const clearOf1 = (ci) => (!ci ? '' : ci[0] > 1 ? 'pos' : ci[1] < 1 ? 'neg' : '');
 const kpi = (k, val, sub, cls) => h('div', { class: 'kpi' }, h('div', { class: 'k', text: k }), h('div', { class: ['v', 'num', cls], text: val }), sub ? h('div', { class: 's', text: sub }) : null);
-const ixCell = (ix) => h('td', { class: 'num' }, h('span', { class: ok(ix?.index) ? sign(ix.index - 1) : 'faint', text: fmt2(ix?.index) }), ix?.ci ? h('span', { class: 'ci', text: `${fmt2(ix.ci[0])} ${DASH} ${fmt2(ix.ci[1])}` }) : null);
+const ixCell = (ix) => h('td', { class: 'num' }, h('span', { class: ok(ix?.index) ? clearOf1(ix.ci) : 'faint', text: fmt2(ix?.index) }), ix?.ci ? h('span', { class: 'ci', text: `${fmt2(ix.ci[0])} ${DASH} ${fmt2(ix.ci[1])}` }) : null);
 const moneyCell = (r) => h('td', { class: ['num', ok(r?.ratio) ? sign(r.ratio - 1) : 'faint'], text: fmt3(r?.ratio) });
 const tableOf = (heads, rows) => h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null, heads.map((x) => h('th', { text: x })))), h('tbody', null, rows)));
 
@@ -459,48 +556,56 @@ function header() {
 function renderDashboard() {
   const v = view;
   const width = Math.min(root.clientWidth || 1000, 1008) - 34;
-  const out = [header(), problemsSection()];
+  const out = [header()];
   if (loadError) out.push(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${loadError}` }));
-  if (!v) { out.push(h('p', { class: 'faint', text: 'Loading…' })); root.replaceChildren(...out); return; }
+  if (!v) { out.push(problemsSection(), h('p', { class: 'faint', text: 'Loading…' })); root.replaceChildren(...out); return; }
 
   out.push(h('div', { class: 'sec-head' }, h('h2', { text: 'Right now' }),
-    toggle([[30, 'last 30 min', 'the last 30 minutes against the 90 minutes before'], [60, 'last hour', 'the last hour against the 3 hours before']], compareMin, setCompare)));
-  out.push(h('div', { class: 'verdicts' }, verdictCard('upgrade'), verdictCard('case')));
+    toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over')));
+  const gw = width >= 680 ? Math.floor((width - 16) / 2) - 2 : width;
+  out.push(h('div', { class: 'glance' }, glanceCard('upgrade', gw), glanceCard('case', gw)));
+  out.push(problemsSection());
 
   const t = v.totals;
+  const up = v.kinds.upgrade;
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Last ${v.spec.label}` })),
     h('div', { class: 'kpis' },
-      kpi('Upgrade win index', fmt2(v.kinds.upgrade.avg.index), v.kinds.upgrade.avg.ci ? `range ${fmt2(v.kinds.upgrade.avg.ci[0])}–${fmt2(v.kinds.upgrade.avg.ci[1])}` : null, sign((v.kinds.upgrade.avg.index ?? NaN) - 1)),
-      kpi('Upgrades, return per 1', fmt3(v.kinds.upgrade.money.ratio), `${fmtInt(v.kinds.upgrade.money.n)} upgrades`),
+      kpi('Upgrades vs normal', fmt2(up.avg.index), up.avg.ci ? `range ${fmt2(up.avg.ci[0])}–${fmt2(up.avg.ci[1])}` : null, clearOf1(up.avg.ci)),
+      kpi('Upgrades vs shown odds', fmt2(up.shownAvg.index), up.shownAvg.ci ? `range ${fmt2(up.shownAvg.ci[0])}–${fmt2(up.shownAvg.ci[1])}` : null, clearOf1(up.shownAvg.ci)),
+      kpi('Upgrades, return per 1', fmt3(up.money.ratio), `${fmtInt(up.money.n)} upgrades`),
       kpi('Case hit rate', pct(v.kinds.case.avg.exp ? v.kinds.case.avg.obs / v.kinds.case.avg.n : null), `index ${fmt2(v.kinds.case.avg.index)}`),
       kpi('Cases, return per 1', fmt3(v.kinds.case.money.ratio), `${fmtInt(v.kinds.case.money.n)} opens`),
       kpi('Players up, upgrades', t.upgrade.players ? pct(t.upgrade.up / t.upgrade.players, 0) : DASH, `${fmtInt(t.upgrade.up)} of ${fmtInt(t.upgrade.players)}`),
       kpi('Players up, cases', t.case.players ? pct(t.case.up / t.case.players, 0) : DASH, `${fmtInt(t.case.up)} of ${fmtInt(t.case.players)}`)),
-    h('p', { class: 'hint', text: 'Win index: upgrade wins against the wins the shown chances predict. Hit index: case opens worth at least the case price, against each case’s normal rate over the last 7 days. 1 means as expected; above 1 is better for players. Both count every upgrade or open once, so they settle much faster than return per 1, which one big win can move.' })));
+    h('p', { class: 'hint', text: 'Vs normal: upgrade wins against the usual real rate for the same shown chance and time into the session, over the last 7 days. Vs shown odds: against what the shown chances promise. Hit index: case opens worth at least the case price, against each case’s usual rate. 1 means as usual (or as shown); above 1 is better for players. These count every upgrade or open once, so they settle much faster than return per 1, which one big win can move.' })));
+
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by time into the session' })),
+    phaseTable(),
+    h('p', { class: 'hint', text: 'Wins against the shown chance in this range; under each, the usual value over the last 7 days and the number of upgrades. A session starts after 20 minutes without play, which is usually a new deposit. “Start not seen”: the session began before the player’s first row the monitor has.' })));
 
   for (const kind of KINDS) {
     const k = v.kinds[kind];
     out.push(h('section', null,
       h('div', { class: 'sec-head' },
         h('h2', { text: `${NAMES[kind][0]} per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }),
-        toggle([['index', NAMES[kind][2], NAMES[kind][3]], ['money', 'return per 1', 'total received per 1 staked']], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); })),
+        toggle(METRICS[kind], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); })),
       windowChart({ v, kind, width }),
-      h('div', { class: 'split' }, windowList('Best windows (index above the range average)', k.best, kind), windowList('Worst windows', k.worst, kind)),
-      h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin. Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank windows by how far they sit from the average, counting their sample size.' })));
+      h('div', { class: 'split' }, windowList('Best windows (above the range average)', k.best, kind), windowList('Worst windows', k.worst, kind)),
+      h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin or still arriving (the shaded part, whose rows are not all read yet). Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank settled windows by how far they sit from the average, counting their sample size.' })));
   }
 
   out.push(h('section', null,
     h('div', { class: 'sec-head' }, h('h2', { text: 'By weekday and hour' }),
       toggle(KINDS.map((k) => [k, NAMES[k][0]]), heatKind, (x) => { heatKind = x; store.set('pulse.heat', x); renderDashboard(); })),
     heatmap({ v, kind: heatKind, width }),
-    h('p', { class: 'hint', text: `The last ${v.spec.to - v.spec.from >= 7 * 24 * HOUR ? v.spec.label : '7 days'}, whatever the range above. Shows ${metric[heatKind] === 'index' ? NAMES[heatKind][2] : 'return per 1'} (switch above the ${NAMES[heatKind][0].toLowerCase()} chart). Patterns need weeks of data to mean much; a single bright cell is usually luck.` })));
+    h('p', { class: 'hint', text: `The last ${v.spec.to - v.spec.from >= 7 * 24 * HOUR ? v.spec.label : '7 days'}, whatever the range above. Shows ${metric[heatKind] === 'money' ? 'return per 1' : metricName(heatKind, 'index')} (switch above the ${NAMES[heatKind][0].toLowerCase()} chart). Patterns need weeks of data to mean much; a single bright cell is usually luck.` })));
 
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by shown chance' })),
-    v.bands.length ? tableOf(['Shown chance', 'Upgrades', 'Players', 'Win rate', 'Shown', 'Win index', 'Return'],
+    v.bands.length ? tableOf(['Shown chance', 'Upgrades', 'Players', 'Win rate', 'Shown', 'Vs shown', 'Vs normal', 'Return'],
       v.bands.map((b) => h('tr', null, h('td', { text: b.label }), h('td', { class: 'num', text: fmtInt(b.n) }), h('td', { class: 'num', text: fmtInt(b.players) }),
-        h('td', { class: 'num', text: pct(b.winRate) }), h('td', { class: 'num faint', text: pct(b.shownRate) }), ixCell(b.index), moneyCell(b.money))))
+        h('td', { class: 'num', text: pct(b.winRate) }), h('td', { class: 'num faint', text: pct(b.shownRate) }), ixCell(b.index), ixCell(b.normal), moneyCell(b.money))))
       : h('p', { class: 'faint', text: 'No upgrades in this range yet.' }),
-    h('p', { class: 'hint', text: 'Win rate against the average shown chance in each band. A band whose index is far from the others is where the shown odds are off the most.' })));
+    h('p', { class: 'hint', text: 'Win rate against the average shown chance in each band. Vs shown: where the shown odds are off; low chances usually win more than shown, high chances less. Vs normal: against the usual rate for the band and session phase, so a value away from 1 means this range differs from the last 7 days.' })));
 
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Cases' })),
     v.cases.length ? tableOf(['Case', 'Opens', 'Players', 'Price', 'Hit rate', 'Normal', 'Hit index', 'Return'],
@@ -517,7 +622,8 @@ function renderDashboard() {
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Site activity' })), activityChart({ v, width })));
 
   out.push(h('section', null, h('h2', { text: 'How the sample is taken' }),
-    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours for new rows, and checked again every 3 hours while they keep showing up in the feed. Players are stored as a salted hash, never by name.' })));
+    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours, then checked again for new rows: every 10 minutes while they play, less often the longer they have been away (up to every 6 hours). Players are stored as a salted hash, never by name.' }),
+    h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In this range that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${Math.round(v.settled.lagMs / 60000)}` : ''}.` })));
   root.replaceChildren(...out);
   if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
 }
@@ -568,20 +674,17 @@ async function load() {
     const needHeat = spec.to - spec.from < 7 * 24 * HOUR;
     const heatFresh = heatCache && now - heatCache.at < 10 * 60 * 1000 && heatCache.tz === tz;
     const heatTo = Math.floor(now / HOUR) * HOUR + HOUR;
-    const one = (from, to) => ({ from_ms: Math.floor(from), to_ms: Math.ceil(to), bucket_ms: Math.ceil(to) - Math.floor(from) });
-    const [report, cmp, volume, volRecent, volBase, statusRes, eventsRes, heatNew] = await Promise.all([
+    const [report, cmp, volume, statusRes, eventsRes, heatNew] = await Promise.all([
       rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
-      rpc('monitor_report', { from_ms: Math.floor(cs.from), to_ms: Math.ceil(cs.to), bucket_ms: cs.bucket, tz_offset_min: tz }),
+      rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
-      rpc('monitor_volume_agg', one(now - cs.bucket, now + 1)),
-      rpc('monitor_volume_agg', one(now - 4 * cs.bucket, now - cs.bucket)),
       sb.from('monitor_status').select('updated_at,status').maybeSingle(),
       sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
       needHeat && !heatFresh ? rpc('monitor_report', { from_ms: heatTo - 7 * 24 * HOUR, to_ms: heatTo, bucket_ms: 24 * HOUR, tz_offset_min: tz }) : Promise.resolve(null),
     ]);
     if (statusRes.error) throw statusRes.error;
     if (heatNew) heatCache = { at: now, tz, report: heatNew };
-    view = buildReport({ report, cmp, heatReport: needHeat ? heatCache?.report ?? null : null, compareMinutes: compareMin, volume, volRecent, volBase, spec, now });
+    view = buildReport({ report, cmp, heatReport: needHeat ? heatCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
     loadError = null;

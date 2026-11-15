@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, STEP, DEFAULT_LAG } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -481,36 +481,93 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.deepEqual(windowsFor('30m'), [1, 2, 5, 10]);
   assert.equal(pickWindow('30m', 15), 1);
   assert.equal(pickWindow('1h', 5), 5);
-  assert.deepEqual(compareSpec(now, 30), { from: now - 120 * 60000, to: now, bucket: 30 * 60000, minutes: 30 });
+  // The comparison report: 5-minute steps over the glance's 6 hours plus the longest compared part.
+  const cs = compareSpec(now, 30);
+  assert.equal(cs.bucket, STEP);
+  assert.equal(cs.to, Math.floor(now / STEP) * STEP + STEP);
+  assert.equal(cs.to - cs.from, 7 * HOUR);
   assert.equal(pickWindow('6h', 20), 20);
-  // Shapes as monitor_report sends them (some numbers as strings, empty sums as null).
-  const up = (bucket, w, extra = {}) => ({ bucket, kind: 'upgrade', n: 40, players: 10, up: 4, sx: '400', sy: 380, gxx: 16000, gyy: 15000, gxy: 15000, nw: 40, w, ew: 10, vw: 8, nh: 0, h: null, eh: null, vh: null, ...extra });
+  // Arrival lag: measured once enough rows have it, else assumed; at least one step, at most 2 hours.
+  assert.equal(settledAt(null, now).lagMs, DEFAULT_LAG);
+  assert.equal(settledAt({ rows: 50, p80: 60000 }, now).known, false);
+  assert.equal(settledAt({ rows: 500, p50: 30000, p80: 60000 }, now).lagMs, STEP);
+  assert.equal(settledAt({ rows: 500, p50: 30000, p80: 9 * HOUR }, now).lagMs, 2 * HOUR);
+  assert.equal(settledAt({ rows: 500, p50: 30000, p80: 60000 }, now).at, Math.floor((now - STEP) / STEP) * STEP);
+  // Shapes as monitor_report sends them (some numbers as strings, empty sums as null). Normal ("ea") expects 8 wins, the shown chances 10.
+  const up = (bucket, w, extra = {}) => ({ bucket, kind: 'upgrade', n: 40, players: 10, up: 4, sx: '400', sy: 380, gxx: 16000, gyy: 15000, gxy: 15000, nw: 40, w, ew: 10, vw: 8, ea: 8, va: 6, nh: 0, h: null, eh: null, vh: null, ...extra });
+  const phaseRow = { phase: 1, cg: 1, n: 100, players: 9, sx: 1000, sy: 1100, w: 30, ew: 20, vw: 16, ea: 25, va: 18 };
   const report = {
-    series: [up(spec.to - W, 12), up(spec.to - 2 * HOUR, 8)],
-    heat: [{ dow: 4, hour: 13, kind: 'upgrade', n: 40, sx: 400, sy: 380, nw: 40, w: 12, ew: 10, vw: 8, nh: 0, h: null, eh: null, vh: null }],
-    bands: [{ band: 'b', n: 100, players: 9, sx: 1000, sy: 950, w: 25, ew: 20, vw: 16 }],
+    series: [up(spec.to - 3 * W, 12), up(spec.to - 2 * HOUR, 8), up(spec.to - W, 8)],
+    heat: [{ dow: 4, hour: 13, kind: 'upgrade', n: 40, sx: 400, sy: 380, nw: 40, w: 12, ew: 10, vw: 8, ea: 8, va: 6, nh: 0, h: null, eh: null, vh: null }],
+    bands: [{ band: 'b', n: 100, players: 9, sx: 1000, sy: 950, w: 25, ew: 20, vw: 16, ea: 25, va: 18 }],
+    phases: [phaseRow],
+    phases_norm: [{ phase: 1, cg: 1, n: 1000, w: 250, ew: 200 }],
     cases: [{ slug: 'magnum', n: 50, players: 7, sx: 950, sy: 900, h: 20, eh: 17.5, vh: 11, price: 19 }],
     stakes: [{ kind: 'case', sb: 2, n: 50, players: 7, sx: 950, sy: 900, nw: 0, w: null, ew: null, vw: null, nh: 50, h: 20, eh: 17.5, vh: 11 }],
     totals: [{ kind: 'upgrade', players: 12, up: 5 }],
+    excluded: [{ kind: 'upgrade', n: 7 }],
+    lag: { rows: 500, p50: 30000, p80: 60000 },
   };
-  const cs = compareSpec(now);
-  const cmp = { series: [0, 1, 2, 3].map((i) => up(cs.from + i * HOUR, i === 3 ? 40 : 25, { nw: 100, ew: 25, vw: 18, n: 100 })) };
-  const v = buildReport({ report, cmp, volume: [{ bucket: String(spec.coarse.to - HOUR), samples: '60', cases_per_min: '9000.5', upgrades_per_min: '6000', online: '2500' }], spec, now });
+  const settled = settledAt(report.lag, now).at;
+  // The 30 minutes before the settled time win 11 of 8 normal per step; the 90 before, 8 of 8.
+  const cmpSeries = [];
+  for (let t = cs.from; t < cs.to; t += STEP) {
+    if (t >= settled) continue;
+    cmpSeries.push(up(t, t >= settled - 30 * 60000 ? 11 : 8, { n: 50, nw: 50 }));
+  }
+  const cmp = { series: cmpSeries, phases: [phaseRow] };
+  const v = buildReport({ report, cmp, compareMinutes: 30, volume: [{ bucket: String(spec.coarse.to - HOUR), samples: '60', cases_per_min: '9000.5', upgrades_per_min: '6000', online: '2500' }], spec, now });
   const k = v.kinds.upgrade;
   assert.equal(k.windows.length, 96);
-  assert.equal(k.windows.at(-1).index.index, 1.2);
-  assert.equal(k.avg.index, 1);
-  assert.equal(k.best[0].start, spec.to - W);
+  const at = (t) => k.windows.find((w) => w.start === t);
+  assert.equal(at(spec.to - 3 * W).index.index, 1.5, 'against normal');
+  assert.equal(at(spec.to - 3 * W).shown.index, 1.2, 'against the shown chances');
+  assert.equal(at(spec.to - 3 * W).provisional, false);
+  assert.equal(k.windows.at(-1).provisional, true, 'the current window is still arriving');
+  assert.equal(k.avg.index, 28 / 24);
+  assert.equal(k.shownAvg.index, 28 / 30);
+  assert.equal(k.best[0].start, spec.to - 3 * W, 'the best settled window; the provisional one is left out');
+  assert.ok(!k.best.some((w) => w.provisional));
   assert.equal(k.worst[0].start, spec.to - 2 * HOUR);
-  assert.ok(k.windows.at(-1).smooth != null);
+  assert.ok(at(spec.to - 3 * W).smooth != null);
   assert.equal(k.money.ratio, 0.95);
+  // Against normal over the 30 minutes before the settled time: 66 wins where 48 are normal, z = 3.
+  assert.equal(v.compare.upgrade.to, settled);
+  assert.equal(v.compare.upgrade.index, 66 / 48);
   assert.equal(v.compare.upgrade.verdict, 'better');
+  assert.equal(v.compare.upgrade.base.index, 1);
+  assert.equal(v.compare.upgrade.before.verdict, 'better');
   assert.equal(v.compare.case.verdict, 'few');
-  assert.equal(v.heat.upgrade[3][13].index.index, 1.2);
-  assert.equal(v.hours.upgrade[13].index.index, 1.2);
+  // Glance: one point per step over 6 hours; the one at the settled time is the compared part.
+  const g = v.glance.upgrade;
+  assert.equal(g.points.length, 6 * 12 + 1);
+  assert.equal(g.points.find((p) => p.t === settled).index, 66 / 48);
+  assert.equal(g.points.at(-1).provisional, true);
+  assert.equal(g.points.find((p) => p.t === settled).provisional, false);
+  assert.equal(v.heat.upgrade[3][13].index.index, 1.5);
+  assert.equal(v.hours.upgrade[13].index.index, 1.5);
   assert.equal(v.hours.upgrade[12].index.index, null);
   assert.equal(v.bands[0].label, '10–15%');
   assert.equal(v.bands[0].winRate, 0.25);
+  assert.equal(v.bands[0].index.index, 1.25);
+  assert.equal(v.bands[0].normal.index, 1);
+  // Session phase x chance group.
+  const first = v.phases.find((r) => r.phase === 1).cells[0];
+  assert.equal(first.shown.index, 1.5);
+  assert.equal(first.normal.index, 1.2);
+  assert.equal(first.usual.index, 1.25);
+  assert.equal(v.phases.find((r) => r.phase === 2).cells[0].n, 0);
+  assert.equal(v.fresh.now.index, 1.5);
+  assert.equal(v.fresh.usual.index, 1.25);
+  assert.deepEqual(v.excluded, { upgrade: 7, case: 0 });
+  assert.equal(v.settled.known, true);
+  // A report without "ea" (an older database function) falls back to the shown chances.
+  const old = buildReport({ report: { series: [up(spec.to - 3 * W, 12, { ea: null, va: null })] }, cmp: {}, spec, now });
+  assert.equal(old.kinds.upgrade.windows.find((w) => w.start === spec.to - 3 * W).index.index, 1.2);
+  assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.2, index: 1.5 }).verdict, 'better');
+  assert.equal(againstNormal({ n: 100, obs: 24, exp: 20, se: 0.2, index: 1.2 }).verdict, 'same');
+  assert.equal(againstNormal({ n: 10, obs: 3, exp: 2, se: 0.5, index: 1.5 }).verdict, 'few');
+  assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.2, index: 1.5 }).z, 2.5);
   assert.equal(v.cases[0].hitRate, 0.4);
   assert.equal(v.cases[0].index.index, 20 / 17.5);
   assert.equal(v.stakes[0].index.index, 20 / 17.5);

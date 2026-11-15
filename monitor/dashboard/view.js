@@ -1,12 +1,17 @@
 // Turns the database answers (monitor_report, monitor_volume_agg) into what the dashboard shows.
 // Pure, so the tests can run it.
 //
-// Two measures per kind:
-//   index  observed against expected: upgrade wins against the wins the shown chances predict, case
-//          hits (an open worth at least the case price) against the hits the case's normal rate
-//          predicts. Each upgrade or open counts once, whatever its size, so this settles fast.
-//          1 = as expected, above 1 = better for players.
+// Three measures per kind:
+//   index  observed against normal: upgrade wins against the wins the last 7 days' real rate predicts for
+//          the same chance band and session phase (see supabase/migrations/*_monitor_derive.sql); case hits
+//          (an open worth at least the case price) against each case's rate over the last 7 days. Each
+//          upgrade or open counts once, whatever its size, so this settles fast. 1 = normal, above 1 =
+//          better for players than usual.
+//   shown  upgrade wins against the wins the shown chances predict (for cases the same as index).
 //   return total value received per 1 staked. What players actually got, but one big win moves it a lot.
+//
+// Rows arrive late (revisits, history pages), so windows newer than the "settled" time are still filling:
+// they are marked provisional and the comparisons end at the settled time.
 
 import { HOUR, ratioOf, compareRatios, indexOf, indexZ, compareIndex } from './stats.js';
 
@@ -32,6 +37,15 @@ const MAX_WINDOWS = 800;
 const MIN_WINDOWS = 3;
 /** The window each range starts with. */
 export const DEFAULT_WINDOW = { '30m': 1, '1h': 2, '3h': 5, '6h': 10, '24h': 15, '3d': 30, '7d': 60, '30d': 360 };
+
+/** Step of the comparison report and of the glance lines. */
+export const STEP = 5 * MIN;
+/** What the glance lines cover. */
+export const GLANCE_SPAN = 6 * HOUR;
+/** How late rows arrive is measured (report.lag); with too few measured rows this is assumed. */
+export const DEFAULT_LAG = 30 * MIN;
+export const MAX_LAG = 2 * HOUR;
+const MIN_LAG_ROWS = 200;
 
 /** Window sizes that give a range between MIN_WINDOWS and MAX_WINDOWS windows. */
 export function windowsFor(key) {
@@ -60,10 +74,22 @@ export function rangeSpec(key, now, windowMin = 15) {
   return { key: k, label: r.label, from, to, window: win, coarse: { from: cfrom, to: cto, bucket: r.bucket } };
 }
 
-/** The comparison: the last `minutes` against the 3 times as long before them, as one report of 4 buckets. */
+/**
+ * The comparison and glance report: 5-minute buckets over the last 7 hours (the glance's 6 hours plus the
+ * longest compared part before its first point), so the page can end the comparison at the settled time,
+ * whatever the arrival lag turns out to be.
+ */
 export function compareSpec(now, minutes = 60) {
-  const len = minutes * MIN;
-  return { from: now - 4 * len, to: now, bucket: len, minutes };
+  const to = Math.floor(now / STEP) * STEP + STEP;
+  return { from: to - GLANCE_SPAN - HOUR, to, bucket: STEP, minutes };
+}
+
+/** How late rows arrive, and the time before which windows are complete enough to judge. */
+export function settledAt(lag, now) {
+  const p80 = Number(lag?.p80);
+  const known = Number(lag?.rows) >= MIN_LAG_ROWS && Number.isFinite(p80);
+  const lagMs = known ? Math.min(MAX_LAG, Math.max(STEP, p80)) : DEFAULT_LAG;
+  return { lagMs, known, p50: known ? Number(lag.p50) : null, at: Math.floor((now - lagMs) / STEP) * STEP };
 }
 
 const n0 = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? 0 : Number(v));
@@ -76,9 +102,18 @@ export function cleanRow(r) {
   return out;
 }
 
-/** The index of one row for a kind (upgrade: wins, case: hits). */
-export function rowIndex(kind, r) {
-  return kind === 'upgrade' ? indexOf({ n: n0(r?.nw), obs: n0(r?.w), exp: n0(r?.ew), v: n0(r?.vw) }) : indexOf({ n: n0(r?.nh), obs: n0(r?.h), exp: n0(r?.eh), v: n0(r?.vh) });
+/**
+ * The index of one row for a kind (upgrade: wins, case: hits). mode 'normal' compares upgrades with the
+ * normal rate (falls back to the shown chance for a report without it), 'shown' with the shown chance.
+ */
+export function rowIndex(kind, r, mode = 'normal') {
+  return indexOf(rowCounts(kind, r, mode));
+}
+/** The counts behind rowIndex: {n, obs, exp, v}. */
+export function rowCounts(kind, r, mode = 'normal') {
+  if (kind !== 'upgrade') return { n: n0(r?.nh), obs: n0(r?.h), exp: n0(r?.eh), v: n0(r?.vh) };
+  const normal = mode === 'normal' && n0(r?.ea) > 0;
+  return { n: n0(r?.nw), obs: n0(r?.w), exp: normal ? n0(r.ea) : n0(r?.ew), v: normal ? n0(r.va) : n0(r?.vw) };
 }
 
 /** Return per 1 of one row, with the per-player error when the row has it. */
@@ -92,24 +127,55 @@ const sumRows = (rows) => {
   return out;
 };
 
+/** An index against 1 (normal): verdict 'better' | 'worse' | 'same' | 'few', as compareIndex. */
+export function againstNormal(ix, { minExp = 5, minN = 30 } = {}) {
+  if (!(ix?.n >= minN) || !(ix.exp >= minExp) || !(ix.se > 0)) return { ...ix, z: null, p: null, verdict: 'few' };
+  const z = (ix.index - 1) / ix.se;
+  const p = 2 * (1 - normCdf(Math.abs(z)));
+  return { ...ix, z, p, verdict: p < 0.05 ? (z > 0 ? 'better' : 'worse') : 'same' };
+}
+function normCdf(z) {
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return z >= 0 ? (1 + erf) / 2 : (1 - erf) / 2;
+}
+
 export function cleanVolume(v) {
   return { bucket: Number(v.bucket), samples: n0(v.samples), casesPerMin: numOrNull(v.cases_per_min), upgradesPerMin: numOrNull(v.upgrades_per_min), online: numOrNull(v.online) };
 }
 const EMPTY_VOLUME = { bucket: 0, samples: 0, casesPerMin: null, upgradesPerMin: null, online: null };
 
+export const PHASES = [
+  [1, 'First 5 minutes'],
+  [2, '5–15 minutes'],
+  [3, '15–60 minutes'],
+  [4, 'After an hour'],
+  [0, 'Start not seen'],
+];
+export const CHANCE_GROUPS = [
+  [1, 'under 15%'],
+  [2, '15–35%'],
+  [3, '35% and up'],
+];
+
 /**
  * @param {Object} o
  * @param {any} o.report    monitor_report over the range, per window
- * @param {any} o.cmp       monitor_report over compareSpec(now) (hourly)
+ * @param {any} o.cmp       monitor_report over compareSpec(now) (5-minute buckets)
  * @param {any[]} o.volume  monitor_volume_agg over the range, per coarse bucket
- * @param {any[]} o.volRecent  monitor_volume_agg over the last hour
- * @param {any[]} o.volBase    monitor_volume_agg over the 3 hours before
+ * @param {any[]} o.volRecent  monitor_volume_agg over the compared recent part
+ * @param {any[]} o.volBase    monitor_volume_agg over the part before it
  * @param {ReturnType<typeof rangeSpec>} o.spec
  * @param {number} o.now
  */
 export function buildReport({ report, cmp, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
   const series = (report?.series ?? []).map(cleanRow);
-  const out = { now, spec, kinds: {}, compare: {}, compareMoney: {}, heat: {}, hours: {}, totals: {} };
+  const settled = settledAt(report?.lag ?? cmp?.lag, now);
+  const out = { now, spec, settled, kinds: {}, compare: {}, compareMoney: {}, glance: {}, heat: {}, hours: {}, totals: {}, excluded: {} };
+  const len = compareMinutes * MIN;
+  const cmpRows = (cmp?.series ?? []).map(cleanRow);
+  const cs = compareSpec(now, compareMinutes);
 
   for (const kind of KINDS) {
     const rows = series.filter((r) => r.kind === kind);
@@ -126,32 +192,51 @@ export function buildReport({ report, cmp, heatReport = null, compareMinutes = 6
       roll.push(r ?? {});
       if (roll.length > steps) roll.shift();
       const smooth = rowIndex(kind, sumRows(roll.map((x) => cleanRow(x))));
-      windows.push({ start: t, end: Math.min(t + spec.window, now), n: n0(r?.n), players: n0(r?.players), up: n0(r?.up), index, z: indexZ(index, avg.index), money: rowMoney(r), smooth: smooth.index });
+      windows.push({
+        start: t,
+        end: Math.min(t + spec.window, now),
+        provisional: t + spec.window > settled.at,
+        n: n0(r?.n),
+        players: n0(r?.players),
+        up: n0(r?.up),
+        index,
+        shown: rowIndex(kind, r, 'shown'),
+        z: indexZ(index, avg.index),
+        money: rowMoney(r),
+        smooth: smooth.index,
+      });
     }
-    const ranked = windows.filter((w) => w.index.n >= 10 && w.z != null).sort((a, b) => b.z - a.z);
+    const ranked = windows.filter((w) => !w.provisional && w.index.n >= 10 && w.z != null).sort((a, b) => b.z - a.z);
     out.kinds[kind] = {
       windows,
       avg,
+      shownAvg: rowIndex(kind, total, 'shown'),
       money: ratioOf({ n: total.n ?? 0, players: 0, sx: total.sx ?? 0, sy: total.sy ?? 0 }),
       best: ranked.filter((w) => w.z > 0).slice(0, 5),
       worst: ranked.filter((w) => w.z < 0).reverse().slice(0, 5),
     };
 
-    // Last hour against the 3 hours before.
-    const c = (cmp?.series ?? []).map(cleanRow).filter((r) => r.kind === kind);
-    const cs = compareSpec(now, compareMinutes);
-    const lastStart = cs.from + 3 * cs.bucket;
-    const recent = c.filter((r) => Number(r.bucket) >= lastStart);
-    const base = c.filter((r) => Number(r.bucket) < lastStart);
-    const ri = rowIndex(kind, sumRows(recent));
-    const bi = rowIndex(kind, sumRows(base));
-    out.compare[kind] = compareIndex({ n: ri.n, obs: ri.obs, exp: ri.exp, v: kind === 'upgrade' ? sumRows(recent).vw ?? 0 : sumRows(recent).vh ?? 0 }, { n: bi.n, obs: bi.obs, exp: bi.exp, v: kind === 'upgrade' ? sumRows(base).vw ?? 0 : sumRows(base).vh ?? 0 });
-    const sr = sumRows(recent);
-    const sb = sumRows(base);
+    // The last `compareMinutes` before the settled time, against normal and against the 3 times as long before.
+    const c = cmpRows.filter((r) => r.kind === kind);
+    const inPart = (from, to) => c.filter((r) => Number(r.bucket) >= from && Number(r.bucket) < to);
+    const sr = sumRows(inPart(settled.at - len, settled.at));
+    const sb = sumRows(inPart(settled.at - 4 * len, settled.at - len));
+    const ri = rowIndex(kind, sr);
+    const bi = rowIndex(kind, sb);
+    out.compare[kind] = { ...againstNormal(ri), from: settled.at - len, to: settled.at, before: compareIndex(rowCounts(kind, sr), rowCounts(kind, sb)), base: bi };
     out.compareMoney[kind] = compareRatios(
       { n: sr.n ?? 0, players: sr.players ?? 0, sx: sr.sx ?? 0, sy: sr.sy ?? 0, gxx: sr.gxx ?? 0, gyy: sr.gyy ?? 0, gxy: sr.gxy ?? 0 },
       { n: sb.n ?? 0, players: sb.players ?? 0, sx: sb.sx ?? 0, sy: sb.sy ?? 0, gxx: sb.gxx ?? 0, gyy: sb.gyy ?? 0, gxy: sb.gxy ?? 0 },
     );
+
+    // Glance line: the index over the `compareMinutes` before each 5-minute step of the last 6 hours.
+    const points = [];
+    for (let t = cs.to - GLANCE_SPAN; t <= cs.to; t += STEP) {
+      const end = Math.min(t, now);
+      const ix = rowIndex(kind, sumRows(inPart(t - len, t)));
+      points.push({ t: end, index: ix.n >= 20 ? ix.index : null, ci: ix.n >= 20 ? ix.ci : null, n: ix.n, provisional: t > settled.at });
+    }
+    out.glance[kind] = { points, from: cs.to - GLANCE_SPAN, to: now };
 
     // Weekday x hour, and hour of day over all days.
     const heat = ((heatReport ?? report)?.heat ?? []).map(cleanRow).filter((r) => r.kind === kind);
@@ -169,6 +254,7 @@ export function buildReport({ report, cmp, heatReport = null, compareMinutes = 6
     });
     const tot = (report?.totals ?? []).find((x) => x.kind === kind);
     out.totals[kind] = { players: n0(tot?.players), up: n0(tot?.up) };
+    out.excluded[kind] = n0((report?.excluded ?? []).find((x) => x.kind === kind)?.n);
   }
 
   out.bands = (report?.bands ?? []).map(cleanRow).sort((a, b) => String(a.band).localeCompare(String(b.band))).map((b) => ({
@@ -177,10 +263,41 @@ export function buildReport({ report, cmp, heatReport = null, compareMinutes = 6
     n: b.n,
     players: b.players,
     index: indexOf({ n: b.n, obs: b.w, exp: b.ew, v: b.vw }),
+    normal: b.ea > 0 ? indexOf({ n: b.n, obs: b.w, exp: b.ea, v: b.va }) : null,
     winRate: b.n ? b.w / b.n : null,
     shownRate: b.n ? b.ew / b.n : null,
     money: ratioOf({ n: b.n, players: 0, sx: b.sx, sy: b.sy }),
   }));
+
+  // Session phase x chance group: in the range (against the shown chance and against normal) and the 7-day normal.
+  const ph = (report?.phases ?? []).map(cleanRow);
+  const norm = (report?.phases_norm ?? []).map(cleanRow);
+  const cell = (list, p, g) => list.find((r) => Number(r.phase) === p && Number(r.cg) === g);
+  out.phases = PHASES.map(([p, label]) => ({
+    phase: p,
+    label,
+    cells: CHANCE_GROUPS.map(([g]) => {
+      const r = cell(ph, p, g);
+      const nr = cell(norm, p, g);
+      return {
+        n: n0(r?.n),
+        players: n0(r?.players),
+        shown: indexOf({ n: n0(r?.n), obs: n0(r?.w), exp: n0(r?.ew), v: n0(r?.vw) }),
+        normal: indexOf({ n: n0(r?.n), obs: n0(r?.w), exp: n0(r?.ea), v: n0(r?.va) }),
+        usual: indexOf({ n: n0(nr?.n), obs: n0(nr?.w), exp: n0(nr?.ew), v: 0 }),
+        money: ratioOf({ n: n0(r?.n), players: 0, sx: n0(r?.sx), sy: n0(r?.sy) }),
+      };
+    }),
+  }));
+  // The headline of the phase effect: low chances in the first 5 minutes of a session, over the glance span.
+  const fresh = cell((cmp?.phases ?? []).map(cleanRow), 1, 1);
+  const freshNorm = cell(norm.length ? norm : (cmp?.phases_norm ?? []).map(cleanRow), 1, 1);
+  out.fresh = {
+    now: indexOf({ n: n0(fresh?.n), obs: n0(fresh?.w), exp: n0(fresh?.ew), v: n0(fresh?.vw) }),
+    vsNormal: indexOf({ n: n0(fresh?.n), obs: n0(fresh?.w), exp: n0(fresh?.ea), v: n0(fresh?.va) }),
+    usual: indexOf({ n: n0(freshNorm?.n), obs: n0(freshNorm?.w), exp: n0(freshNorm?.ew), v: 0 }),
+  };
+
   out.cases = (report?.cases ?? []).map(cleanRow).map((c) => ({
     slug: c.slug,
     n: c.n,

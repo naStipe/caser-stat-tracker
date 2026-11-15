@@ -10,27 +10,51 @@ It is not part of the userscript in the parent folder.
 
 ## What the dashboard shows
 
-Two measures, for upgrades and for cases:
+Three measures, for upgrades and for cases:
 
-- **Index**: observed against expected. For upgrades, wins against the wins the shown chances predict. For cases,
-  "hits" (an open worth at least the case price) against the hits the case's normal rate predicts (its rate over
-  the last 7 days). Each upgrade or open counts once, whatever its size, so this settles quickly. 1 means as
-  expected; above 1 is better for players. Its 95% range is binomial: every upgrade or open is a separate draw.
+- **Index against normal**: observed against what is usual for the situation. For upgrades, wins against the wins
+  the last 7 days' real rate predicts for the same shown-chance band and the same time into the player's session
+  (a session starts after 20 minutes without play, usually a deposit). Early in a session low chances win far
+  more often than shown and high chances always less, so an index against the shown chance mostly measures
+  where players are in their sessions; this one does not. For cases, "hits" (an open worth at least the case
+  price) against each case's rate over the last 7 days. Each upgrade or open counts once, whatever its size, so
+  this settles quickly. 1 means as usual; above 1 is better for players. Its 95% range is binomial: every upgrade
+  or open is a separate draw.
+- **Index against the shown odds** (upgrades): wins against what the shown chances promise.
 - **Return per 1**: total value received per 1 staked. What players actually got, but a single big win moves it a
   lot, so it needs far more data to show a change. Its 95% range is clustered by player.
 
+Two corrections apply to every number:
+
+- **Rows next to a player's discovery are left out**: from 2 hours before to 30 minutes after the moment the feed
+  showed them. Players are found right after a big win, so they had a streak just before it (1.09 to 1.18 times
+  the normal win rate on the data of 14 November) and a dip just after (0.85 to 0.89). The page says how many rows
+  this leaves out.
+- **Windows still filling are marked**: rows arrive minutes to hours after they happen (revisits, history pages).
+  The database records when each row arrived, and windows newer than the time by which 80% of rows have arrived
+  are shaded as "still arriving", are not ranked, and are not used by "right now".
+
+Both, and the session phase, come from columns the database fills itself (`phase`, `near`, `added` in
+`monitor_rows`, see `supabase/migrations/*_monitor_derive.sql`): a `pg_cron` job, `monitor_derive()`, runs every
+minute for new rows and refreshes the 7-day normal rates (`monitor_cal`) every 30 minutes. The monitor sends
+nothing extra.
+
 Sections:
 
+- **right now**, one card each for upgrades and cases: the last 30 minutes (or hour) up to the settled time against
+  normal, with a significance test, the part before it, and a line of the last 6 hours (each point the 30 minutes
+  or hour before it, with its 95% range; dashed while rows are still arriving). The upgrade card also shows how low
+  chances did in the first 5 minutes of sessions against their usual value;
 - the monitor's state and its recent events (problems are listed here too);
-- **right now**: the last 30 minutes against the 90 minutes before, or the last hour against the 3 hours before
-  (a switch), with a significance test;
 - totals for the range (30 minutes to 30 days, opening on the last hour), including the share of players who
   ended up in profit;
-- **one chart for upgrades and one for cases, per window** (1 minute to 1 day, depending on the range; index or
-  return per 1), with each window's 95% range, a smoothed line, the range average, sample sizes, and the best and
-  worst windows;
+- **upgrades by time into the session**: wins against the shown chance per session phase and chance group, next to
+  the usual value over 7 days;
+- **one chart for upgrades and one for cases, per window** (1 minute to 1 day, depending on the range; against
+  normal, against the shown odds, or return per 1), with each window's 95% range, a smoothed line, the range
+  average, sample sizes, and the best and worst settled windows;
 - a weekday × hour heat map (local time) over the last 7 days, whatever the range;
-- upgrades by shown chance (where the shown odds are off the most), cases one by one, stake sizes;
+- upgrades by shown chance (against the shown odds and against normal), cases one by one, stake sizes;
 - site activity from the site's public counters.
 
 ## How it samples
@@ -142,6 +166,8 @@ Tables and functions: `supabase/migrations/*_monitor*.sql` in the parent folder 
 - `monitor_report`, `monitor_volume_agg`: what the dashboard reads, for viewers only.
 - `monitor_private`, `monitor_watchdog`, `monitor_send_alert`: the alert URL and the watchdog; no one else can
   read or call them.
+- `monitor_derive`, `monitor_cal`, `monitor_derive_state`: the every-minute job that fills each row's session phase
+  and discovery flag, and the 7-day normal rates it keeps; no one else can read or call them.
 - The monitor deletes rows and events older than `RETENTION_DAYS` (default 30) once an hour.
 
 ## Run the monitor
