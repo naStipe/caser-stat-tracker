@@ -492,6 +492,8 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(settledAt({ rows: 50, p80: 60000 }, now).known, false);
   assert.equal(settledAt({ rows: 500, p50: 30000, p80: 60000 }, now).lagMs, STEP);
   assert.equal(settledAt({ rows: 500, p50: 30000, p80: 9 * HOUR }, now).lagMs, 2 * HOUR);
+  assert.equal(settledAt({ rows: 500, p50: 30000, p80: 9 * HOUR }, now).capped, true);
+  assert.equal(settledAt({ rows: 500, p50: 30000, p80: 60000 }, now).capped, false);
   assert.equal(settledAt({ rows: 500, p50: 30000, p80: 60000 }, now).at, Math.floor((now - STEP) / STEP) * STEP);
   // Shapes as monitor_report sends them (some numbers as strings, empty sums as null). Normal ("ea") expects 8 wins, the shown chances 10.
   const up = (bucket, w, extra = {}) => ({ bucket, kind: 'upgrade', n: 40, players: 10, up: 4, sx: '400', sy: 380, gxx: 16000, gyy: 15000, gxy: 15000, nw: 40, w, ew: 10, vw: 8, ea: 8, va: 6, nh: 0, h: null, eh: null, vh: null, ...extra });

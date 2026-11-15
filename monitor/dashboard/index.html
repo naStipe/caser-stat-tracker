@@ -513,7 +513,7 @@ function glanceCard(kind, width) {
     glanceLine({ kind, width }),
     h('div', { class: 'muted', text: detail + before }),
     h('div', { class: ['predicts', p.verdict === 'carry' || p.verdict === 'reverse' ? 'warn-text' : 'muted'], text: predicts }),
-    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${lag.known ? `80% arrive within ${Math.round(lag.lagMs / 60000)} min` : `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured`}).` }));
+    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${!lag.known ? `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured` : lag.capped ? `80% take over 2 hours to arrive; windows count as complete after 2 hours` : `80% arrive within ${Math.round(lag.lagMs / 60000)} min`}).` }));
 }
 
 const signed = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 2)}` : DASH);
@@ -738,7 +738,7 @@ function renderDashboard() {
 
   out.push(h('section', null, h('h2', { text: 'How the sample is taken' }),
     h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours, then checked again for new rows: every 10 minutes while they play, less often the longer they have been away (up to every 6 hours). Players are stored as a salted hash, never by name.' }),
-    h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In this range that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${Math.round(v.settled.lagMs / 60000)}` : ''}.` })));
+    h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In this range that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${v.settled.capped ? 'over 120' : Math.round(v.settled.lagMs / 60000)}` : ''}.` })));
   root.replaceChildren(...out);
   if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
 }

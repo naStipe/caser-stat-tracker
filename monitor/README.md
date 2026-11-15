@@ -32,7 +32,9 @@ Two corrections apply to every number:
   this leaves out.
 - **Windows still filling are marked**: rows arrive minutes to hours after they happen (revisits, history pages).
   The database records when each row arrived, and windows newer than the time by which 80% of rows have arrived
-  are shaded as "still arriving", are not ranked, and are not used by "right now".
+  are shaded as "still arriving", are not ranked, and are not used by "right now". The arrival time is measured from
+  rows 3 to 24 hours old that the measures use; until 200 such rows exist it is assumed to be 30 minutes, and it is
+  capped at 2 hours.
 
 Both, and the session phase, come from columns the database fills itself (`phase`, `near`, `added` in
 `monitor_rows`, see `supabase/migrations/*_monitor_derive.sql`): a `pg_cron` job, `monitor_derive()`, runs every

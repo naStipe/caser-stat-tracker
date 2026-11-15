@@ -89,7 +89,8 @@ export function settledAt(lag, now) {
   const p80 = Number(lag?.p80);
   const known = Number(lag?.rows) >= MIN_LAG_ROWS && Number.isFinite(p80);
   const lagMs = known ? Math.min(MAX_LAG, Math.max(STEP, p80)) : DEFAULT_LAG;
-  return { lagMs, known, p50: known ? Number(lag.p50) : null, at: Math.floor((now - lagMs) / STEP) * STEP };
+  // capped: most rows arrive later than the page waits; windows past MAX_LAG are judged anyway.
+  return { lagMs, known, capped: known && p80 > MAX_LAG, p50: known ? Number(lag.p50) : null, at: Math.floor((now - lagMs) / STEP) * STEP };
 }
 
 const n0 = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? 0 : Number(v));
