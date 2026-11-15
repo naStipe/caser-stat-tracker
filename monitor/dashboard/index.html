@@ -26,8 +26,28 @@
   h2 { font-size: 14px; font-weight: 600; margin: 0; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   .sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 10px; }
-  .range-bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; background: var(--bg); padding: 10px 0; margin: 8px 0 8px; border-bottom: 1px solid var(--line); }
-  .range-bar .label { margin-left: 0; }
+  .tabs { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; background: var(--bg); margin: 0 0 16px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .tabs .label { margin-left: 0; }
+  .tab-list { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; margin-bottom: -7px; }
+  .tab-list::-webkit-scrollbar { display: none; }
+  .tab-list button { border: 0; border-radius: 0; border-bottom: 2px solid transparent; padding: 8px 12px; color: var(--muted); white-space: nowrap; }
+  .tab-list button:hover { background: transparent; color: var(--text); }
+  .tab-list button.on { background: transparent; color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .status { display: inline-flex; align-items: center; gap: 7px; min-width: 0; max-width: 460px; font-size: 12.5px; color: var(--muted); padding: 3px 10px; border-radius: 999px; }
+  .status span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status i { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+  .status.ok i { background: var(--pos); }
+  .status.bad i { background: var(--neg); }
+  .tbl-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-bottom: 8px; }
+  .tbl-tools input { width: 200px; padding: 5px 9px; font-size: 13px; }
+  .tbl-tools input.min { width: 84px; }
+  .tbl-tools .label { margin-left: 0; }
+  button.link { border: 0; padding: 0; color: var(--accent); font-size: 12.5px; }
+  button.link:hover { background: transparent; text-decoration: underline; }
+  th button.sort { border: 0; padding: 0; border-radius: 0; color: inherit; font-weight: inherit; }
+  th button.sort:hover { background: transparent; color: var(--text); }
+  th.sorted { color: var(--text); }
+  th .arrow { display: inline-block; width: 1em; text-align: center; }
   .muted { color: var(--muted); }
   .faint { color: var(--faint); }
   .hint { color: var(--faint); font-size: 12.5px; margin: 10px 0 0; }
@@ -35,8 +55,10 @@
   .neg { color: var(--neg); }
   .warn-text { color: var(--warn); }
   .num { font-variant-numeric: tabular-nums; }
-  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-  .group { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+  .group { display: inline-flex; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; scrollbar-width: none; }
+  .group::-webkit-scrollbar { display: none; }
+  .group button { flex: none; }
   .group button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
   .group button:last-child { border-right: 0; }
   .label { color: var(--faint); font-size: 12.5px; margin: 0 2px 0 6px; }
@@ -108,7 +130,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, FEED_TIERS, FEED_MIN_SEEN } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -155,7 +177,6 @@ let events = [];
 let session = null;
 let loading = false;
 let loadError = null;
-let firstPaint = true;
 
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -629,6 +650,80 @@ const ixCell = (ix) => h('td', { class: 'num' }, h('span', { class: ok(ix?.index
 const moneyCell = (r) => h('td', { class: ['num', ok(r?.ratio) ? sign(r.ratio - 1) : 'faint'], text: fmt3(r?.ratio) });
 const tableOf = (heads, rows) => h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null, heads.map((x) => h('th', { text: x })))), h('tbody', null, rows)));
 
+/** Sort and filter choices per table, kept across reloads. */
+const tableState = {};
+function stateOf(id) {
+  if (!tableState[id]) {
+    let st = {};
+    try { st = JSON.parse(store.get(`pulse.table.${id}`, '{}')) || {}; } catch {}
+    tableState[id] = { sort: Number.isInteger(st.sort) ? st.sort : null, dir: st.dir === 'asc' ? 'asc' : 'desc', q: typeof st.q === 'string' ? st.q : '', min: Number(st.min) > 0 ? Number(st.min) : 0 };
+  }
+  return tableState[id];
+}
+/**
+ * A table whose columns sort on click (high to low, low to high, then back to the default order) and whose rows
+ * can be narrowed by text and by a minimum sample size. Sorting and filtering redraw only the table.
+ * columns: [{ label, cell(row) -> td, sort(row) -> number | string | null }]
+ */
+function dataTable({ id, columns, rows, search, minOf, minLabel }) {
+  const st = stateOf(id);
+  const save = () => store.set(`pulse.table.${id}`, JSON.stringify(st));
+  const tbody = h('tbody');
+  const count = h('span', { class: 'faint small-text' });
+  // Text columns start A to Z, number columns high to low; the third click goes back to the default order.
+  const firstDir = (c) => (c.text ? 'asc' : 'desc');
+  const heads = columns.map((c, i) => h('th', { scope: 'col' },
+    c.sort ? h('button', { type: 'button', class: 'sort', title: 'Sort by this column', onclick: () => {
+      if (st.sort !== i) { st.sort = i; st.dir = firstDir(c); }
+      else if (st.dir === firstDir(c)) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+      else st.sort = null;
+      save();
+      paint();
+    } }, c.label, h('span', { class: 'arrow' })) : c.label));
+  function paint() {
+    const q = st.q.trim().toLowerCase();
+    let list = rows.filter((r) => (!q || search(r).toLowerCase().includes(q)) && (!minOf || !st.min || (minOf(r) ?? 0) >= st.min));
+    const col = st.sort != null ? columns[st.sort] : null;
+    if (col?.sort) {
+      const k = st.dir === 'asc' ? 1 : -1;
+      list = list.map((r, i) => ({ r, i, v: col.sort(r) })).sort((a, b) => {
+        const an = a.v == null || (typeof a.v === 'number' && !Number.isFinite(a.v));
+        const bn = b.v == null || (typeof b.v === 'number' && !Number.isFinite(b.v));
+        if (an || bn) return an === bn ? a.i - b.i : an ? 1 : -1; // empty values last either way
+        return (typeof a.v === 'string' ? a.v.localeCompare(b.v) : a.v - b.v) * k || a.i - b.i;
+      }).map((x) => x.r);
+    }
+    tbody.replaceChildren(...list.map((r) => h('tr', null, columns.map((c) => c.cell(r)))));
+    if (!list.length) tbody.append(h('tr', null, h('td', { colspan: columns.length, class: 'faint', text: 'No rows match.' })));
+    heads.forEach((th, i) => {
+      const on = st.sort === i;
+      th.setAttribute('aria-sort', on ? (st.dir === 'asc' ? 'ascending' : 'descending') : 'none');
+      th.classList.toggle('sorted', on);
+      const arrow = th.querySelector('.arrow');
+      if (arrow) arrow.textContent = on ? (st.dir === 'asc' ? '↑' : '↓') : '';
+    });
+    count.textContent = list.length === rows.length ? `${rows.length} rows` : `${list.length} of ${rows.length} rows`;
+    reset.hidden = st.sort == null && !st.q && !st.min;
+  }
+  const qInput = search ? h('input', { type: 'search', placeholder: 'Filter…', 'aria-label': 'Filter rows', value: st.q, oninput: (e) => { st.q = e.target.value; save(); paint(); } }) : null;
+  const minInput = minOf ? h('input', { type: 'number', min: 0, step: 1, inputmode: 'numeric', class: 'min', 'aria-label': minLabel, value: st.min || '', placeholder: '0', oninput: (e) => { st.min = Math.max(0, Number(e.target.value) || 0); save(); paint(); } }) : null;
+  const reset = h('button', { type: 'button', class: 'link', text: 'Reset', onclick: () => {
+    st.sort = null; st.q = ''; st.min = 0; save();
+    if (qInput) qInput.value = '';
+    if (minInput) minInput.value = '';
+    paint();
+  } });
+  const tools = h('div', { class: 'tbl-tools' },
+    qInput,
+    minInput ? h('span', { class: 'row' }, h('span', { class: 'label', text: minLabel }), minInput) : null,
+    count, reset);
+  const wrap = h('div', null, tools, h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null, heads)), tbody)));
+  paint();
+  return wrap;
+}
+const ixSort = (ix) => (ok(ix?.index) ? ix.index : null);
+const moneySort = (m) => (ok(m?.ratio) ? m.ratio : null);
+
 function problemsSection() {
   const st = health?.status ?? {};
   const facts = !health || (health.level === 'bad' && !st.running) ? [] : [
@@ -654,29 +749,55 @@ function problemsSection() {
 }
 
 function header() {
-  return h('header', null, h('h1', { text: 'Pulse monitor' }),
+  const lvl = health?.level ?? 'warn';
+  return h('header', null,
+    h('div', { class: 'row', style: 'gap:8px 14px;min-width:0' },
+      h('h1', { text: 'Pulse monitor' }),
+      h('button', { type: 'button', class: ['status', lvl], title: 'Monitor status and recent events', onclick: () => setTab('monitor') }, h('i'), h('span', { text: health?.text ?? 'Loading…' }))),
     h('div', { class: 'row' },
       h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
       h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
 }
-/** Range picker, placed right above the sections it changes. */
-function rangeBar() {
-  return h('div', { class: 'range-bar' },
-    toggle(Object.entries(RANGES).map(([k, r]) => [k, k, r.label]), rangeKey, setRange, 'Range'),
-    h('span', { class: 'faint small-text', text: 'Changes everything below.' }));
+
+/** The page is split into tabs, so nothing needs a long scroll to reach. */
+const TABS = [
+  ['now', 'Right now', 'The last 30 minutes or hour against normal, and what it predicts'],
+  ['time', 'Over time', 'The picked range window by window, site activity and the weekday heat map'],
+  ['tables', 'Tables', 'Session phase, shown chance, cases and stake size, sortable'],
+  ['feed', 'Drop line', 'Colours of the live drop line and whether they go with results'],
+  ['monitor', 'Monitor', 'Whether the monitor is running, recent events and how the sample is taken'],
+];
+const RANGE_TABS = new Set(['time', 'tables', 'feed']);
+const tabFromHash = () => (TABS.some(([k]) => k === location.hash.slice(1)) ? location.hash.slice(1) : null);
+let tab = tabFromHash() ?? (TABS.some(([k]) => k === store.get('pulse.tab')) ? store.get('pulse.tab') : 'now');
+function setTab(k) {
+  if (!TABS.some(([t]) => t === k)) return;
+  const changed = tab !== k;
+  tab = k;
+  store.set('pulse.tab', k);
+  if (location.hash.slice(1) !== k) history.replaceState(null, '', `#${k}`);
+  renderDashboard();
+  if (changed) {
+    const nav = root.querySelector('.tabs');
+    if (nav && window.scrollY > nav.offsetTop) window.scrollTo({ top: nav.offsetTop });
+  }
+}
+addEventListener('hashchange', () => { const k = tabFromHash(); if (k && k !== tab) setTab(k); });
+
+/** Tabs, with the range picker beside them on the tabs it changes. */
+function tabBar() {
+  return h('nav', { class: 'tabs', 'aria-label': 'Sections' },
+    h('div', { class: 'tab-list', role: 'tablist' }, TABS.map(([k, label, title]) =>
+      h('button', { type: 'button', role: 'tab', id: `tab-${k}`, 'aria-selected': String(k === tab), 'aria-controls': 'tab-panel', class: k === tab ? 'on' : '', title, text: label, onclick: () => setTab(k) }))),
+    RANGE_TABS.has(tab) ? toggle(Object.entries(RANGES).map(([k, r]) => [k, k, `Last ${r.label}`]), rangeKey, setRange, 'Range') : null);
 }
 /** Window-size picker for the per-window charts. */
 function windowToggle() {
   return toggle(windowsFor(rangeKey).map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window');
 }
 
-function renderDashboard() {
-  const v = view;
-  const width = Math.min(root.clientWidth || 1000, 1008) - 34;
-  const out = [header()];
-  if (loadError) out.push(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${loadError}` }));
-  if (!v) { out.push(problemsSection(), h('p', { class: 'faint', text: 'Loading…' })); root.replaceChildren(...out); return; }
-
+function nowTab(v, width) {
+  const out = [];
   out.push(h('div', { class: 'sec-head' }, h('h2', { text: 'Right now' }),
     toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over')));
   const gw = width >= 680 ? Math.floor((width - 16) / 2) - 2 : width;
@@ -690,11 +811,13 @@ function renderDashboard() {
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does the pattern hold day by day?' })),
     dailyChart({ width }),
     h('p', { class: 'hint', text: 'Wins against the shown chance per day, last 7 days: low chances in the first 5 minutes of a session (the only group that wins more than shown) and high chances at any time. If the site changes how it treats sessions, it shows here first.' })));
-  out.push(problemsSection());
+  return out;
+}
 
+function timeTab(v, width) {
+  const out = [];
   const t = v.totals;
   const up = v.kinds.upgrade;
-  out.push(rangeBar());
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Last ${v.spec.label}` })),
     h('div', { class: 'kpis' },
       kpi('Upgrades vs normal', fmt2(up.avg.index), up.avg.ci ? `range ${fmt2(up.avg.ci[0])}–${fmt2(up.avg.ci[1])}` : null, clearOf1(up.avg.ci)),
@@ -706,15 +829,11 @@ function renderDashboard() {
       kpi('Players up, cases', t.case.players ? pct(t.case.up / t.case.players, 0) : DASH, `${fmtInt(t.case.up)} of ${fmtInt(t.case.players)}`)),
     h('p', { class: 'hint', text: 'Vs normal: upgrade wins against the usual real rate for the same shown chance and time into the session, over the last 7 days. Vs shown odds: against what the shown chances promise. Hit index: case opens worth at least the case price, against each case’s usual rate. 1 means as usual (or as shown); above 1 is better for players. These count every upgrade or open once, so they settle much faster than return per 1, which one big win can move.' })));
 
-  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by time into the session' })),
-    phaseTable(),
-    h('p', { class: 'hint', text: 'Wins against the shown chance in this range; under each, the usual value over the last 7 days and the number of upgrades. A session starts after 20 minutes without play, which is usually a new deposit. “Start not seen”: the session began before the player’s first row the monitor has.' })));
-
   for (const kind of KINDS) {
     const k = v.kinds[kind];
     out.push(h('section', null,
       h('div', { class: 'sec-head' },
-        h('h2', { text: `${NAMES[kind][0]} per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }),
+        h('h2', { text: `${NAMES[kind][0]} per ${winLabel(windowMin)} window` }),
         h('div', { class: 'row' }, windowToggle(),
           toggle(METRICS[kind], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); }))),
       windowChart({ v, kind, width }),
@@ -722,40 +841,89 @@ function renderDashboard() {
       h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin or still arriving (the shaded part, whose rows are not all read yet). Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank settled windows by how far they sit from the average, counting their sample size.' })));
   }
 
-  out.push(feedSection({ v, width }));
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Site activity' })), activityChart({ v, width })));
 
   out.push(h('section', null,
     h('div', { class: 'sec-head' }, h('h2', { text: 'By weekday and hour' }),
       toggle(KINDS.map((k) => [k, NAMES[k][0]]), heatKind, (x) => { heatKind = x; store.set('pulse.heat', x); renderDashboard(); })),
     heatmap({ v, kind: heatKind, width }),
     h('p', { class: 'hint', text: `The last ${v.spec.to - v.spec.from >= 7 * 24 * HOUR ? v.spec.label : '7 days'}, whatever the range above. Shows ${metric[heatKind] === 'money' ? 'return per 1' : metricName(heatKind, 'index')} (switch above the ${NAMES[heatKind][0].toLowerCase()} chart). Patterns need weeks of data to mean much; a single bright cell is usually luck.` })));
+  return out;
+}
+
+function tablesTab(v) {
+  const out = [];
+  const num = (val) => h('td', { class: 'num', text: val });
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Cases' })),
+    v.cases.length ? dataTable({ id: 'cases', rows: v.cases, search: (c) => c.slug ?? '', minOf: (c) => c.n, minLabel: 'Min opens', columns: [
+      { label: 'Case', text: true, sort: (c) => c.slug ?? '', cell: (c) => h('td', { text: c.slug }) },
+      { label: 'Opens', sort: (c) => c.n, cell: (c) => num(fmtInt(c.n)) },
+      { label: 'Players', sort: (c) => c.players, cell: (c) => num(fmtInt(c.players)) },
+      { label: 'Price', sort: (c) => c.price, cell: (c) => num(fmtInt(c.price)) },
+      { label: 'Hit rate', sort: (c) => c.hitRate, cell: (c) => num(pct(c.hitRate)) },
+      { label: 'Normal', sort: (c) => c.normalRate, cell: (c) => h('td', { class: 'num faint', text: pct(c.normalRate) }) },
+      { label: 'Hit index', sort: (c) => ixSort(c.index), cell: (c) => ixCell(c.index) },
+      { label: 'Return', sort: (c) => moneySort(c.money), cell: (c) => moneyCell(c.money) },
+    ] }) : h('p', { class: 'faint', text: 'No case opens with a known case in this range yet.' }),
+    h('p', { class: 'hint', text: 'Click a column to sort it (again to flip, a third time for the default order). Hit: an open worth at least the case price. Normal: the case’s hit rate over the last 7 days. The 60 most opened cases. Return on a case with few opens is mostly luck: set a minimum number of opens before sorting by it.' })));
 
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by shown chance' })),
-    v.bands.length ? tableOf(['Shown chance', 'Upgrades', 'Players', 'Win rate', 'Shown', 'Vs shown', 'Vs normal', 'Return'],
-      v.bands.map((b) => h('tr', null, h('td', { text: b.label }), h('td', { class: 'num', text: fmtInt(b.n) }), h('td', { class: 'num', text: fmtInt(b.players) }),
-        h('td', { class: 'num', text: pct(b.winRate) }), h('td', { class: 'num faint', text: pct(b.shownRate) }), ixCell(b.index), ixCell(b.normal), moneyCell(b.money))))
-      : h('p', { class: 'faint', text: 'No upgrades in this range yet.' }),
+    v.bands.length ? dataTable({ id: 'bands', rows: v.bands, minOf: (b) => b.n, minLabel: 'Min upgrades', columns: [
+      { label: 'Shown chance', cell: (b) => h('td', { text: b.label }) },
+      { label: 'Upgrades', sort: (b) => b.n, cell: (b) => num(fmtInt(b.n)) },
+      { label: 'Players', sort: (b) => b.players, cell: (b) => num(fmtInt(b.players)) },
+      { label: 'Win rate', sort: (b) => b.winRate, cell: (b) => num(pct(b.winRate)) },
+      { label: 'Shown', sort: (b) => b.shownRate, cell: (b) => h('td', { class: 'num faint', text: pct(b.shownRate) }) },
+      { label: 'Vs shown', sort: (b) => ixSort(b.index), cell: (b) => ixCell(b.index) },
+      { label: 'Vs normal', sort: (b) => ixSort(b.normal), cell: (b) => ixCell(b.normal) },
+      { label: 'Return', sort: (b) => moneySort(b.money), cell: (b) => moneyCell(b.money) },
+    ] }) : h('p', { class: 'faint', text: 'No upgrades in this range yet.' }),
     h('p', { class: 'hint', text: 'Win rate against the average shown chance in each band. Vs shown: where the shown odds are off; low chances usually win more than shown, high chances less. Vs normal: against the usual rate for the band and session phase, so a value away from 1 means this range differs from the last 7 days.' })));
 
-  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Cases' })),
-    v.cases.length ? tableOf(['Case', 'Opens', 'Players', 'Price', 'Hit rate', 'Normal', 'Hit index', 'Return'],
-      v.cases.map((c) => h('tr', null, h('td', { text: c.slug }), h('td', { class: 'num', text: fmtInt(c.n) }), h('td', { class: 'num', text: fmtInt(c.players) }), h('td', { class: 'num', text: fmtInt(c.price) }),
-        h('td', { class: 'num', text: pct(c.hitRate) }), h('td', { class: 'num faint', text: pct(c.normalRate) }), ixCell(c.index), moneyCell(c.money))))
-      : h('p', { class: 'faint', text: 'No case opens with a known case in this range yet.' }),
-    h('p', { class: 'hint', text: 'Hit: an open worth at least the case price. Normal: the case’s hit rate over the last 7 days. The 60 most opened cases.' })));
-
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'By stake size' })),
-    v.stakes.length ? tableOf(['Kind', 'Stake', 'Rows', 'Players', 'Index', 'Return'],
-      v.stakes.map((x) => h('tr', null, h('td', { text: NAMES[x.kind][0] }), h('td', { class: 'num', text: x.label }), h('td', { class: 'num', text: fmtInt(x.n) }), h('td', { class: 'num', text: fmtInt(x.players) }), ixCell(x.index), moneyCell(x.money))))
-      : h('p', { class: 'faint', text: 'Nothing in this range yet.' })));
+    v.stakes.length ? dataTable({ id: 'stakes', rows: v.stakes, search: (x) => `${NAMES[x.kind][0]} ${x.label}`, minOf: (x) => x.n, minLabel: 'Min rows', columns: [
+      { label: 'Kind', text: true, sort: (x) => NAMES[x.kind][0], cell: (x) => h('td', { text: NAMES[x.kind][0] }) },
+      { label: 'Stake', cell: (x) => num(x.label) },
+      { label: 'Rows', sort: (x) => x.n, cell: (x) => num(fmtInt(x.n)) },
+      { label: 'Players', sort: (x) => x.players, cell: (x) => num(fmtInt(x.players)) },
+      { label: 'Index', sort: (x) => ixSort(x.index), cell: (x) => ixCell(x.index) },
+      { label: 'Return', sort: (x) => moneySort(x.money), cell: (x) => moneyCell(x.money) },
+    ] }) : h('p', { class: 'faint', text: 'Nothing in this range yet.' })));
 
-  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Site activity' })), activityChart({ v, width })));
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Upgrades by time into the session' })),
+    phaseTable(),
+    h('p', { class: 'hint', text: 'Wins against the shown chance in this range; under each, the usual value over the last 7 days and the number of upgrades. A session starts after 20 minutes without play, which is usually a new deposit. “Start not seen”: the session began before the player’s first row the monitor has.' })));
+  return out;
+}
 
-  out.push(h('section', null, h('h2', { text: 'How the sample is taken' }),
-    h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours, then checked again for new rows: every 10 minutes while they play, less often the longer they have been away (up to every 6 hours). Players are stored as a salted hash, never by name.' }),
-    h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In this range that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${v.settled.capped ? 'over 120' : Math.round(v.settled.lagMs / 60000)}` : ''}.` })));
+function monitorTab(v) {
+  return [problemsSection(),
+    h('section', null, h('h2', { text: 'How the sample is taken' }),
+      h('p', { class: 'muted', text: 'Players come from the live-drop feed, which shows big wins, so the sample leans towards big spenders. When a player is found, their history is read back 7 days (at most about 1,000 rows per list), leaving out the feed wins that found them. They are followed for up to 2 hours, then checked again for new rows: every 10 minutes while they play, less often the longer they have been away (up to every 6 hours). Players are stored as a salted hash, never by name.' }),
+      h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In the range picked on the other tabs (last ${v.spec.label}) that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${v.settled.capped ? 'over 120' : Math.round(v.settled.lagMs / 60000)}` : ''}.` }))];
+}
+
+let shownTab = null;
+function renderDashboard() {
+  const v = view;
+  const width = Math.min(root.clientWidth || 1000, 1008) - 34;
+  const out = [header(), tabBar()];
+  if (loadError) out.push(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${loadError}` }));
+  if (!v) {
+    out.push(tab === 'monitor' ? problemsSection() : h('p', { class: 'faint', text: 'Loading…' }));
+    root.replaceChildren(...out);
+    return;
+  }
+  const page = tab === 'time' ? timeTab(v, width)
+    : tab === 'tables' ? tablesTab(v)
+    : tab === 'feed' ? [feedSection({ v, width })]
+    : tab === 'monitor' ? monitorTab(v)
+    : nowTab(v, width);
+  // Keep the page where it is on the minute refresh: only a new tab fades in.
+  const panel = h('div', { id: 'tab-panel', role: 'tabpanel', 'aria-labelledby': `tab-${tab}`, class: shownTab !== tab ? 'fade' : '' }, page);
+  shownTab = tab;
+  out.push(panel);
   root.replaceChildren(...out);
-  if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
 }
 
 /** Colours hidden in the drop-line chart (clicked off in its legend). */
@@ -766,10 +934,64 @@ function toggleFeedTier(k) {
   if (view) renderDashboard();
 }
 
+/**
+ * The drop-line chart can have its own range, so short windows work over long ranges too ('same' follows the
+ * range at the top). The database allows up to 10,000 windows per request.
+ */
+const FEED_RANGE_KEYS = ['1h', '3h', '6h', '24h', '3d', '7d', '30d'];
+const FEED_MAX_WINDOWS = 10000;
+const winLabel = (m) => (m >= 60 ? `${m / 60}-hour` : `${m}-minute`);
+function feedWindowsFor(k) {
+  const span = RANGES[k].span;
+  return WINDOWS.filter((m) => span / (m * 60000) <= FEED_MAX_WINDOWS && span / (m * 60000) >= 3);
+}
+function pickFeedWin(k, wanted) {
+  const allowed = feedWindowsFor(k);
+  if (allowed.includes(Number(wanted))) return Number(wanted);
+  return allowed.find((m) => RANGES[k].span / (m * 60000) <= 1500) ?? allowed.at(-1);
+}
+let feedRangeKey = FEED_RANGE_KEYS.includes(store.get('pulse.feedRange')) ? store.get('pulse.feedRange') : 'same';
+let feedWin = feedRangeKey === 'same' ? null : pickFeedWin(feedRangeKey, store.get(`pulse.feedWindow.${feedRangeKey}`));
+let feedView = null; // { spec, now, windows } for the chart's own range
+let feedError = null;
+function feedSpecOf(now) {
+  const win = feedWin * 60000;
+  const to = Math.floor(now / win) * win + win;
+  return { key: feedRangeKey, label: RANGES[feedRangeKey].label, from: to - Math.ceil(RANGES[feedRangeKey].span / win) * win, to, window: win };
+}
+async function fetchFeed(now) {
+  if (feedRangeKey === 'same') return null;
+  const fs = feedSpecOf(now);
+  const rows = await rpc('monitor_feed_agg', { from_ms: fs.from, to_ms: fs.to, bucket_ms: fs.window });
+  return { spec: fs, now, windows: feedReport(rows, fs, null, 0, now).windows };
+}
+let feedAsk = 0;
+async function loadFeed() {
+  const ask = ++feedAsk;
+  feedError = null;
+  if (view) renderDashboard();
+  let next = null, err = null;
+  try { next = await fetchFeed(Date.now()); } catch (e) { err = e.message || String(e); }
+  if (ask !== feedAsk) return; // a newer pick is on its way
+  feedView = next;
+  feedError = err;
+  if (view) renderDashboard();
+}
+function setFeedRange(k) {
+  feedRangeKey = k === 'same' || !RANGES[k] ? 'same' : k;
+  store.set('pulse.feedRange', feedRangeKey);
+  feedWin = feedRangeKey === 'same' ? null : pickFeedWin(feedRangeKey, store.get(`pulse.feedWindow.${feedRangeKey}`, feedWin));
+  loadFeed();
+}
+function setFeedWin(m) {
+  feedWin = pickFeedWin(feedRangeKey, m);
+  store.set(`pulse.feedWindow.${feedRangeKey}`, String(feedWin));
+  loadFeed();
+}
+
 /** The drop line's colour mix per window: one line per colour (its share of the drops seen), with the drop rate under it. */
-function feedChart({ v, width }) {
-  const { spec, now } = v;
-  const fw = v.feed.windows;
+function feedChart({ spec, now, windows: fw, width }) {
+  const winMin = spec.window / 60000;
   // Start the axis at the first window with drops, so a short history is not squeezed into the right edge.
   const first = fw.find((w) => w.seen);
   const t0 = first ? Math.max(spec.from, Math.min(first.start, now - 6 * spec.window)) : spec.from;
@@ -779,7 +1001,7 @@ function feedChart({ v, width }) {
   let top = 0.1;
   for (const w of fw) if (full(w)) for (const [k] of tiers) top = Math.max(top, share(w, k));
   const { lo, hi, ticks } = niceTicks(0, Math.min(1, top * 1.08), 4);
-  const f = frame({ width, t0, t1: now, lo, hi: Math.min(1, hi), ticks: ticks.filter((q) => q <= 1), tickFmt: (q) => `${Math.round(q * 100)}%`, span: now - t0, strip: 30, H: 250, vgrid: false, label: `Share of each colour on the drop line per ${windowMin}-minute window over the last ${spec.label}.` });
+  const f = frame({ width, t0, t1: now, lo, hi: Math.min(1, hi), ticks: ticks.filter((q) => q <= 1), tickFmt: (q) => `${Math.round(q * 100)}%`, span: now - t0, strip: 30, H: 250, vgrid: false, label: `Share of each colour on the drop line per ${winMin}-minute window over the last ${spec.label}.` });
   const { svg, x, y } = f;
   const bw = Math.max(1, f.iw / Math.max(1, (now - t0) / spec.window) - 1);
   const maxRate = Math.max(1, ...fw.map((w) => w.perMin ?? 0));
@@ -789,7 +1011,10 @@ function feedChart({ v, width }) {
     svg.append(s('rect', { x: x(w.start), y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
   }
   // One line per colour; windows with too few drops break the line instead of adding noise.
-  const dots = fw.filter((w) => full(w) && w.start + spec.window > t0).length <= 90;
+  const drawn = fw.filter((w) => full(w) && w.start + spec.window > t0).length;
+  const dots = drawn <= 90;
+  // Many windows: thinner lines, so the colours stay apart instead of merging into one band.
+  const stroke = drawn > 600 ? 1 : drawn > 250 ? 1.25 : 1.75;
   const mid = (w) => x(w.start + spec.window / 2);
   for (const [k, color] of tiers) {
     let d = '';
@@ -798,7 +1023,7 @@ function feedChart({ v, width }) {
       d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${mid(w).toFixed(1)},${y(share(w, k)).toFixed(1)}`;
       if (dots) svg.append(s('circle', { cx: mid(w), cy: y(share(w, k)), r: 2, fill: color }));
     }
-    svg.append(s('path', { d: d.trim(), fill: 'none', stroke: color, 'stroke-width': 1.75, 'stroke-linejoin': 'round', 'stroke-opacity': 0.9 }));
+    svg.append(s('path', { d: d.trim(), fill: 'none', stroke: color, 'stroke-width': stroke, 'stroke-linejoin': 'round', 'stroke-opacity': 0.9 }));
   }
   const marks = fw.filter((w) => w.seen).map((w) => ({ cx: mid(w), cy: y(full(w) && tiers.length ? Math.max(...tiers.map(([k]) => share(w, k))) : 0), w }));
   const readout = h('div', { class: 'readout' });
@@ -830,17 +1055,26 @@ function feedSection({ v, width }) {
       ixCell(c.upgrade[0].thirds[i].index), ixCell(c.upgrade[1].thirds[i].index), ixCell(c.case[0].thirds[i].index), ixCell(c.case[1].thirds[i].index));
   });
   const zCell = (x) => h('td', { class: ['num', !ok(x.z) ? 'faint' : Math.abs(x.z) >= 2 ? (x.z < 0 ? 'neg' : 'pos') : 'faint'], text: ok(x.z) ? `${x.z > 0 ? '+' : ''}${fmt(x.z, 1)}` : DASH });
+  const own = feedRangeKey !== 'same';
+  const fv = own ? feedView : { spec: v.spec, now: v.now, windows: v.feed.windows };
+  const winMin = own ? feedWin : windowMin;
+  const chart = fv && (!own || (fv.spec.key === feedRangeKey && fv.spec.window === feedWin * 60000)) ? feedChart({ ...fv, width })
+    : h('p', { class: 'faint', style: 'min-height:200px', text: feedError ? `Could not load the drop line: ${feedError}` : 'Loading…' });
   return h('section', null,
-    h('div', { class: 'sec-head' }, h('h2', { text: `Drop line colours per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }), windowToggle()),
-    feedChart({ v, width }),
-    h('h3', { class: 'muted small-text', style: 'margin:14px 0 4px;font-weight:600', text: 'Do cheap colours go with worse results?' }),
+    h('div', { class: 'sec-head' },
+      h('h2', { text: `Drop line colours per ${winLabel(winMin)} window, last ${own ? RANGES[feedRangeKey].label : v.spec.label}` }),
+      h('div', { class: 'row', style: 'gap:6px 12px' },
+        toggle([['same', 'Top', 'Use the range and window picked at the top'], ...FEED_RANGE_KEYS.map((k) => [k, k, `Last ${RANGES[k].label}`])], feedRangeKey, setFeedRange, 'Range'),
+        own ? toggle(feedWindowsFor(feedRangeKey).map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), feedWin, setFeedWin, 'Window') : windowToggle())),
+    chart,
+    h('h3', { class: 'muted small-text', style: 'margin:14px 0 4px;font-weight:600', text: `Do cheap colours go with worse results? Last ${v.spec.label}, ${winLabel(windowMin)} windows (the range at the top)` }),
     anyRows
       ? tableOf(['Windows by share of purple and below', 'Upgrades, same window', 'Upgrades, next window', 'Cases, same window', 'Cases, next window'], [
           ...rows,
           h('tr', null, h('td', { class: 'faint', text: 'Most against fewest, in standard errors' }), zCell(c.upgrade[0]), zCell(c.upgrade[1]), zCell(c.case[0]), zCell(c.case[1])),
         ])
       : h('p', { class: 'faint', text: `Not enough settled windows with ${FEED_MIN_SEEN} or more drops seen yet.` }),
-    h('p', { class: 'hint', text: `Each line is one colour: its share of the drops the monitor saw in each window, as the site draws them (gold: knives, gloves and the Howl; purple also holds every sticker). Click a colour in the legend to hide or show its line. Shares, not counts, so a busy hour does not look different just for being busy; the drop rate is the grey strip under it. The line shows only big wins. The monitor reads its newest 20 every 30 to 90 seconds; the site numbers its drops, so the rate is exact even when a read misses some. Windows with under ${FEED_MIN_SEEN} drops seen leave a gap in the lines. The table splits the settled windows of this range into thirds by their share of purple and below, with wins against normal (upgrades) and the hit index (cases) for each third. “Same window” is partly circular: the line is made of the wins, so a window where players win less shows fewer top colours. “Next window” is the real test: whether the mix you see now says anything about the minutes after it. A difference under 2 standard errors is likely chance; use a long range for enough windows.` }));
+    h('p', { class: 'hint', text: `The chart can have its own range, so short windows work over days too; “Top” follows the range at the top of the page. Each line is one colour: its share of the drops the monitor saw in each window, as the site draws them (gold: knives, gloves and the Howl; purple also holds every sticker). Click a colour in the legend to hide or show its line. Shares, not counts, so a busy hour does not look different just for being busy; the drop rate is the grey strip under it. The line shows only big wins. The monitor reads its newest 20 every 30 to 90 seconds; the site numbers its drops, so the rate is exact even when a read misses some. Windows with under ${FEED_MIN_SEEN} drops seen leave a gap in the lines. The table splits the settled windows of this range into thirds by their share of purple and below, with wins against normal (upgrades) and the hit index (cases) for each third. “Same window” is partly circular: the line is made of the wins, so a window where players win less shows fewer top colours. “Next window” is the real test: whether the mix you see now says anything about the minutes after it. A difference under 2 standard errors is likely chance; use a long range for enough windows.` }));
 }
 
 function renderLogin(message) {
@@ -891,7 +1125,7 @@ async function load() {
     const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
     const pc = predictCache.get(predictMin);
     const predictFresh = pc && now - pc.at < 10 * 60 * 1000;
-    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew, feed] = await Promise.all([
+    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew, feed, ownFeed] = await Promise.all([
       rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
       rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
@@ -901,7 +1135,9 @@ async function load() {
       predictFresh ? Promise.resolve(null) : rpc('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }),
       // The drop-line colours are an extra: the rest of the page works without them.
       rpc('monitor_feed_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window }).catch(() => []),
+      fetchFeed(now).catch((e) => { feedError = e.message || String(e); return null; }),
     ]);
+    if (ownFeed) { feedView = ownFeed; feedError = null; }
     if (statusRes.error) throw statusRes.error;
     if (weekNew) weekCache = { at: now, tz, report: weekNew };
     if (predictNew) predictCache.set(predictMin, { at: now, rows: predictNew });
