@@ -68,6 +68,52 @@ Sections:
 - upgrades by shown chance (against the shown odds and against normal), cases one by one, stake sizes;
 - site activity from the site's public counters.
 
+## What the data says about deposits (November 2026)
+
+The full analysis of the account's own history is in [docs/FINDINGS.md](../docs/FINDINGS.md). What the monitor and a
+second look at that history added, as of 2026-11-15:
+
+**The boost restarts with every completed deposit, top-ups included.** The account's own upgrades (normal mode,
+without mystery or super-drop upgrades), split by whether the player had played in the 20 minutes before the deposit:
+
+| Deposit | Time after it | Upgrades | Under 15%: wins vs shown | 35% and up: wins vs shown | Return per 1 |
+|---|---|---|---|---|---|
+| Top-up (played in the 20 min before) | 0–5 min | 10,430 | 1.16 (z +4.8) | 0.91 | 0.93 |
+| | 5–15 min | 3,626 | 1.09 | 0.78 | 0.82 |
+| | 15–60 min | 1,582 | 0.90 | 0.82 | 0.74 |
+| Fresh (no play in the 20 min before) | 0–5 min | 6,401 | 1.12 (z +2.9) | 0.83 | 0.97 |
+| | 5–15 min | 2,831 | 1.02 | 0.86 | 0.85 |
+| | 15–60 min | 844 | 0.80 | 0.68 | 0.75 |
+
+The clock is the deposit, not a break in play: a top-up made while playing brings the boost back as strongly as a
+deposit after a pause. It fades within about 15 minutes. **Return per 1 stays below 1 in every row, the first 5
+minutes included**: the boost slows the losses, it does not turn them into gains.
+
+**Other players show the same shape.** The monitor cannot see other players' deposits, so it starts a session after
+20 minutes without play (which misses top-ups made while playing, so the real effect is likely a little sharper).
+Over the 7 days to 2026-11-15, with the rows next to each player's discovery left out, wins against the shown
+chance were:
+
+| Time into session | Under 15% | 35% and up |
+|---|---|---|
+| First 5 minutes | 1.21 | 0.84 |
+| 5–15 minutes | 0.94 | 0.79 |
+| 15–60 minutes | 1.03 | 0.86 |
+| After an hour | 0.93 | 0.78 |
+
+High chances win less than shown in every phase; only low chances early in a session win more.
+
+**There is no "good time" for the site as a whole.** Whether a 30-minute or 1-hour window went better or worse than
+normal said nothing about the next one: the correlation between consecutive windows was +0.09 (30 minutes, 60
+pairs) and −0.07 (1 hour, 49 pairs), and windows swung by 1.10 and 1.13 standard errors, where pure chance gives
+1.00. That is only the first 1.5 days of data, enough to rule out a large effect, not a small one; the dashboard's
+"Does the last 30 minutes predict the next?" section keeps checking.
+
+What this adds up to: the only pattern found is tied to the player's own deposits, not to the time of day or to
+how the site is treating everyone right now, and even at its best it loses money. That is what a mechanism made to
+encourage the next deposit would look like. All of it is correlation in observed data, not knowledge of how the
+site decides outcomes, and the site can change it at any time (the dashboard's day-by-day chart shows that first).
+
 ## How it samples
 
 One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does the most urgent thing that is due:
