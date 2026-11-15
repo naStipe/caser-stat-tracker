@@ -87,6 +87,9 @@
   .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
   .legend i { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin-right: 6px; }
   .legend i.dot { width: 8px; height: 8px; border-radius: 50%; }
+  .legend .legend-item { border: 0; padding: 0; font: inherit; color: inherit; transition: opacity 120ms; }
+  .legend .legend-item:hover { color: var(--text); }
+  .legend .legend-item i { height: 3px; border-radius: 2px; }
   .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 12px; }
   .split h3 { font-size: 12.5px; font-weight: 600; color: var(--muted); margin: 0 0 4px; }
   .table-wrap { overflow-x: auto; }
@@ -755,31 +758,49 @@ function renderDashboard() {
   if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
 }
 
-/** The drop line's colour mix per window: stacked shares, with the drop rate under it. */
+/** Colours hidden in the drop-line chart (clicked off in its legend). */
+const feedHidden = new Set((store.get('pulse.feedHidden', '') || '').split(',').filter(Boolean));
+function toggleFeedTier(k) {
+  if (feedHidden.has(k)) feedHidden.delete(k); else feedHidden.add(k);
+  store.set('pulse.feedHidden', [...feedHidden].join(','));
+  if (view) renderDashboard();
+}
+
+/** The drop line's colour mix per window: one line per colour (its share of the drops seen), with the drop rate under it. */
 function feedChart({ v, width }) {
   const { spec, now } = v;
   const fw = v.feed.windows;
-  const f = frame({ width, t0: spec.from, t1: now, lo: 0, hi: 1, ticks: [0, 0.25, 0.5, 0.75, 1], tickFmt: (q) => `${Math.round(q * 100)}%`, span: spec.to - spec.from, strip: 30, H: 230, vgrid: false, label: `Colours of the drop line per ${windowMin}-minute window over the last ${spec.label}.` });
+  // Start the axis at the first window with drops, so a short history is not squeezed into the right edge.
+  const first = fw.find((w) => w.seen);
+  const t0 = first ? Math.max(spec.from, Math.min(first.start, now - 6 * spec.window)) : spec.from;
+  const tiers = FEED_TIERS.filter(([k]) => !feedHidden.has(k));
+  const full = (w) => w.seen >= FEED_MIN_SEEN;
+  const share = (w, k) => w.counts[k] / w.seen;
+  let top = 0.1;
+  for (const w of fw) if (full(w)) for (const [k] of tiers) top = Math.max(top, share(w, k));
+  const { lo, hi, ticks } = niceTicks(0, Math.min(1, top * 1.08), 4);
+  const f = frame({ width, t0, t1: now, lo, hi: Math.min(1, hi), ticks: ticks.filter((q) => q <= 1), tickFmt: (q) => `${Math.round(q * 100)}%`, span: now - t0, strip: 30, H: 250, vgrid: false, label: `Share of each colour on the drop line per ${windowMin}-minute window over the last ${spec.label}.` });
   const { svg, x, y } = f;
-  const bw = Math.max(1, f.iw / Math.max(1, fw.length) - 1);
+  const bw = Math.max(1, f.iw / Math.max(1, (now - t0) / spec.window) - 1);
   const maxRate = Math.max(1, ...fw.map((w) => w.perMin ?? 0));
-  const marks = [];
   for (const w of fw) {
-    if (w.perMin) {
-      const bh = Math.max(1, (w.perMin / maxRate) * (f.strip - 8));
-      svg.append(s('rect', { x: x(w.start), y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
-    }
-    if (!w.seen) continue;
-    // Best colours on top, down to grey at 0.
-    let top = 1;
-    for (const [k, color] of FEED_TIERS) {
-      const share = w.counts[k] / w.seen;
-      if (!share) continue;
-      svg.append(s('rect', { x: x(w.start), y: y(top), width: bw, height: Math.max(0, y(top - share) - y(top)), fill: color, 'fill-opacity': w.seen >= FEED_MIN_SEEN ? 0.9 : 0.35 }));
-      top -= share;
-    }
-    marks.push({ cx: x(w.start) + bw / 2, cy: y(w.low ?? 0), w });
+    if (!w.perMin || w.start + spec.window <= t0) continue;
+    const bh = Math.max(1, (w.perMin / maxRate) * (f.strip - 8));
+    svg.append(s('rect', { x: x(w.start), y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
   }
+  // One line per colour; windows with too few drops break the line instead of adding noise.
+  const dots = fw.filter((w) => full(w) && w.start + spec.window > t0).length <= 90;
+  const mid = (w) => x(w.start + spec.window / 2);
+  for (const [k, color] of tiers) {
+    let d = '';
+    for (const w of fw) {
+      if (!full(w)) { d += ' '; continue; }
+      d += `${d && !d.endsWith(' ') ? 'L' : 'M'}${mid(w).toFixed(1)},${y(share(w, k)).toFixed(1)}`;
+      if (dots) svg.append(s('circle', { cx: mid(w), cy: y(share(w, k)), r: 2, fill: color }));
+    }
+    svg.append(s('path', { d: d.trim(), fill: 'none', stroke: color, 'stroke-width': 1.75, 'stroke-linejoin': 'round', 'stroke-opacity': 0.9 }));
+  }
+  const marks = fw.filter((w) => w.seen).map((w) => ({ cx: mid(w), cy: y(full(w) && tiers.length ? Math.max(...tiers.map(([k]) => share(w, k))) : 0), w }));
   const readout = h('div', { class: 'readout' });
   const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a window for details.' : 'No drop-line counts in this range yet. The monitor stores them from version 1.6.0 on.' }));
   idle();
@@ -790,10 +811,10 @@ function feedChart({ v, width }) {
         h('span', { class: 'faint', text: w.span ? ` of ${fmtInt(w.span)} shown (${pct(Math.min(1, w.seen / w.span), 0)})` : '' }),
         h('span', { class: 'num', text: ok(w.perMin) ? ` · ${fmt(w.perMin, 1)} drops a minute` : '' }),
         h('span', { class: 'num', text: ` · purple and below ${pct(w.low, 0)}` })),
-      h('div', { class: 'faint num', text: FEED_TIERS.filter(([k]) => w.counts[k]).map(([k, , name]) => `${name.split(' (')[0]} ${w.counts[k]}`).join(' · ') }));
+      h('div', { class: 'faint num', text: FEED_TIERS.filter(([k]) => w.counts[k]).map(([k, , name]) => `${name.split(' (')[0]} ${w.counts[k]} (${pct(share(w, k), 0)})`).join(' · ') + (full(w) ? '' : `  · under ${FEED_MIN_SEEN} drops, not drawn`) }));
   }, idle);
   return h('div', null,
-    h('div', { class: 'legend' }, FEED_TIERS.map(([, color, name]) => h('span', null, h('i', { class: 'dot', style: `background:${color}` }), name)),
+    h('div', { class: 'legend' }, FEED_TIERS.map(([k, color, name]) => h('button', { type: 'button', class: 'legend-item', 'aria-pressed': String(!feedHidden.has(k)), title: feedHidden.has(k) ? 'Show this colour' : 'Hide this colour', style: feedHidden.has(k) ? 'opacity:0.4' : '', onclick: () => toggleFeedTier(k) }, h('i', { style: `background:${color}` }), name)),
       h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'drops per minute')),
     readout, h('div', { class: 'chart' }, f.svg));
 }
@@ -819,7 +840,7 @@ function feedSection({ v, width }) {
           h('tr', null, h('td', { class: 'faint', text: 'Most against fewest, in standard errors' }), zCell(c.upgrade[0]), zCell(c.upgrade[1]), zCell(c.case[0]), zCell(c.case[1])),
         ])
       : h('p', { class: 'faint', text: `Not enough settled windows with ${FEED_MIN_SEEN} or more drops seen yet.` }),
-    h('p', { class: 'hint', text: `Each bar is one window: the share of the drops the monitor saw in each colour, as the site draws them (gold: knives, gloves and the Howl; purple also holds every sticker). Shares, not counts, so a busy hour does not look different just for being busy; the drop rate is the grey strip under it. The line shows only big wins. The monitor reads its newest 20 every 30 to 90 seconds; the site numbers its drops, so the rate is exact even when a read misses some. Faded bars have under ${FEED_MIN_SEEN} drops seen. The table splits the settled windows of this range into thirds by their share of purple and below, with wins against normal (upgrades) and the hit index (cases) for each third. “Same window” is partly circular: the line is made of the wins, so a window where players win less shows fewer top colours. “Next window” is the real test: whether the mix you see now says anything about the minutes after it. A difference under 2 standard errors is likely chance; use a long range for enough windows.` }));
+    h('p', { class: 'hint', text: `Each line is one colour: its share of the drops the monitor saw in each window, as the site draws them (gold: knives, gloves and the Howl; purple also holds every sticker). Click a colour in the legend to hide or show its line. Shares, not counts, so a busy hour does not look different just for being busy; the drop rate is the grey strip under it. The line shows only big wins. The monitor reads its newest 20 every 30 to 90 seconds; the site numbers its drops, so the rate is exact even when a read misses some. Windows with under ${FEED_MIN_SEEN} drops seen leave a gap in the lines. The table splits the settled windows of this range into thirds by their share of purple and below, with wins against normal (upgrades) and the hit index (cases) for each third. “Same window” is partly circular: the line is made of the wins, so a window where players win less shows fewer top colours. “Next window” is the real test: whether the mix you see now says anything about the minutes after it. A difference under 2 standard errors is likely chance; use a long range for enough windows.` }));
 }
 
 function renderLogin(message) {
