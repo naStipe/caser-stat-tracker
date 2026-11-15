@@ -26,6 +26,8 @@
   h2 { font-size: 14px; font-weight: 600; margin: 0; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   .sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 10px; }
+  .range-bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; background: var(--bg); padding: 10px 0; margin: 8px 0 8px; border-bottom: 1px solid var(--line); }
+  .range-bar .label { margin-left: 0; }
   .muted { color: var(--muted); }
   .faint { color: var(--faint); }
   .hint { color: var(--faint); font-size: 12.5px; margin: 10px 0 0; }
@@ -103,7 +105,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, FEED_TIERS, FEED_MIN_SEEN } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -203,7 +205,7 @@ function niceTicks(min, max, count = 4) {
 }
 
 /** Time axis, value grid and an optional strip under the plot (for sample sizes). */
-function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, strip = 0 }) {
+function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, strip = 0, vgrid = true }) {
   const W = Math.max(280, Math.floor(width));
   const padL = 44, padR = 10, padT = 10, padB = 22 + strip;
   const iw = W - padL - padR, ih = H - padT - padB;
@@ -221,7 +223,7 @@ function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, st
   const offset = new Date().getTimezoneOffset() * 60000;
   for (let t = Math.ceil((t0 - offset) / step) * step + offset; t <= t1; t += step) {
     const xx = Math.round(x(t)) + 0.5;
-    svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih + strip, stroke: COLORS.grid }));
+    if (vgrid) svg.append(s('line', { x1: xx, x2: xx, y1: padT, y2: padT + ih + strip, stroke: COLORS.grid }));
     if (xx > padL + 28 && xx < W - padR - 28) svg.append(s('text', { x: xx, y: H - 6, 'text-anchor': 'middle', text: timeLabel(t, span) }));
   }
   return { svg, x, y, W, H, padL, padR, padT, iw, ih, stripTop: padT + ih + 4, strip };
@@ -247,7 +249,7 @@ function hover(f, marks, onPick, onIdle) {
   hit.addEventListener('pointerleave', () => { ring.setAttribute('visibility', 'hidden'); onIdle(); });
 }
 
-/** One value per window: the index or return per 1, with ranges, the smoothed hour, and sample sizes. */
+/** One value per window: the index or return per 1, the smoothed hour, and sample sizes (the range shows on hover). */
 function windowChart({ v, kind, width }) {
   const k = v.kinds[kind];
   const m = metric[kind];
@@ -268,7 +270,7 @@ function windowChart({ v, kind, width }) {
   }
   const clipped = vals.filter(ok).map((q) => Math.max(0, Math.min(cap, q)));
   const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...clipped) - 0.05), Math.max(...clipped) + 0.05, 4);
-  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, strip: 30, H: 250, label: `${NAMES[kind][0]}: ${metricName(kind, m)} per ${windowMin}-minute window over the last ${spec.label}.` });
+  const f = frame({ width, t0: spec.from, t1: now, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span, strip: 30, H: 250, vgrid: false, label: `${NAMES[kind][0]}: ${metricName(kind, m)} per ${windowMin}-minute window over the last ${spec.label}.` });
   const { svg, x, y } = f;
   // Windows whose rows are still arriving: a flat band behind them.
   if (settled.at < now) {
@@ -299,7 +301,6 @@ function windowChart({ v, kind, width }) {
     const cx = x(w.start + spec.window / 2);
     const z = m === 'index' && !w.provisional ? w.z : null;
     const color = w.provisional ? COLORS.diag : z != null && z >= 2 ? COLORS.pos : z != null && z <= -2 ? COLORS.neg : COLORS.line;
-    if (p.ci && !dense) svg.append(s('line', { x1: cx, x2: cx, y1: y(p.ci[0]), y2: y(p.ci[1]), stroke: COLORS.zero }));
     const solid = p.n >= 20 && !w.provisional;
     svg.append(s('circle', { cx, cy: y(p.val), r: dense ? 2 : 3, fill: solid ? color : COLORS.bg, stroke: color, 'stroke-width': 1.25 }));
     marks.push({ cx, cy: y(p.val), w, p });
@@ -650,13 +651,20 @@ function problemsSection() {
 }
 
 function header() {
-  const wins = windowsFor(rangeKey);
   return h('header', null, h('h1', { text: 'Pulse monitor' }),
     h('div', { class: 'row' },
-      toggle(Object.entries(RANGES).map(([k, r]) => [k, k, r.label]), rangeKey, setRange, 'Range'),
-      toggle(wins.map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window'),
       h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
       h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
+}
+/** Range picker, placed right above the sections it changes. */
+function rangeBar() {
+  return h('div', { class: 'range-bar' },
+    toggle(Object.entries(RANGES).map(([k, r]) => [k, k, r.label]), rangeKey, setRange, 'Range'),
+    h('span', { class: 'faint small-text', text: 'Changes everything below.' }));
+}
+/** Window-size picker for the per-window charts. */
+function windowToggle() {
+  return toggle(windowsFor(rangeKey).map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window');
 }
 
 function renderDashboard() {
@@ -683,6 +691,7 @@ function renderDashboard() {
 
   const t = v.totals;
   const up = v.kinds.upgrade;
+  out.push(rangeBar());
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Last ${v.spec.label}` })),
     h('div', { class: 'kpis' },
       kpi('Upgrades vs normal', fmt2(up.avg.index), up.avg.ci ? `range ${fmt2(up.avg.ci[0])}–${fmt2(up.avg.ci[1])}` : null, clearOf1(up.avg.ci)),
@@ -703,11 +712,14 @@ function renderDashboard() {
     out.push(h('section', null,
       h('div', { class: 'sec-head' },
         h('h2', { text: `${NAMES[kind][0]} per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }),
-        toggle(METRICS[kind], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); })),
+        h('div', { class: 'row' }, windowToggle(),
+          toggle(METRICS[kind], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); }))),
       windowChart({ v, kind, width }),
       h('div', { class: 'split' }, windowList('Best windows (above the range average)', k.best, kind), windowList('Worst windows', k.worst, kind)),
       h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin or still arriving (the shaded part, whose rows are not all read yet). Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank settled windows by how far they sit from the average, counting their sample size.' })));
   }
+
+  out.push(feedSection({ v, width }));
 
   out.push(h('section', null,
     h('div', { class: 'sec-head' }, h('h2', { text: 'By weekday and hour' }),
@@ -741,6 +753,73 @@ function renderDashboard() {
     h('p', { class: 'muted', text: `Rows from 2 hours before to 30 minutes after a player was found are left out of every number here: players are found right after a big win, so they had a streak just before and usually a dip just after. In this range that leaves out ${fmtInt(v.excluded.upgrade)} upgrades and ${fmtInt(v.excluded.case)} case opens. Rows arrive minutes to hours after they happen, so the newest windows are marked as still arriving${v.settled.known ? `: half arrive within ${Math.round(v.settled.p50 / 60000)} minutes, 80% within ${v.settled.capped ? 'over 120' : Math.round(v.settled.lagMs / 60000)}` : ''}.` })));
   root.replaceChildren(...out);
   if (firstPaint) { root.classList.add('fade'); firstPaint = false; }
+}
+
+/** The drop line's colour mix per window: stacked shares, with the drop rate under it. */
+function feedChart({ v, width }) {
+  const { spec, now } = v;
+  const fw = v.feed.windows;
+  const f = frame({ width, t0: spec.from, t1: now, lo: 0, hi: 1, ticks: [0, 0.25, 0.5, 0.75, 1], tickFmt: (q) => `${Math.round(q * 100)}%`, span: spec.to - spec.from, strip: 30, H: 230, vgrid: false, label: `Colours of the drop line per ${windowMin}-minute window over the last ${spec.label}.` });
+  const { svg, x, y } = f;
+  const bw = Math.max(1, f.iw / Math.max(1, fw.length) - 1);
+  const maxRate = Math.max(1, ...fw.map((w) => w.perMin ?? 0));
+  const marks = [];
+  for (const w of fw) {
+    if (w.perMin) {
+      const bh = Math.max(1, (w.perMin / maxRate) * (f.strip - 8));
+      svg.append(s('rect', { x: x(w.start), y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
+    }
+    if (!w.seen) continue;
+    // Best colours on top, down to grey at 0.
+    let top = 1;
+    for (const [k, color] of FEED_TIERS) {
+      const share = w.counts[k] / w.seen;
+      if (!share) continue;
+      svg.append(s('rect', { x: x(w.start), y: y(top), width: bw, height: Math.max(0, y(top - share) - y(top)), fill: color, 'fill-opacity': w.seen >= FEED_MIN_SEEN ? 0.9 : 0.35 }));
+      top -= share;
+    }
+    marks.push({ cx: x(w.start) + bw / 2, cy: y(w.low ?? 0), w });
+  }
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: marks.length ? 'Hover or tap a window for details.' : 'No drop-line counts in this range yet. The monitor stores them from version 1.6.0 on.' }));
+  idle();
+  hover(f, marks, ({ w }) => {
+    readout.replaceChildren(
+      h('div', null, `${spanLabel(w.start, w.start + spec.window)}  `,
+        h('span', { class: 'num', text: `${fmtInt(w.seen)} drops seen` }),
+        h('span', { class: 'faint', text: w.span ? ` of ${fmtInt(w.span)} shown (${pct(Math.min(1, w.seen / w.span), 0)})` : '' }),
+        h('span', { class: 'num', text: ok(w.perMin) ? ` · ${fmt(w.perMin, 1)} drops a minute` : '' }),
+        h('span', { class: 'num', text: ` · purple and below ${pct(w.low, 0)}` })),
+      h('div', { class: 'faint num', text: FEED_TIERS.filter(([k]) => w.counts[k]).map(([k, , name]) => `${name.split(' (')[0]} ${w.counts[k]}`).join(' · ') }));
+  }, idle);
+  return h('div', null,
+    h('div', { class: 'legend' }, FEED_TIERS.map(([, color, name]) => h('span', null, h('i', { class: 'dot', style: `background:${color}` }), name)),
+      h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'drops per minute')),
+    readout, h('div', { class: 'chart' }, f.svg));
+}
+
+function feedSection({ v, width }) {
+  const c = v.feed.check;
+  const names = ['Fewest cheap colours', 'Middle', 'Most cheap colours'];
+  const anyRows = c.upgrade[0].windows + c.case[0].windows > 0;
+  const rows = [0, 1, 2].map((i) => {
+    const t = c.upgrade[0].windows ? c.upgrade[0].thirds[i] : c.case[0].thirds[i];
+    return h('tr', null,
+      h('td', null, names[i], h('span', { class: 'ci', text: t.windows ? `${pct(t.from, 0)}–${pct(t.to, 0)} purple and below, ${t.windows} windows` : '' })),
+      ixCell(c.upgrade[0].thirds[i].index), ixCell(c.upgrade[1].thirds[i].index), ixCell(c.case[0].thirds[i].index), ixCell(c.case[1].thirds[i].index));
+  });
+  const zCell = (x) => h('td', { class: ['num', !ok(x.z) ? 'faint' : Math.abs(x.z) >= 2 ? (x.z < 0 ? 'neg' : 'pos') : 'faint'], text: ok(x.z) ? `${x.z > 0 ? '+' : ''}${fmt(x.z, 1)}` : DASH });
+  return h('section', null,
+    h('div', { class: 'sec-head' }, h('h2', { text: `Drop line colours per ${windowMin >= 60 ? `${windowMin / 60}-hour` : `${windowMin}-minute`} window` }), windowToggle()),
+    feedChart({ v, width }),
+    h('h3', { class: 'muted small-text', style: 'margin:14px 0 4px;font-weight:600', text: 'Do cheap colours go with worse results?' }),
+    anyRows
+      ? tableOf(['Windows by share of purple and below', 'Upgrades, same window', 'Upgrades, next window', 'Cases, same window', 'Cases, next window'], [
+          ...rows,
+          h('tr', null, h('td', { class: 'faint', text: 'Most against fewest, in standard errors' }), zCell(c.upgrade[0]), zCell(c.upgrade[1]), zCell(c.case[0]), zCell(c.case[1])),
+        ])
+      : h('p', { class: 'faint', text: `Not enough settled windows with ${FEED_MIN_SEEN} or more drops seen yet.` }),
+    h('p', { class: 'hint', text: `Each bar is one window: the share of the drops the monitor saw in each colour, as the site draws them (gold: knives, gloves and the Howl; purple also holds every sticker). Shares, not counts, so a busy hour does not look different just for being busy; the drop rate is the grey strip under it. The line shows only big wins. The monitor reads its newest 20 every 30 to 90 seconds; the site numbers its drops, so the rate is exact even when a read misses some. Faded bars have under ${FEED_MIN_SEEN} drops seen. The table splits the settled windows of this range into thirds by their share of purple and below, with wins against normal (upgrades) and the hit index (cases) for each third. “Same window” is partly circular: the line is made of the wins, so a window where players win less shows fewer top colours. “Next window” is the real test: whether the mix you see now says anything about the minutes after it. A difference under 2 standard errors is likely chance; use a long range for enough windows.` }));
 }
 
 function renderLogin(message) {
@@ -791,7 +870,7 @@ async function load() {
     const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
     const pc = predictCache.get(predictMin);
     const predictFresh = pc && now - pc.at < 10 * 60 * 1000;
-    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew] = await Promise.all([
+    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew, feed] = await Promise.all([
       rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
       rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
@@ -799,12 +878,14 @@ async function load() {
       sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
       weekFresh ? Promise.resolve(null) : rpc('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }),
       predictFresh ? Promise.resolve(null) : rpc('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }),
+      // The drop-line colours are an extra: the rest of the page works without them.
+      rpc('monitor_feed_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window }).catch(() => []),
     ]);
     if (statusRes.error) throw statusRes.error;
     if (weekNew) weekCache = { at: now, tz, report: weekNew };
     if (predictNew) predictCache.set(predictMin, { at: now, rows: predictNew });
     const predict = predictCache.get(predictMin) ? { minutes: predictMin, rows: predictCache.get(predictMin).rows } : null;
-    view = buildReport({ report, cmp, week: weekCache?.report ?? null, predict, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
+    view = buildReport({ report, cmp, week: weekCache?.report ?? null, predict, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, feed, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
     loadError = null;

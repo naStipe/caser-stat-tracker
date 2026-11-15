@@ -10,6 +10,8 @@
 //                                             a read adds `feedBusy` or more players to the look queue (new,
 //                                             or known and not looked at in the last 2 h), 1.5 times longer
 //                                             after a read that adds none, up to `feedMaxMs`.
+//                                             Each read also counts the colours of the drops it has not
+//                                             seen before (saveFeed), for the drop-line chart.
 //   GET /api/statistics        every 60 s     site-wide counters of case opens and upgrades
 // Otherwise the turn goes to the next kind of work in `turns`, a fixed rotation, so each kind gets its
 // share of the requests even when another always has work (a kind with nothing to do passes its turn on):
@@ -35,7 +37,7 @@
 // Page size: the site's own pages ask for 50 rows. The collector asks for `tryPageSize` (100) once and
 // keeps it if the site sends more than 50 rows, or falls back to 50.
 
-import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample } from './parse.js';
+import { CasePrices, upgradeRows, caseRows, feedDrops, feedItems, feedSample, volumeSample } from './parse.js';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -128,7 +130,7 @@ function importKnown(k, t, opt) {
  * @param {{known?: any[], pageSize?: number, pageProbe?: string}} [o.initial]  from exportState() of an earlier run
  * @param {Partial<typeof DEFAULTS>} [o.options]
  */
-export function createCollector({ getJson, hashUser, saveRows, saveVolume, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
+export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveFeed = async () => {}, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
   const prices = new CasePrices();
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
@@ -162,6 +164,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   let wake = null;
   let lastFeed = -Infinity;
   let feedGap = opt.feedEveryMs;
+  let lastFeedId = null; // newest drop number seen, for the colour counts of the drop line
+  let lastFeedAt = null;
   let lastStats = -Infinity;
   let lastCases = -Infinity;
   let pausedUntil = 0;
@@ -250,7 +254,14 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, now =
   async function readFeed() {
     lastFeed = now();
     let added = 0;
-    for (const [id, skip] of feedDrops(await get('/api/live-drops'))) {
+    const body = await get('/api/live-drops');
+    const items = feedItems(body);
+    if (items.length) {
+      await saveFeed(feedSample(items, { ts: lastFeed, lastId: lastFeedId, lastAt: lastFeedAt }));
+      lastFeedId = items[0].id; // also when the numbers went backwards: counting starts over from here
+      lastFeedAt = lastFeed;
+    }
+    for (const [id, skip] of feedDrops(body)) {
       remember(id);
       if (players.has(id) || backfilled.has(id)) continue;
       const waiting = queue.find((q) => q.id === id);

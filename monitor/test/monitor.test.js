@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
+import { CasePrices, upgradeRows, caseRows, feedDrops, feedTier, feedItems, feedSample, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
 import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, STEP, DEFAULT_LAG } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
@@ -112,6 +112,58 @@ test('stats: volume rates and summary windows', () => {
   assert.equal(sum.hours.length, 24);
   assert.equal(sum.hours[0].start, T0);
   assert.equal(sum.compare.upgrade.recent.ratio, 1.2);
+});
+
+test('parse: drop-line colours as the site draws them', () => {
+  assert.equal(feedTier({ marketName: '★ Navaja Knife | Scorched (Minimal Wear)', rarity: '10' }), 'gold');
+  assert.equal(feedTier({ marketName: 'M4A4 | Howl (Field-Tested)', skin: 'Howl', rarity: '4' }), 'gold');
+  assert.equal(feedTier({ marketName: 'Sticker | ZywOo (Gold)', rarity: '4' }), 'purple');
+  assert.equal(feedTier({ marketName: 'Some patch', type: '13', rarity: '10' }), 'purple');
+  assert.equal(feedTier({ marketName: 'AK-47 | Jaguar', rarity: '10' }), 'red');
+  assert.equal(feedTier({ marketName: 'X', rarity: '12' }), 'pink');
+  assert.equal(feedTier({ marketName: 'X', rarity: '15' }), 'blue');
+  assert.equal(feedTier({ marketName: 'X', rarity: '14' }), 'light');
+  assert.equal(feedTier({ marketName: 'X', rarity: 'Mythical' }), 'purple');
+  assert.equal(feedTier({ marketName: 'X' }), 'grey');
+  const drop = (id, rarity, probability = '0.0000', price = '10') => ({ id: String(id), probability, user: { id: '1' }, item: { marketName: 'X', price, rarity } });
+  const body = { liveDrops: [drop(105, '10', '0.5'), drop(104, '15'), drop(103, '16')], hotDrops: [drop(105, '10', '0.5'), drop('bad', '10')] };
+  const items = feedItems(body);
+  assert.deepEqual(items.map((d) => [d.id, d.tier, d.up]), [[105, 'red', true], [104, 'blue', false], [103, 'purple', false]]);
+  const first = feedSample(items, { ts: T0 });
+  assert.equal(first.seen, 3);
+  assert.equal(first.span, null, 'the first read has nothing to measure from');
+  // Since drop 100: 5 drops happened, the read still shows 3 of them, 2 were missed.
+  const next = feedSample(items, { ts: T0 + 30000, lastId: 100, lastAt: T0 });
+  assert.deepEqual([next.seen, next.span, next.elapsed, next.red, next.blue, next.purple, next.up, next.value], [3, 5, 30000, 1, 1, 1, 1, 30]);
+  const none = feedSample(items, { ts: T0 + 60000, lastId: 105, lastAt: T0 + 30000 });
+  assert.deepEqual([none.seen, none.span], [0, 0]);
+});
+
+test('collector: each feed read counts only drops it has not seen', async () => {
+  const site = fakeSite();
+  const drop = (id, rarity) => ({ id: String(id), probability: '0', user: { id: '42' }, item: { marketName: 'W', price: '5', rarity } });
+  site.feed = { liveDrops: [drop(11, '10'), drop(10, '2')] };
+  const feed = [];
+  let reads = 0;
+  let t = T0;
+  const c = createCollector({
+    getJson: async (p) => {
+      if (p.startsWith('/api/live-drops') && ++reads === 2) site.feed = { liveDrops: [drop(14, '3'), drop(13, '10'), drop(11, '10')] };
+      if (reads >= 2 && p.startsWith('/api/live-drops')) c.stop();
+      return site.getJson(p);
+    },
+    hashUser: async (id) => `h${id}`,
+    saveRows: async () => {},
+    saveVolume: async () => {},
+    saveFeed: async (f) => feed.push(f),
+    now: () => t,
+    sleep: async (ms) => { t += ms; },
+    options: { gapMs: 1000 },
+  });
+  await c.start();
+  assert.equal(feed.length, 2);
+  assert.deepEqual([feed[0].seen, feed[0].span, feed[0].red, feed[0].blue], [2, null, 1, 1]);
+  assert.deepEqual([feed[1].seen, feed[1].span, feed[1].red, feed[1].purple], [2, 3, 1, 1]);
 });
 
 // ---- collector ----
@@ -360,7 +412,7 @@ test('monitor: sends rows, volume and its status to Supabase, keeps tokens and s
     const env = { ...ENV, DATA_DIR: dir };
     const first = await startMonitor(w, env, clock);
     assert.equal(first.config.gapMs, 8000);
-    assert.equal(first.config.retentionDays, 30);
+    assert.equal(first.config.retentionDays, 90);
     assert.equal((await first.run()).error, null);
     assert.deepEqual([...w.db.rows.keys()].sort(), ['case:9', 'upgrade:7']);
     const row = w.db.rows.get('upgrade:7');
@@ -370,7 +422,8 @@ test('monitor: sends rows, volume and its status to Supabase, keeps tokens and s
     assert.equal(w.db.status.id, 1);
     assert.equal(w.db.status.status.running, false, 'the final report says it stopped');
     assert.equal(w.db.status.status.version, 'test');
-    assert.ok(w.db.deletes.some((d) => d.startsWith('monitor_rows?ts=lt.')), 'old rows are pruned');
+    assert.ok(w.db.deletes.some((d) => d.startsWith('monitor_volume?ts=lt.')), 'old samples are pruned');
+    assert.ok(!w.db.deletes.some((d) => d.startsWith('monitor_rows')), 'raw rows are left to the database');
     const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
     assert.equal(state.tokens.refresh, `r${w.issued}`);
     assert.equal(state.pendingRows.length, 0);
@@ -476,7 +529,7 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(spec.to, Math.floor(now / W) * W + W);
   assert.equal(spec.coarse.bucket, HOUR);
   assert.equal(rangeSpec('nope', now).key, '24h');
-  assert.deepEqual(windowsFor('30d'), [60, 120, 360, 1440]);
+  assert.deepEqual(windowsFor('30d'), [360, 1440], 'over 8 days only whole 6 hours');
   assert.equal(pickWindow('30d', 15), 360, 'the range default');
   assert.deepEqual(windowsFor('30m'), [1, 2, 5, 10]);
   assert.equal(pickWindow('30m', 15), 1);
@@ -1083,4 +1136,21 @@ test('collector: a state saved before 1.4 reads recent players history again', a
   assert.ok(hist.length && hist.every((p) => p.includes('/recent?')), 'only the player who played in the last 7 days');
   assert.match(hist[0], /offset=50\b/);
   assert.equal(c.exportState().known.find((k) => k.id === 'old').hist.upgrade, null);
+});
+
+test('view: drop-line colours per window, and the thirds by cheap-colour share', async () => {
+  const { feedReport } = await import('../dashboard/view.js');
+  const spec = { from: T0, to: T0 + 6 * 600000, window: 600000 };
+  const rows = [0, 1, 2, 3, 4, 5].map((i) => ({ bucket: T0 + i * 600000, seen: 20, span: '30', elapsed: 600000, red: 20 - i * 3, purple: i * 3, up: 5, value: 100 }));
+  const res = [0, 1, 2, 3, 4, 5].map((i) => ({ start: T0 + i * 600000, index: { n: 100, obs: 50 - i * 3, exp: 50, se: 0.1, index: (50 - i * 3) / 50 } }));
+  const f = feedReport(rows, spec, { upgrade: { windows: res }, case: { windows: [] } }, T0 + 6 * 600000, T0 + 6 * 600000);
+  assert.equal(f.windows.length, 6);
+  assert.equal(f.windows[0].perMin, 3);
+  assert.equal(f.windows[5].low, 15 / 20);
+  const same = f.check.upgrade[0];
+  assert.equal(same.windows, 6);
+  assert.ok(same.thirds[0].index.index > same.thirds[2].index.index, 'more cheap colours, fewer wins here');
+  assert.ok(same.z < 0);
+  assert.equal(f.check.upgrade[1].windows, 5, 'the next window exists for all but the last');
+  assert.equal(f.check.case[0].windows, 0);
 });

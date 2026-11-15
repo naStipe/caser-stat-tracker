@@ -192,6 +192,67 @@ export function feedDrops(body) {
   return out;
 }
 
+/**
+ * Colour groups of the drop line, best first, as the site draws the bar under each item:
+ * gold (knives, gloves, Howl), red, pink, purple (and every sticker), blue, light blue, grey.
+ */
+export const FEED_TIERS = ['gold', 'red', 'pink', 'purple', 'blue', 'light', 'grey'];
+// The site's rarity codes and names -> colour group (its own table, read from its page code on 2026-11-15).
+const RARITY_CODE = { 1: 'grey', 2: 'blue', 3: 'purple', 4: 'red', 5: 'pink', 6: 'pink', 7: 'red', 8: 'blue', 9: 'purple', 10: 'red', 11: 'gold', 12: 'pink', 13: 'grey', 14: 'light', 15: 'blue', 16: 'purple' };
+const RARITY_NAME = { common: 'grey', uncommon: 'light', rare: 'blue', mythical: 'purple', legendary: 'pink', ancient: 'red', immortal: 'gold' };
+
+/** The colour group the site shows for a feed item. */
+export function feedTier(rawItem) {
+  const o = obj(rawItem) ?? {};
+  const name = String(o.marketName ?? o.name ?? '').trim();
+  const skin = String(o.skin ?? '').trim().toLowerCase();
+  if (name.includes('★') || name.includes('M4A4 | Howl') || (name.includes('M4A4') && skin === 'howl')) return 'gold';
+  if (Number(o.type) === 13 || name.startsWith('Sticker')) return 'purple';
+  const r = o.rarity;
+  if (r == null) return 'grey';
+  const t = String(r).trim();
+  return (/^\d+$/.test(t) ? RARITY_CODE[Number(t)] : RARITY_NAME[t.toLowerCase()]) ?? 'grey';
+}
+
+/**
+ * The drops in a /api/live-drops answer: [{id, tier, up, price}], newest first, each once.
+ * id is the drop's number; the site numbers drops one after another, so gaps between reads count the
+ * drops that were missed. up: the drop came from an upgrade (it has a chance), not a case.
+ */
+export function feedItems(body) {
+  const o = obj(body) ?? {};
+  const seen = new Set();
+  const out = [];
+  for (const d of [...arr(o.liveDrops), ...arr(o.hotDrops), ...arr(o.items)]) {
+    const id = Number(obj(d)?.id);
+    if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, tier: feedTier(d.item), up: num(d.probability) > 0, price: num(obj(d.item)?.price) });
+  }
+  return out.sort((a, b) => b.id - a.id);
+}
+
+/**
+ * One feed read -> what it adds to the colour counts: {ts, seen, span, elapsed, gold, red, ..., up, value}.
+ * Only drops newer than `lastId` count. span: drops the site showed since the last read (from the numbers,
+ * so it is exact even when the read missed some); elapsed: ms since that read. Both are null for the first
+ * read, or when the numbers went backwards.
+ */
+export function feedSample(items, { ts, lastId = null, lastAt = null }) {
+  const fresh = lastId == null ? items : items.filter((d) => d.id > lastId);
+  const top = items.length ? items[0].id : null;
+  const known = lastId != null && lastAt != null && top != null && top >= lastId;
+  const out = { ts, seen: fresh.length, span: known ? top - lastId : null, elapsed: known ? Math.max(0, ts - lastAt) : null, up: 0, value: 0 };
+  for (const t of FEED_TIERS) out[t] = 0;
+  for (const d of fresh) {
+    out[d.tier]++;
+    if (d.up) out.up++;
+    out.value += d.price;
+  }
+  out.value = Math.round(out.value * 100) / 100;
+  return out;
+}
+
 /** /api/statistics answer -> {ts, cases, upgrades, online}, or null. */
 export function volumeSample(body, ts) {
   const o = obj(body);

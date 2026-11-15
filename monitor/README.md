@@ -128,6 +128,9 @@ One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does 
    last 2 hours) sets 30 s; a read that adds none makes the next wait 1.5 times longer, up to 90 s
    (`FEED_MAX_SECONDS`). The requests saved go to revisits and history. The cost: a player who reaches the feed
    only once, during a long wait, can be missed, and a known player's return is seen up to a minute later.
+   Each feed read also counts the colours (rarity groups, as the site draws them) of the drops it had not seen,
+   into `monitor_feed`. The site numbers its drops one after another, so each read also knows how many drops
+   happened since the one before, including those it was too late to see.
 2. Every other turn goes to the next kind of work in a fixed rotation, so each gets its share of the requests even
    when another always has work (a kind with nothing to do passes its turn on). Per 8 turns:
    - 2 × **first look**: a newly found player's latest page of upgrades and case drops
@@ -219,15 +222,18 @@ watchdog, a `pg_cron` job that runs every 5 minutes.
 
 Tables and functions: `supabase/migrations/*_monitor*.sql` in the parent folder (already applied to the project).
 
-- `monitor_rows`, `monitor_volume`, `monitor_status`, `monitor_events`: written only by the monitor, with the
+- `monitor_rows`, `monitor_volume`, `monitor_feed`, `monitor_status`, `monitor_events`: written only by the monitor, with the
   project's **secret key** (it bypasses row level security, so it stays on the server, in `.env`).
 - `monitor_viewers`: Supabase Auth users allowed to read. Everyone else, signed in or not, reads nothing.
-- `monitor_report`, `monitor_volume_agg`: what the dashboard reads, for viewers only.
+- `monitor_report`, `monitor_volume_agg`, `monitor_feed_agg`: what the dashboard reads, for viewers only.
 - `monitor_private`, `monitor_watchdog`, `monitor_send_alert`: the alert URL and the watchdog; no one else can
   read or call them.
 - `monitor_derive`, `monitor_cal`, `monitor_derive_state`: the every-minute job that fills each row's session phase
   and discovery flag, and the 7-day normal rates it keeps; no one else can read or call them.
-- The monitor deletes rows and events older than `RETENTION_DAYS` (default 30) once an hour.
+- The database keeps raw rows for 9 days (`monitor_prune()`, hourly). Every row also goes into running totals as it
+  arrives (`monitor_hourly` per half hour and player, `monitor_6h` and `monitor_6h_u` per 6 hours), which are kept,
+  and which the reports read for windows of whole half hours. The monitor deletes site counters, drop-line counts
+  and events older than `RETENTION_DAYS` (default 90) once an hour.
 
 ## Run the monitor
 
@@ -270,7 +276,7 @@ running monitor keeps working until it is updated.
 | `SUPABASE_SECRET_KEY` | | the project's secret key |
 | `ALERT_URL` | | ntfy, Discord or Telegram webhook for alerts |
 | `SUPABASE_URL` | the project in `dashboard/config.js` | |
-| `RETENTION_DAYS` | 30 | rows and events older than this are deleted |
+| `RETENTION_DAYS` | 90 | site counters, drop-line counts and events older than this are deleted (raw rows: 9 days, in the database) |
 | `HISTORY_DAYS` | 7 | how far back a found player's history is read |
 | `HISTORY_PAGES` | 10 | older pages read per list per player (0: only the latest page) |
 | `REVISIT_HOURS` | 6 | how often known players who last played 1 to 3 days ago are checked again |

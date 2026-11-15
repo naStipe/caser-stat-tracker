@@ -50,7 +50,10 @@ const MIN_LAG_ROWS = 200;
 /** Window sizes that give a range between MIN_WINDOWS and MAX_WINDOWS windows. */
 export function windowsFor(key) {
   const span = (RANGES[key] ?? RANGES['24h']).span;
-  return WINDOWS.filter((m) => span / (m * MIN) <= MAX_WINDOWS && span / (m * MIN) >= MIN_WINDOWS);
+  // Over a day, only whole half hours, and over 8 days whole 6 hours: the database answers those from its running
+  // totals (fast at any range); finer windows need the raw rows, which only stay fast over a day or so.
+  const step = span > 8 * DAY ? 360 : span > DAY ? 30 : 1;
+  return WINDOWS.filter((m) => m % step === 0 && span / (m * MIN) <= MAX_WINDOWS && span / (m * MIN) >= MIN_WINDOWS);
 }
 
 /** The window to use: the one asked for if allowed, else the range's default. */
@@ -99,7 +102,8 @@ const numOrNull = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ?
 /** Numbers of one report row (the database sends some as strings, and nulls for empty sums). */
 export function cleanRow(r) {
   const out = {};
-  for (const [k, v] of Object.entries(r ?? {})) out[k] = typeof v === 'string' && k !== 'kind' && k !== 'slug' && k !== 'band' ? n0(v) : v ?? 0;
+  // players stays null when the report does not know it (ranges over 8 days, per band, case and stake size).
+  for (const [k, v] of Object.entries(r ?? {})) out[k] = typeof v === 'string' && k !== 'kind' && k !== 'slug' && k !== 'band' ? n0(v) : k === 'players' && v == null ? null : v ?? 0;
   return out;
 }
 
@@ -281,7 +285,7 @@ export function dailyPattern(week) {
  * @param {ReturnType<typeof rangeSpec>} o.spec
  * @param {number} o.now
  */
-export function buildReport({ report, cmp, week = null, predict = null, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
+export function buildReport({ report, cmp, week = null, predict = null, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], feed = [], spec, now }) {
   const series = (report?.series ?? []).map(cleanRow);
   const settled = settledAt(report?.lag ?? cmp?.lag, now);
   const out = { now, spec, settled, kinds: {}, compare: {}, compareMoney: {}, glance: {}, heat: {}, hours: {}, totals: {}, excluded: {} };
@@ -450,6 +454,7 @@ export function buildReport({ report, cmp, week = null, predict = null, heatRepo
   }
   out.week = week;
   out.daily = dailyPattern(week);
+  out.feed = feedReport(feed, spec, out.kinds, settled.at, now);
   return out;
 }
 
@@ -465,4 +470,74 @@ export function monitorHealth(row, now) {
   if (s.cloudError) return { level: 'warn', text: `Running, but writing to Supabase failed: ${s.cloudError}`, at };
   if (s.errorStreak >= 5) return { level: 'warn', text: `Running, but requests keep failing (${s.errorStreak} in a row): ${s.error}`, at };
   return { level: 'ok', text: 'Running.', at };
+}
+
+/**
+ * Colour groups of the site's drop line (the live feed of big wins), best first, with the colours the site
+ * draws under each item. The monitor stores how many drops of each it saw per feed read (monitor_feed).
+ */
+export const FEED_TIERS = [
+  ['gold', '#FFAE39', 'Gold (knives, gloves)'],
+  ['red', '#FF5E5E', 'Red'],
+  ['pink', '#EE5DFF', 'Pink'],
+  ['purple', '#A26EFF', 'Purple (and stickers)'],
+  ['blue', '#5A75FF', 'Blue'],
+  ['light', '#88BEF9', 'Light blue'],
+  ['grey', '#B8CADD', 'Grey'],
+];
+/** The groups counted as the "cheap colours" share: purple and below. */
+export const FEED_LOW = ['purple', 'blue', 'light', 'grey'];
+/** A window needs this many drops seen before its colour mix is used. */
+export const FEED_MIN_SEEN = 10;
+
+/**
+ * The drop line per window of the range, and whether its colour mix goes with the results.
+ * check[kind][lag]: windows split into thirds by their share of purple-and-below drops; for each third the
+ * pooled index (vs normal) of the same window (lag 0) or the window after it (lag 1). Only settled result
+ * windows count.
+ */
+export function feedReport(rows, spec, kinds, settledAtMs, now) {
+  const by = new Map((rows ?? []).map((r) => [Number(r.bucket), cleanRow(r)]));
+  const windows = [];
+  for (let t = spec.from; t < spec.to; t += spec.window) {
+    const r = by.get(t) ?? {};
+    const seen = n0(r.seen);
+    const counts = Object.fromEntries(FEED_TIERS.map(([k]) => [k, n0(r[k])]));
+    const low = FEED_LOW.reduce((s, k) => s + counts[k], 0);
+    const elapsed = n0(r.elapsed);
+    windows.push({
+      start: t,
+      end: Math.min(t + spec.window, now),
+      seen,
+      counts,
+      low: seen ? low / seen : null,
+      span: n0(r.span),
+      perMin: elapsed > 0 ? (n0(r.span) / elapsed) * MIN : null,
+      up: n0(r.up),
+      value: n0(r.value),
+    });
+  }
+  const check = {};
+  for (const kind of KINDS) {
+    const res = kinds?.[kind]?.windows ?? [];
+    check[kind] = [0, 1].map((lag) => {
+      const pairs = [];
+      for (let i = 0; i + lag < windows.length && i + lag < res.length; i++) {
+        const f = windows[i];
+        const w = res[i + lag];
+        if (f.seen < FEED_MIN_SEEN || f.low == null || !w || w.start + spec.window > settledAtMs || !(w.index?.exp > 0)) continue;
+        pairs.push({ low: f.low, obs: w.index.obs, exp: w.index.exp, v: w.index.se > 0 ? (w.index.se * w.index.exp) ** 2 : 0, n: w.index.n });
+      }
+      pairs.sort((a, b) => a.low - b.low);
+      const thirds = [0, 1, 2].map((g) => {
+        const part = pairs.slice(Math.floor((g * pairs.length) / 3), Math.floor(((g + 1) * pairs.length) / 3));
+        const sum = part.reduce((s, p) => ({ n: s.n + p.n, obs: s.obs + p.obs, exp: s.exp + p.exp, v: s.v + p.v }), { n: 0, obs: 0, exp: 0, v: 0 });
+        return { windows: part.length, from: part[0]?.low ?? null, to: part.at(-1)?.low ?? null, index: indexOf(sum) };
+      });
+      const [a, , c] = thirds;
+      const z = a.index.se > 0 && c.index.se > 0 && a.index.index != null && c.index.index != null ? (c.index.index - a.index.index) / Math.hypot(a.index.se, c.index.se) : null;
+      return { lag, windows: pairs.length, thirds, z };
+    });
+  }
+  return { windows, check };
 }

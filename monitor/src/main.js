@@ -6,7 +6,8 @@
 //   SUPABASE_SECRET_KEY   the project's secret key (sb_secret_…), or the legacy service_role key
 //   ALERT_URL             webhook for alerts (Discord, Telegram or ntfy, see notify.js); optional
 //   SUPABASE_URL          default https://hafnhxumrqyaljmciqqq.supabase.co
-//   RETENTION_DAYS        rows older than this are deleted, default 30
+//   RETENTION_DAYS        site counters, drop-line counts and events older than this are deleted, default 90
+//                         (raw rows: the database keeps 9 days of them and running totals for good)
 //   HISTORY_DAYS          how far back a found player's history is read, default 7
 //   HISTORY_PAGES         older pages read per list per player, default 10
 //   REVISIT_HOURS         how often a known player who last played 1 to 3 days ago is checked again, default 6
@@ -83,7 +84,7 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
   const secret = (env.SUPABASE_SECRET_KEY || '').trim();
   const alertUrl = (env.ALERT_URL || '').trim() || null;
   const supabaseUrl = (env.SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
-  const retentionDays = positive(env.RETENTION_DAYS, 30);
+  const retentionDays = positive(env.RETENTION_DAYS, 90);
   const base = (env.CASER_BASE || 'https://caser.gg').replace(/\/+$/, '');
   const gapMs = Number(env.PULSE_GAP_MS) > 0 ? Math.max(2000, Number(env.PULSE_GAP_MS)) : 8000;
   const dir = env.DATA_DIR || 'data';
@@ -109,6 +110,7 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
   if (!state.tokens?.refresh) throw new Error('Set CASER_REFRESH_TOKEN (see the README).');
   state.pendingRows ||= [];
   state.pendingVolume ||= [];
+  state.pendingFeed ||= [];
   state.pendingEvents ||= [];
 
   let saving = Promise.resolve();
@@ -151,6 +153,10 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
       state.pendingVolume.push(v);
       if (state.pendingVolume.length > MAX_PENDING_VOLUME) state.pendingVolume = state.pendingVolume.slice(-MAX_PENDING_VOLUME);
     },
+    saveFeed: async (f) => {
+      state.pendingFeed.push(f);
+      if (state.pendingFeed.length > MAX_PENDING_VOLUME) state.pendingFeed = state.pendingFeed.slice(-MAX_PENDING_VOLUME);
+    },
     onEvent: (e) => report(e.level, e.code, e.message, { force: e.code === 'login' || e.code === 'blocked' }),
     initial: state.collector ?? {},
     now,
@@ -188,12 +194,14 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
     // Copies: rows saved while the push runs are appended to the live arrays.
     const rows = state.pendingRows.slice();
     const volume = state.pendingVolume.slice();
+    const feed = state.pendingFeed.slice();
     const events = state.pendingEvents.slice();
     try {
-      if (rows.length || volume.length) await cloud.push(rows, volume);
+      if (rows.length || volume.length || feed.length) await cloud.push(rows, volume, feed);
       pushed += rows.length;
       state.pendingRows = state.pendingRows.slice(rows.length);
       state.pendingVolume = state.pendingVolume.slice(volume.length);
+      state.pendingFeed = state.pendingFeed.slice(feed.length);
       if (events.length) await cloud.events(events);
       state.pendingEvents = state.pendingEvents.slice(events.length);
       if (now() - lastPrune >= PRUNE_EVERY_MS) {
