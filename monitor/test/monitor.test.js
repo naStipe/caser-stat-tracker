@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, STEP, DEFAULT_LAG } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, STEP, DEFAULT_LAG } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -575,6 +575,63 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(v.volume.buckets.length, 24);
   assert.equal(v.volume.buckets.at(-1).casesPerMin, 9000.5);
   assert.equal(v.volume.buckets[0].casesPerMin, null);
+});
+
+test('dashboard view: whether a window predicts the next, a situation lookup, and the pattern by day', () => {
+  const H = 30 * 60000;
+  const start = Date.parse('2026-11-10T00:00:00Z');
+  // Windows alternate high and low: each one predicts the opposite of the next.
+  const alt = [];
+  for (let i = 0; i < 60; i++) alt.push({ bucket: String(start + i * H), kind: 'upgrade', nw: 100, w: i % 2 ? 30 : 10, ea: 20, va: 16 });
+  const settled = start + 60 * H;
+  const rev = persistence(alt, 'upgrade', settled, 30);
+  assert.equal(rev.pairs, 59);
+  assert.ok(rev.r < -0.99);
+  assert.equal(rev.verdict, 'reverse');
+  assert.ok(Math.abs(rev.spread - 2.5 * Math.sqrt(60 / 59)) < 1e-9, 'z = ±2.5 each window');
+  // Hour windows join two 30-minute buckets; the last window still arriving is left out.
+  const hour = persistence(alt, 'upgrade', settled - H, 60);
+  assert.equal(hour.windows, 29);
+  // Windows that swing at random carry no pattern; too few pairs say so.
+  const noise = (i) => { const x = Math.sin(i * 12.9898 + 4.1) * 43758.5453; return x - Math.floor(x); };
+  const flat = Array.from({ length: 40 }, (_, i) => ({ bucket: start + i * H, kind: 'upgrade', nw: 100, w: Math.round(14 + 12 * noise(i)), ea: 20, va: 16 }));
+  assert.equal(persistence(flat, 'upgrade', start + 40 * H, 30).verdict, 'none');
+  assert.equal(persistence(flat.slice(0, 10), 'upgrade', start + 10 * H, 30).verdict, 'few');
+  assert.equal(persistence(flat, 'case', start + 40 * H, 30).pairs, 0);
+
+  const week = {
+    situations: [{ band: 'b', phase: 1, n: '400', players: 30, sx: 40000, sy: 36000, w: 60, ew: 48, vw: 42, ea: 58, gxx: 6e7, gyy: 5e7, gxy: 5.4e7 }],
+    daily: [
+      { day: start, phase: 1, cg: 1, n: 100, w: 15, ew: 12, vw: 10 },
+      { day: start, phase: 2, cg: 3, n: 50, w: 20, ew: 25, vw: 12 },
+      { day: start, phase: 4, cg: 3, n: 50, w: 20, ew: 25, vw: 12 },
+      { day: start + 86400000, phase: 1, cg: 1, n: 80, w: 8, ew: 10, vw: 9 },
+    ],
+  };
+  const st = situation(week, 'b', 1);
+  assert.equal(st.n, 400);
+  assert.equal(st.shown.index, 1.25);
+  assert.equal(st.winRate, 0.15);
+  assert.equal(st.money.ratio, 0.9);
+  assert.ok(st.money.ci, 'clustered range with 30 players');
+  assert.equal(situation(week, 'g', 1).n, 0);
+  const days = dailyPattern(week);
+  assert.equal(days.length, 2);
+  assert.equal(days[0].fresh.index, 1.25);
+  assert.equal(days[0].high.index, 0.8);
+  assert.equal(days[0].high.n, 100);
+  assert.equal(days[1].fresh.index, 0.8);
+  assert.equal(days[1].high.index, null);
+  // buildReport hands them to the page.
+  const now = start + 61 * H;
+  const v = buildReport({ report: { lag: { rows: 500, p50: 60000, p80: 60000 } }, cmp: {}, week: { ...week, series: alt }, compareMinutes: 30, spec: rangeSpec('1h', now, 2), now });
+  assert.equal(v.persistence.upgrade[30].verdict, 'reverse');
+  assert.equal(v.persistence.case[30].verdict, 'few');
+  assert.equal(v.daily.length, 2);
+  assert.equal(v.week, v.week);
+  assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.1, index: 1.5 }).strength, 'strong');
+  assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.2, index: 1.5 }).strength, 'mild');
+  assert.equal(againstNormal({ n: 100, obs: 24, exp: 20, se: 0.2, index: 1.2 }).strength, 'noise');
 });
 
 test('stats: win and hit index with a binomial range, and its comparison', () => {

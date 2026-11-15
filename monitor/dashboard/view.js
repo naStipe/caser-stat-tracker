@@ -127,12 +127,66 @@ const sumRows = (rows) => {
   return out;
 };
 
-/** An index against 1 (normal): verdict 'better' | 'worse' | 'same' | 'few', as compareIndex. */
+/**
+ * An index against 1 (normal): verdict 'better' | 'worse' | 'same' | 'few', as compareIndex, and how unusual it
+ * is: 'noise' (|z| under 2), 'mild' (2 to 3: checked every 30 minutes, about 2 a day happen by chance) or
+ * 'strong' (3 and more: about one a week by chance).
+ */
 export function againstNormal(ix, { minExp = 5, minN = 30 } = {}) {
-  if (!(ix?.n >= minN) || !(ix.exp >= minExp) || !(ix.se > 0)) return { ...ix, z: null, p: null, verdict: 'few' };
+  if (!(ix?.n >= minN) || !(ix.exp >= minExp) || !(ix.se > 0)) return { ...ix, z: null, p: null, verdict: 'few', strength: 'few' };
   const z = (ix.index - 1) / ix.se;
   const p = 2 * (1 - normCdf(Math.abs(z)));
-  return { ...ix, z, p, verdict: p < 0.05 ? (z > 0 ? 'better' : 'worse') : 'same' };
+  const strength = Math.abs(z) >= 3 ? 'strong' : Math.abs(z) >= 2 ? 'mild' : 'noise';
+  return { ...ix, z, p, verdict: p < 0.05 ? (z > 0 ? 'better' : 'worse') : 'same', strength };
+}
+
+/**
+ * Does "right now" predict the next window? From a 7-day report in 30-minute buckets: each settled window of
+ * `minutes` (30 or 60) becomes z = (observed - normal) / its standard error, and consecutive windows are
+ * correlated. Pure noise gives a correlation near 0 and a spread of z near 1.
+ * verdict: 'few' (under 20 pairs) | 'carry' (a good window tends to be followed by a good one) |
+ *          'reverse' (followed by a bad one) | 'none' (no relation found).
+ */
+export function persistence(series, kind, settledAt, minutes = 30, { minExp = 10 } = {}) {
+  const len = minutes * MIN;
+  const byWin = new Map();
+  for (const raw of series ?? []) {
+    if (raw.kind !== kind) continue;
+    const r = cleanRow(raw);
+    const start = Math.floor(Number(r.bucket) / len) * len;
+    if (start + len > settledAt) continue;
+    const c = rowCounts(kind, r);
+    const s = byWin.get(start) ?? { n: 0, obs: 0, exp: 0, v: 0 };
+    s.n += c.n;
+    s.obs += c.obs;
+    s.exp += c.exp;
+    s.v += c.v;
+    byWin.set(start, s);
+  }
+  const z = new Map();
+  for (const [start, s] of byWin) if (s.exp >= minExp && s.v > 0) z.set(start, (s.obs - s.exp) / Math.sqrt(s.v));
+  const pairs = [];
+  for (const [start, a] of z) if (z.has(start + len)) pairs.push([a, z.get(start + len)]);
+  const all = [...z.values()];
+  const mean = (xs) => xs.reduce((t, x) => t + x, 0) / (xs.length || 1);
+  const spread = all.length > 1 ? Math.sqrt(all.reduce((t, x) => t + (x - mean(all)) ** 2, 0) / (all.length - 1)) : null;
+  const n = pairs.length;
+  if (n < 20) return { minutes, windows: all.length, pairs: n, r: null, ci: null, spread, verdict: 'few', points: pairs };
+  const mx = mean(pairs.map((p) => p[0]));
+  const my = mean(pairs.map((p) => p[1]));
+  let sxy = 0, sxx = 0, syy = 0;
+  for (const [x, y] of pairs) {
+    sxy += (x - mx) * (y - my);
+    sxx += (x - mx) ** 2;
+    syy += (y - my) ** 2;
+  }
+  const r = sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0;
+  // 95% range through Fisher's z.
+  const fz = Math.atanh(Math.max(-0.999999, Math.min(0.999999, r)));
+  const half = 1.959964 / Math.sqrt(n - 3);
+  const ci = [Math.tanh(fz - half), Math.tanh(fz + half)];
+  const verdict = ci[0] > 0 ? 'carry' : ci[1] < 0 ? 'reverse' : 'none';
+  return { minutes, windows: all.length, pairs: n, r, ci, spread, verdict, points: pairs };
 }
 function normCdf(z) {
   const x = Math.abs(z) / Math.SQRT2;
@@ -158,18 +212,61 @@ export const CHANCE_GROUPS = [
   [2, '15–35%'],
   [3, '35% and up'],
 ];
+export const BANDS = [
+  ['a', 'under 10%'],
+  ['b', '10–15%'],
+  ['c', '15–25%'],
+  ['d', '25–35%'],
+  ['e', '35–55%'],
+  ['f', '55–70%'],
+  ['g', '70% and up'],
+];
+
+/**
+ * The last 7 days for one shown-chance band and session phase: wins against the shown chance, and return
+ * per 1 with a range clustered by player. From the "situations" of a 7-day report.
+ */
+export function situation(week, band, phase) {
+  const r = cleanRow((week?.situations ?? []).find((s) => s.band === band && Number(s.phase) === Number(phase)));
+  return {
+    n: n0(r.n),
+    players: n0(r.players),
+    shown: indexOf({ n: n0(r.n), obs: n0(r.w), exp: n0(r.ew), v: n0(r.vw) }),
+    winRate: r.n ? n0(r.w) / n0(r.n) : null,
+    shownRate: r.n ? n0(r.ew) / n0(r.n) : null,
+    money: ratioOf({ n: n0(r.n), players: n0(r.players), sx: n0(r.sx), sy: n0(r.sy), gxx: n0(r.gxx), gyy: n0(r.gyy), gxy: n0(r.gxy) }),
+  };
+}
+
+/**
+ * Day by day over the 7-day report: low chances (under 15%) in the first 5 minutes of a session, and high
+ * chances (35% and up) at any time, against the shown chance. Shows whether the pattern holds or changes.
+ */
+export function dailyPattern(week) {
+  const days = new Map();
+  for (const raw of week?.daily ?? []) {
+    const r = cleanRow(raw);
+    const d = days.get(r.day) ?? { day: r.day, fresh: { n: 0, obs: 0, exp: 0, v: 0 }, high: { n: 0, obs: 0, exp: 0, v: 0 } };
+    const add = (t) => { t.n += r.n; t.obs += r.w; t.exp += r.ew; t.v += r.vw; };
+    if (Number(r.phase) === 1 && Number(r.cg) === 1) add(d.fresh);
+    if (Number(r.cg) === 3) add(d.high);
+    days.set(r.day, d);
+  }
+  return [...days.values()].sort((a, b) => a.day - b.day).map((d) => ({ day: d.day, fresh: indexOf(d.fresh), high: indexOf(d.high) }));
+}
 
 /**
  * @param {Object} o
  * @param {any} o.report    monitor_report over the range, per window
  * @param {any} o.cmp       monitor_report over compareSpec(now) (5-minute buckets)
+ * @param {any} [o.week]    monitor_report over the last 7 days in 30-minute buckets (self-check, lookup, day by day)
  * @param {any[]} o.volume  monitor_volume_agg over the range, per coarse bucket
  * @param {any[]} o.volRecent  monitor_volume_agg over the compared recent part
  * @param {any[]} o.volBase    monitor_volume_agg over the part before it
  * @param {ReturnType<typeof rangeSpec>} o.spec
  * @param {number} o.now
  */
-export function buildReport({ report, cmp, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
+export function buildReport({ report, cmp, week = null, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
   const series = (report?.series ?? []).map(cleanRow);
   const settled = settledAt(report?.lag ?? cmp?.lag, now);
   const out = { now, spec, settled, kinds: {}, compare: {}, compareMoney: {}, glance: {}, heat: {}, hours: {}, totals: {}, excluded: {} };
@@ -326,6 +423,12 @@ export function buildReport({ report, cmp, heatReport = null, compareMinutes = 6
   };
   for (let t = spec.coarse.from; t < spec.coarse.to; t += spec.coarse.bucket) out.volume.buckets.push(vol.find((v) => v.bucket === t) ?? { ...EMPTY_VOLUME, bucket: t });
   out.compareMinutes = compareMinutes;
+
+  // Does a window predict the next one? And the 7-day lookup and day-by-day pattern.
+  out.persistence = {};
+  for (const kind of KINDS) out.persistence[kind] = { 30: persistence(week?.series, kind, settled.at, 30), 60: persistence(week?.series, kind, settled.at, 60) };
+  out.week = week;
+  out.daily = dailyPattern(week);
   return out;
 }
 

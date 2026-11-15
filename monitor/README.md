@@ -42,9 +42,20 @@ nothing extra.
 Sections:
 
 - **right now**, one card each for upgrades and cases: the last 30 minutes (or hour) up to the settled time against
-  normal, with a significance test, the part before it, and a line of the last 6 hours (each point the 30 minutes
-  or hour before it, with its 95% range; dashed while rows are still arriving). The upgrade card also shows how low
-  chances did in the first 5 minutes of sessions against their usual value;
+  normal, described rather than judged: "within normal noise" under 2 standard errors, "slightly high/low, often
+  chance" from 2 to 3 (checked every 30 minutes, about 2 a day happen by chance), "unusually high/low" from 3 (about
+  once a week by chance), the only case shown in green or red. A line shows the last 6 hours (each point the 30
+  minutes or hour before it, with its 95% range; dashed while rows are still arriving), and each card says whether
+  such a window has predicted the next one over the last 7 days;
+- **does the last 30 minutes predict the next?**: every settled window of the last 7 days against the one after it,
+  as a scatter with the correlation and its 95% range. A round cloud means "right now" says nothing about the next
+  half hour (that is what the first days of data show);
+- **look up a situation**: pick a shown-chance band and a time into the session to see the last 7 days' return per
+  1 (95% range clustered by player), win rate and wins against the shown chance. The monitor cannot see deposits,
+  so a session here starts after 20 minutes without play; in the account's own history the boost follows every
+  completed deposit, top-ups made while playing included;
+- **does the pattern hold day by day?**: low chances in the first 5 minutes of a session and high chances at any
+  time, against the shown chance, per day;
 - the monitor's state and its recent events (problems are listed here too);
 - totals for the range (30 minutes to 30 days, opening on the last hour), including the share of players who
   ended up in profit;

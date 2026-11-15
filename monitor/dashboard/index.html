@@ -72,6 +72,8 @@
   .big { font-size: 30px; font-weight: 600; line-height: 1.1; text-align: right; }
   .big small { display: block; font-size: 12px; font-weight: 400; color: var(--faint); }
   .readout.small { min-height: 20px; font-size: 12.5px; margin: 2px 0 0; }
+  .predicts { font-size: 13px; margin-top: 6px; }
+  .small-text { font-size: 12.5px; }
   .headline { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .kpi .k { color: var(--muted); font-size: 12.5px; }
@@ -101,7 +103,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -134,7 +136,9 @@ const metricName = (kind, m) => (METRICS[kind].find(([v]) => v === m) ?? METRICS
 let rangeKey = RANGES[store.get('pulse.range')] ? store.get('pulse.range') : '1h';
 let windowMin = pickWindow(rangeKey, store.get(`pulse.window.${rangeKey}`));
 let compareMin = Number(store.get('pulse.compare', 30)) === 60 ? 60 : 30;
-let heatCache = null; // the 7-day report behind the heat map, reused for 10 minutes
+let weekCache = null; // the 7-day report in 30-minute buckets (self-check, lookup, day by day, heat map), reused for 10 minutes
+let pickBand = store.get('pulse.band', 'b');
+let pickPhase = Number(store.get('pulse.phase', 1));
 const metric = {};
 for (const k of KINDS) { const m = store.get(`pulse.metric.${k}`, 'index'); metric[k] = METRICS[k].some(([v]) => v === m) ? m : 'index'; }
 let heatKind = store.get('pulse.heat', 'upgrade');
@@ -208,7 +212,7 @@ function frame({ width, t0, t1, lo, hi, ticks, tickFmt, span, label, H = 210, st
     const yy = Math.round(y(v)) + 0.5;
     svg.append(s('line', { x1: padL, x2: W - padR, y1: yy, y2: yy, stroke: COLORS.grid }), s('text', { x: padL - 6, y: yy + 3.5, 'text-anchor': 'end', text: tickFmt(v) }));
   }
-  const steps = [5 * 60000, 10 * 60000, 15 * 60000, 30 * 60000, HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR, 2 * 24 * HOUR, 7 * 24 * HOUR];
+  const steps = [5 * 60000, 10 * 60000, 15 * 60000, 30 * 60000, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR, 2 * 24 * HOUR, 7 * 24 * HOUR];
   // At most one time label per 80 px, so narrow screens do not crowd them.
   const maxLabels = Math.max(2, Math.min(6, Math.floor(iw / 80)));
   const step = steps.find((st) => (t1 - t0) / st <= maxLabels) ?? steps.at(-1);
@@ -426,7 +430,6 @@ function activityChart({ v, width }) {
   return h('div', { class: 'chart' }, legend, readout, f.svg);
 }
 
-const VERDICT = { better: ['good', 'Paying more than usual'], worse: ['bad', 'Paying less than usual'], same: ['', 'About as usual'], few: ['', 'Not enough data yet'] };
 const durationText = (m) => (m === 60 ? 'hour' : `${m} minutes`);
 const clock = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -480,28 +483,128 @@ function glanceLine({ kind, width }) {
 function glanceCard(kind, width) {
   const c = view.compare[kind];
   const mo = view.compareMoney[kind];
-  const [cls, word] = VERDICT[c.verdict] || VERDICT.few;
   const m = view.compareMinutes;
   const what = NAMES[kind][1];
   const lag = view.settled;
-  const detail = c.verdict === 'few'
+  const high = ok(c.z) && c.z > 0;
+  // Describes the last window; green or red only when it is far outside what chance gives several times a day.
+  const word = c.strength === 'few' ? 'Not enough data yet'
+    : c.strength === 'noise' ? 'Within normal noise'
+    : c.strength === 'mild' ? `Slightly ${high ? 'high' : 'low'}, often chance`
+    : `Unusually ${high ? 'high' : 'low'}`;
+  const cls = c.strength === 'strong' ? (high ? 'good' : 'bad') : '';
+  const detail = c.strength === 'few'
     ? `Needs at least 30 ${what} in the ${durationText(m)} up to ${clock(c.to)}; there are ${fmtInt(c.n)}.`
-    : `${kind === 'upgrade' ? 'Wins' : 'Hits'} at ${fmt2(c.index)} times the usual rate in the ${durationText(m)} up to ${clock(c.to)} (${fmtInt(c.n)} ${what}${c.ci ? `, 95% range ${fmt2(c.ci[0])}–${fmt2(c.ci[1])}` : ''}). ${c.verdict === 'same' ? 'Within random noise.' : 'Too far from 1 to be luck.'}`;
-  const before = c.before.verdict === 'few' ? '' : ` The ${m === 60 ? '3 hours' : `${3 * m} minutes`} before: ${fmt2(c.base.index)}${c.before.verdict === 'same' ? '' : `, a clear ${c.before.verdict === 'better' ? 'rise' : 'drop'} since`}.`;
-  const fr = view.fresh;
-  const fresh = kind === 'upgrade' && fr.now.n >= 30
-    ? h('div', { class: 'hint', text: `First 5 minutes of a session, chances under 15%: won ${fmt2(fr.now.index)}× the shown chance in the last 7 hours (${fmtInt(fr.now.n)} upgrades), usually ${fmt2(fr.usual.index)}×.` })
-    : null;
+    : `${kind === 'upgrade' ? 'Wins' : 'Hits'} at ${fmt2(c.index)} times the usual rate in the ${durationText(m)} up to ${clock(c.to)} (${fmtInt(c.n)} ${what}${c.ci ? `, 95% range ${fmt2(c.ci[0])}–${fmt2(c.ci[1])}` : ''}, z ${fmt(c.z, 1)}). ${
+        c.strength === 'noise' ? 'Random swings this size happen all the time.' : c.strength === 'mild' ? 'Checked every 30 minutes, about 2 a day look like this by chance alone.' : 'Chance alone gives this about once a week.'}`;
+  const before = c.before.verdict === 'few' ? '' : ` The ${m === 60 ? '3 hours' : `${3 * m} minutes`} before: ${fmt2(c.base.index)}.`;
+  const p = view.persistence[kind][m];
+  const predicts = p.verdict === 'few'
+    ? `Not enough history yet to check whether a window like this says anything about the next one (${fmtInt(p.pairs)} of 20 pairs).`
+    : p.verdict === 'none'
+      ? `It does not predict the next ${durationText(m)}: over 7 days, consecutive windows were unrelated (correlation ${signed(p.r)}, range ${signed(p.ci[0])} to ${signed(p.ci[1])}).`
+      : `Over 7 days a window like this ${p.verdict === 'carry' ? 'tended to be followed by a similar one' : 'tended to be followed by the opposite'} (correlation ${signed(p.r)}, range ${signed(p.ci[0])} to ${signed(p.ci[1])}).`;
   return h('section', { class: cls },
     h('div', { class: 'glance-top' },
-      h('div', null, h('div', { class: 'kind', text: NAMES[kind][0] }), h('div', { class: 'headline', text: word })),
-      h('div', { class: ['big', 'num', !ok(c.index) ? 'faint' : c.verdict === 'better' ? 'pos' : c.verdict === 'worse' ? 'neg' : ''] }, fmt2(c.index), h('small', { text: kind === 'upgrade' ? '× normal' : '× usual hits' }))),
+      h('div', null, h('div', { class: 'kind', text: `${NAMES[kind][0]}, last ${durationText(m)}` }), h('div', { class: 'headline', text: word })),
+      h('div', { class: ['big', 'num', !ok(c.index) ? 'faint' : cls === 'good' ? 'pos' : cls === 'bad' ? 'neg' : ''] }, fmt2(c.index), h('small', { text: kind === 'upgrade' ? '× normal' : '× usual hits' }))),
     glanceLine({ kind, width }),
     h('div', { class: 'muted', text: detail + before }),
-    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${lag.known ? `80% arrive within ${Math.round(lag.lagMs / 60000)} min` : `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured`}).` }),
-    fresh);
+    h('div', { class: ['predicts', p.verdict === 'carry' || p.verdict === 'reverse' ? 'warn-text' : 'muted'], text: predicts }),
+    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${lag.known ? `80% arrive within ${Math.round(lag.lagMs / 60000)} min` : `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured`}).` }));
 }
 
+const signed = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 2)}` : DASH);
+
+/** Each settled window against the next one, as z-scores: a round cloud means one says nothing about the other. */
+function persistenceChart({ kind, width }) {
+  const p = view.persistence[kind][view.compareMinutes];
+  const W = Math.max(200, Math.floor(width)), H = Math.min(W, 220);
+  const pad = 30, lim = 4;
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `${NAMES[kind][0]}: each window against the next one, last 7 days.` });
+  const x = (v) => pad + ((Math.max(-lim, Math.min(lim, v)) + lim) / (2 * lim)) * (W - pad - 8);
+  const y = (v) => 8 + (1 - (Math.max(-lim, Math.min(lim, v)) + lim) / (2 * lim)) * (H - pad - 8);
+  for (const v of [-2, 0, 2]) {
+    svg.append(s('line', { x1: x(v), x2: x(v), y1: y(lim), y2: y(-lim), stroke: v ? COLORS.grid : COLORS.zero }));
+    svg.append(s('line', { x1: x(-lim), x2: x(lim), y1: y(v), y2: y(v), stroke: v ? COLORS.grid : COLORS.zero }));
+    svg.append(s('text', { x: x(v), y: H - 12, 'text-anchor': 'middle', text: String(v) }));
+    svg.append(s('text', { x: pad - 6, y: y(v) + 3.5, 'text-anchor': 'end', text: String(v) }));
+  }
+  svg.append(s('text', { x: x(lim), y: H - 1, 'text-anchor': 'end', text: 'this window →' }));
+  svg.append(s('text', { x: x(-lim) + 2, y: 18, text: '↑ next' }));
+  for (const [a, b] of p.points) svg.append(s('circle', { cx: x(a), cy: y(b), r: 2.5, fill: COLORS.line, 'fill-opacity': 0.7 }));
+  if (ok(p.r)) {
+    // The fitted line through the cloud (z-scores have about equal spread, so slope = correlation).
+    svg.append(s('line', { x1: x(-lim), y1: y(-lim * p.r), x2: x(lim), y2: y(lim * p.r), stroke: COLORS.warn, 'stroke-width': 1.5 }));
+  }
+  const text = p.verdict === 'few'
+    ? `${fmtInt(p.pairs)} pairs so far; needs 20.`
+    : `${fmtInt(p.pairs)} pairs. Correlation ${signed(p.r)} (95% range ${signed(p.ci[0])} to ${signed(p.ci[1])}). Spread of windows ${fmt2(p.spread)}; pure chance gives 1.00.`;
+  return h('div', null, h('h3', { text: NAMES[kind][0] }), h('div', { class: 'chart' }, svg), h('div', { class: 'faint small-text', text }));
+}
+
+/** The last 7 days for a chosen shown chance and time into the session. */
+function situationSection() {
+  const st = situation(view.week, pickBand, pickPhase);
+  const label = BANDS.find(([b]) => b === pickBand)?.[1] ?? pickBand;
+  const phaseLabel = PHASES.find(([p]) => p === pickPhase)?.[1] ?? '';
+  const mo = st.money;
+  const thin = st.n < 100;
+  const loss = ok(mo.ratio) ? (1 - mo.ratio) * 100 : null;
+  const verdict = !st.n ? 'No upgrades like this in the last 7 days.'
+    : !mo.ci ? `Return per 1 ${fmt3(mo.ratio)}, from too few players for a range.`
+    : mo.ci[0] > 1 ? `Returned more than staked: ${fmt3(mo.ratio)} per 1 (range ${fmt3(mo.ci[0])}–${fmt3(mo.ci[1])}).`
+    : mo.ci[1] < 1 ? `Lost about ${fmt(loss, 0)} per 100 staked (range ${fmt((1 - mo.ci[1]) * 100, 0)}–${fmt((1 - mo.ci[0]) * 100, 0)}).`
+    : `Return per 1 ${fmt3(mo.ratio)}, but the range ${fmt3(mo.ci[0])}–${fmt3(mo.ci[1])} includes break-even: the data cannot tell a gain from a loss here.`;
+  return h('section', null,
+    h('div', { class: 'sec-head' }, h('h2', { text: 'Look up a situation' })),
+    h('div', { class: 'row', style: 'margin-bottom:8px' }, toggle(BANDS.map(([b, l]) => [b, l]), pickBand, (b) => { pickBand = b; store.set('pulse.band', b); renderDashboard(); }, 'Shown chance')),
+    h('div', { class: 'row', style: 'margin-bottom:12px' }, toggle(PHASES.filter(([p]) => p !== 0).map(([p, l]) => [p, l]), pickPhase, (p) => { pickPhase = Number(p); store.set('pulse.phase', String(p)); renderDashboard(); }, 'Time into session')),
+    h('div', { class: 'kpis' },
+      kpi('Return per 1', fmt3(mo.ratio), mo.ci ? `range ${fmt3(mo.ci[0])}–${fmt3(mo.ci[1])}` : 'no range: too few players', clearOf1(mo.ci)),
+      kpi('Win rate', pct(st.winRate), `shown ${pct(st.shownRate)}`),
+      kpi('Wins vs shown', fmt2(st.shown.index), st.shown.ci ? `range ${fmt2(st.shown.ci[0])}–${fmt2(st.shown.ci[1])}` : null, clearOf1(st.shown.ci)),
+      kpi('Sample', fmtInt(st.n), `upgrades by ${fmtInt(st.players)} players`)),
+    h('p', { class: thin ? 'warn-text' : 'muted', style: 'margin:12px 0 0', text: `${label}, ${phaseLabel.toLowerCase()} of a session, last 7 days: ${verdict}${thin ? ' Fewer than 100 upgrades: treat it as a rough guess.' : ''}` }),
+    h('p', { class: 'hint', text: 'Return per 1 is what came back per 1 staked, with a 95% range that counts each player once. Wins vs shown can be above 1 while the return is below 1: the wins that come are often small. A session starts after 20 minutes without play. The monitor cannot see other players’ deposits, so a top-up made while playing does not start a new session here; in your own history the boost follows every deposit, top-ups included.' }));
+}
+
+/** Day by day: whether the pattern holds. */
+function dailyChart({ width }) {
+  const days = view.daily.filter((d) => d.fresh.n >= 30 || d.high.n >= 30);
+  if (!days.length) return h('p', { class: 'faint', text: 'Not enough days yet.' });
+  const series = [['fresh', 'Under 15%, first 5 minutes', COLORS.pos], ['high', '35% and up, any time', COLORS.neg]];
+  const vals = [1];
+  for (const d of days) for (const [k] of series) if (d[k].n >= 30 && ok(d[k].index)) vals.push(d[k].index, ...(d[k].ci ?? []));
+  const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(...vals) - 0.05), Math.min(2.5, Math.max(...vals)) + 0.05, 4);
+  const DAY = 24 * HOUR;
+  const t0 = days[0].day, t1 = days.at(-1).day + DAY;
+  const f = frame({ width, t0, t1, lo, hi, ticks, tickFmt: (q) => fmt(q, Math.round(q * 10) === q * 10 ? 1 : 2), span: 8 * DAY, H: 200, label: 'Wins against the shown chance per day.' });
+  const yb = Math.round(f.y(1)) + 0.5;
+  f.svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+  const marks = [];
+  series.forEach(([k, , color], si) => {
+    let d = '';
+    for (const day of days) {
+      const ix = day[k];
+      if (!(ix.n >= 30) || !ok(ix.index)) continue;
+      const cx = f.x(day.day + DAY / 2) + (si ? 5 : -5), cy = f.y(ix.index);
+      if (ix.ci) f.svg.append(s('line', { x1: cx, x2: cx, y1: f.y(ix.ci[0]), y2: f.y(ix.ci[1]), stroke: color, 'stroke-opacity': 0.5 }));
+      f.svg.append(s('circle', { cx, cy, r: 3.5, fill: color }));
+      d += `${d ? 'L' : 'M'}${cx.toFixed(1)},${cy.toFixed(1)}`;
+      marks.push({ cx, cy, day, k });
+    }
+    if (d) f.svg.append(s('path', { d, fill: 'none', stroke: color, 'stroke-width': 1.25, 'stroke-opacity': 0.6 }));
+  });
+  const readout = h('div', { class: 'readout small' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: 'Days with fewer than 30 upgrades in a group are left out. Hover or tap a day.' }));
+  idle();
+  hover(f, marks, ({ day }) => readout.replaceChildren(`${new Date(day.day).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}: `,
+    h('span', { class: 'num', text: `low chances, first 5 min ${fmt2(day.fresh.index)} (${fmtInt(day.fresh.n)}); 35% and up ${fmt2(day.high.index)} (${fmtInt(day.high.n)})` })), idle);
+  const legend = h('div', { class: 'legend' }, series.map(([, label, color]) => h('span', null, h('i', { class: 'dot', style: `background:${color}` }), label)),
+    h('span', null, h('i', { style: `background:${COLORS.diag}` }), '1 = as shown'));
+  return h('div', { class: 'chart' }, legend, readout, f.svg);
+}
 /** Upgrades by time into the session and shown chance: where the shown odds pay more or less than they say. */
 function phaseTable() {
   const rows = view.phases.filter((r) => r.cells.some((c) => c.n || c.usual.n));
@@ -564,6 +667,13 @@ function renderDashboard() {
     toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over')));
   const gw = width >= 680 ? Math.floor((width - 16) / 2) - 2 : width;
   out.push(h('div', { class: 'glance' }, glanceCard('upgrade', gw), glanceCard('case', gw)));
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Does the last ${durationText(compareMin)} predict the next?` })),
+    h('div', { class: 'split' }, persistenceChart({ kind: 'upgrade', width: gw - 34 }), persistenceChart({ kind: 'case', width: gw - 34 })),
+    h('p', { class: 'hint', text: `Each dot is one ${durationText(compareMin)} window of the last 7 days (x) against the one right after it (y), both as how far from normal they were in standard errors. If good windows were followed by good ones, the dots would lean along a rising line. A round cloud and a flat line mean checking “right now” tells you nothing about the next ${durationText(compareMin)}.` })));
+  out.push(situationSection());
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does the pattern hold day by day?' })),
+    dailyChart({ width }),
+    h('p', { class: 'hint', text: 'Wins against the shown chance per day, last 7 days: low chances in the first 5 minutes of a session (the only group that wins more than shown) and high chances at any time. If the site changes how it treats sessions, it shows here first.' })));
   out.push(problemsSection());
 
   const t = v.totals;
@@ -672,19 +782,19 @@ async function load() {
     const tz = -new Date().getTimezoneOffset();
     // The heat map always covers at least 7 days; for shorter ranges it comes from its own report.
     const needHeat = spec.to - spec.from < 7 * 24 * HOUR;
-    const heatFresh = heatCache && now - heatCache.at < 10 * 60 * 1000 && heatCache.tz === tz;
-    const heatTo = Math.floor(now / HOUR) * HOUR + HOUR;
-    const [report, cmp, volume, statusRes, eventsRes, heatNew] = await Promise.all([
+    const weekFresh = weekCache && now - weekCache.at < 10 * 60 * 1000 && weekCache.tz === tz;
+    const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
+    const [report, cmp, volume, statusRes, eventsRes, weekNew] = await Promise.all([
       rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
       rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
       sb.from('monitor_status').select('updated_at,status').maybeSingle(),
       sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
-      needHeat && !heatFresh ? rpc('monitor_report', { from_ms: heatTo - 7 * 24 * HOUR, to_ms: heatTo, bucket_ms: 24 * HOUR, tz_offset_min: tz }) : Promise.resolve(null),
+      weekFresh ? Promise.resolve(null) : rpc('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }),
     ]);
     if (statusRes.error) throw statusRes.error;
-    if (heatNew) heatCache = { at: now, tz, report: heatNew };
-    view = buildReport({ report, cmp, heatReport: needHeat ? heatCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
+    if (weekNew) weekCache = { at: now, tz, report: weekNew };
+    view = buildReport({ report, cmp, week: weekCache?.report ?? null, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
     loadError = null;
