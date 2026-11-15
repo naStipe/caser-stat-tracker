@@ -103,7 +103,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -139,6 +139,8 @@ let compareMin = Number(store.get('pulse.compare', 30)) === 60 ? 60 : 30;
 let weekCache = null; // the 7-day report in 30-minute buckets (self-check, lookup, day by day, heat map), reused for 10 minutes
 let pickBand = store.get('pulse.band', 'b');
 let pickPhase = Number(store.get('pulse.phase', 1));
+let predictMin = PREDICT_WINDOWS.includes(Number(store.get('pulse.predict', 10))) ? Number(store.get('pulse.predict', 10)) : 10;
+const predictCache = new Map(); // window minutes -> {at, rows} from monitor_window_sums, reused for 10 minutes
 const metric = {};
 for (const k of KINDS) { const m = store.get(`pulse.metric.${k}`, 'index'); metric[k] = METRICS[k].some(([v]) => v === m) ? m : 'index'; }
 let heatKind = store.get('pulse.heat', 'upgrade');
@@ -518,7 +520,7 @@ const signed = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 2)}` :
 
 /** Each settled window against the next one, as z-scores: a round cloud means one says nothing about the other. */
 function persistenceChart({ kind, width }) {
-  const p = view.persistence[kind][view.compareMinutes];
+  const p = view.predict?.[kind] ?? view.persistence[kind][view.compareMinutes];
   const W = Math.max(200, Math.floor(width)), H = Math.min(W, 220);
   const pad = 30, lim = 4;
   const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `${NAMES[kind][0]}: each window against the next one, last 7 days.` });
@@ -532,7 +534,8 @@ function persistenceChart({ kind, width }) {
   }
   svg.append(s('text', { x: x(lim), y: H - 1, 'text-anchor': 'end', text: 'this window →' }));
   svg.append(s('text', { x: x(-lim) + 2, y: 18, text: '↑ next' }));
-  for (const [a, b] of p.points) svg.append(s('circle', { cx: x(a), cy: y(b), r: 2.5, fill: COLORS.line, 'fill-opacity': 0.7 }));
+  const many = p.points.length > 300;
+  for (const [a, b] of p.points) svg.append(s('circle', { cx: x(a), cy: y(b), r: many ? 1.8 : 2.5, fill: COLORS.line, 'fill-opacity': many ? 0.45 : 0.7 }));
   if (ok(p.r)) {
     // The fitted line through the cloud (z-scores have about equal spread, so slope = correlation).
     svg.append(s('line', { x1: x(-lim), y1: y(-lim * p.r), x2: x(lim), y2: y(lim * p.r), stroke: COLORS.warn, 'stroke-width': 1.5 }));
@@ -667,9 +670,11 @@ function renderDashboard() {
     toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over')));
   const gw = width >= 680 ? Math.floor((width - 16) / 2) - 2 : width;
   out.push(h('div', { class: 'glance' }, glanceCard('upgrade', gw), glanceCard('case', gw)));
-  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: `Does the last ${durationText(compareMin)} predict the next?` })),
+  const pm = v.predict?.minutes ?? compareMin;
+  out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does one window predict the next?' }),
+      toggle(PREDICT_WINDOWS.map((m) => [m, m >= 60 ? '1 h' : `${m} min`, `${m}-minute windows`]), predictMin, setPredict, 'Window')),
     h('div', { class: 'split' }, persistenceChart({ kind: 'upgrade', width: gw - 34 }), persistenceChart({ kind: 'case', width: gw - 34 })),
-    h('p', { class: 'hint', text: `Each dot is one ${durationText(compareMin)} window of the last 7 days (x) against the one right after it (y), both as how far from normal they were in standard errors. If good windows were followed by good ones, the dots would lean along a rising line. A round cloud and a flat line mean checking “right now” tells you nothing about the next ${durationText(compareMin)}.` })));
+    h('p', { class: 'hint', text: `Each dot is one ${pm}-minute window of the last 7 days (x) against the one right after it (y), both as how far from normal they were in standard errors. If good windows were followed by good ones, the dots would lean along a rising line. A round cloud and a flat line mean checking “right now” tells you nothing about the next ${pm} minutes. Short windows hold few rows (windows with under 3 expected wins or hits are left out), so each dot is noisier, but there are more of them. A small positive value for upgrades can also come from the same players in both windows: the monitor does not see top-up deposits, so a player’s own boost after one shows up in two windows in a row.` })));
   out.push(situationSection());
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does the pattern hold day by day?' })),
     dailyChart({ width }),
@@ -784,17 +789,22 @@ async function load() {
     const needHeat = spec.to - spec.from < 7 * 24 * HOUR;
     const weekFresh = weekCache && now - weekCache.at < 10 * 60 * 1000 && weekCache.tz === tz;
     const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
-    const [report, cmp, volume, statusRes, eventsRes, weekNew] = await Promise.all([
+    const pc = predictCache.get(predictMin);
+    const predictFresh = pc && now - pc.at < 10 * 60 * 1000;
+    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew] = await Promise.all([
       rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
       rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
       sb.from('monitor_status').select('updated_at,status').maybeSingle(),
       sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
       weekFresh ? Promise.resolve(null) : rpc('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }),
+      predictFresh ? Promise.resolve(null) : rpc('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }),
     ]);
     if (statusRes.error) throw statusRes.error;
     if (weekNew) weekCache = { at: now, tz, report: weekNew };
-    view = buildReport({ report, cmp, week: weekCache?.report ?? null, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
+    if (predictNew) predictCache.set(predictMin, { at: now, rows: predictNew });
+    const predict = predictCache.get(predictMin) ? { minutes: predictMin, rows: predictCache.get(predictMin).rows } : null;
+    view = buildReport({ report, cmp, week: weekCache?.report ?? null, predict, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
     loadError = null;
@@ -816,6 +826,11 @@ function setWindow(m) {
   windowMin = pickWindow(rangeKey, m);
   store.set(`pulse.window.${rangeKey}`, String(windowMin));
   view = null;
+  load();
+}
+function setPredict(m) {
+  predictMin = PREDICT_WINDOWS.includes(Number(m)) ? Number(m) : 10;
+  store.set('pulse.predict', String(predictMin));
   load();
 }
 function setCompare(m) {

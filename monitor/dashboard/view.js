@@ -188,6 +188,19 @@ export function persistence(series, kind, settledAt, minutes = 30, { minExp = 10
   const verdict = ci[0] > 0 ? 'carry' : ci[1] < 0 ? 'reverse' : 'none';
   return { minutes, windows: all.length, pairs: n, r, ci, spread, verdict, points: pairs };
 }
+/** Window sizes the "does one window predict the next?" check offers, in minutes. */
+export const PREDICT_WINDOWS = [5, 10, 15, 30, 60];
+/** Short windows hold few rows; below this many expected wins or hits a window is left out. */
+export const PREDICT_MIN_EXP = 3;
+
+/** monitor_window_sums rows ({bucket, kind, n, obs, exp, v}) in the shape persistence() reads. */
+export function sumsToSeries(rows) {
+  return (rows ?? []).map((r) =>
+    r.kind === 'upgrade'
+      ? { bucket: Number(r.bucket), kind: 'upgrade', nw: n0(r.n), w: n0(r.obs), ea: n0(r.exp), va: n0(r.v) }
+      : { bucket: Number(r.bucket), kind: r.kind, nh: n0(r.n), h: n0(r.obs), eh: n0(r.exp), vh: n0(r.v) });
+}
+
 function normCdf(z) {
   const x = Math.abs(z) / Math.SQRT2;
   const t = 1 / (1 + 0.3275911 * x);
@@ -260,13 +273,14 @@ export function dailyPattern(week) {
  * @param {any} o.report    monitor_report over the range, per window
  * @param {any} o.cmp       monitor_report over compareSpec(now) (5-minute buckets)
  * @param {any} [o.week]    monitor_report over the last 7 days in 30-minute buckets (self-check, lookup, day by day)
+ * @param {{minutes: number, rows: any[]}} [o.predict]  monitor_window_sums over the last 7 days in windows of `minutes`
  * @param {any[]} o.volume  monitor_volume_agg over the range, per coarse bucket
  * @param {any[]} o.volRecent  monitor_volume_agg over the compared recent part
  * @param {any[]} o.volBase    monitor_volume_agg over the part before it
  * @param {ReturnType<typeof rangeSpec>} o.spec
  * @param {number} o.now
  */
-export function buildReport({ report, cmp, week = null, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
+export function buildReport({ report, cmp, week = null, predict = null, heatReport = null, compareMinutes = 60, volume = [], volRecent = [], volBase = [], spec, now }) {
   const series = (report?.series ?? []).map(cleanRow);
   const settled = settledAt(report?.lag ?? cmp?.lag, now);
   const out = { now, spec, settled, kinds: {}, compare: {}, compareMoney: {}, glance: {}, heat: {}, hours: {}, totals: {}, excluded: {} };
@@ -427,6 +441,12 @@ export function buildReport({ report, cmp, week = null, heatReport = null, compa
   // Does a window predict the next one? And the 7-day lookup and day-by-day pattern.
   out.persistence = {};
   for (const kind of KINDS) out.persistence[kind] = { 30: persistence(week?.series, kind, settled.at, 30), 60: persistence(week?.series, kind, settled.at, 60) };
+  // The same check at the window size picked on the page, from monitor_window_sums.
+  if (predict) {
+    const rows = sumsToSeries(predict.rows);
+    out.predict = { minutes: predict.minutes };
+    for (const kind of KINDS) out.predict[kind] = persistence(rows, kind, settled.at, predict.minutes, { minExp: PREDICT_MIN_EXP });
+  }
   out.week = week;
   out.daily = dailyPattern(week);
   return out;

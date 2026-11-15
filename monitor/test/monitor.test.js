@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, STEP, DEFAULT_LAG } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, STEP, DEFAULT_LAG } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -626,6 +626,13 @@ test('dashboard view: whether a window predicts the next, a situation lookup, an
   const now = start + 61 * H;
   const v = buildReport({ report: { lag: { rows: 500, p50: 60000, p80: 60000 } }, cmp: {}, week: { ...week, series: alt }, compareMinutes: 30, spec: rangeSpec('1h', now, 2), now });
   assert.equal(v.persistence.upgrade[30].verdict, 'reverse');
+  // The check at a picked window size, from monitor_window_sums rows.
+  const sums = alt.map((r) => ({ bucket: String(r.bucket), kind: 'upgrade', n: '100', obs: r.w, exp: 20, v: 16 }));
+  const vp = buildReport({ report: { lag: { rows: 500, p50: 60000, p80: 60000 } }, cmp: {}, predict: { minutes: 30, rows: sums }, compareMinutes: 30, spec: rangeSpec('1h', now, 2), now });
+  assert.equal(vp.predict.minutes, 30);
+  assert.equal(vp.predict.upgrade.verdict, 'reverse');
+  assert.equal(vp.predict.case.verdict, 'few');
+  assert.deepEqual(sumsToSeries([{ bucket: '5', kind: 'case', n: 4, obs: 2, exp: 1.5, v: 1 }]), [{ bucket: 5, kind: 'case', nh: 4, h: 2, eh: 1.5, vh: 1 }]);
   assert.equal(v.persistence.case[30].verdict, 'few');
   assert.equal(v.daily.length, 2);
   assert.equal(v.week, v.week);
