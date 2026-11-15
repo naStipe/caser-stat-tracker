@@ -52,6 +52,14 @@ Sections:
 - **does the last 30 minutes predict the next?**: every settled window of the last 7 days against the one after it,
   as a scatter with the correlation and its 95% range. A round cloud means "right now" says nothing about the next
   half hour (that is what the first days of data show);
+- **does the whole site shift together?**: over 7 or 30 days in windows of 30 minutes to a day, whether different
+  players in the same window are lucky or unlucky together, which is what a site-wide change of the odds would cause.
+  Each window's spread is split into the part players share and the part inside each player
+  (`monitor_shared`, from the kept half-hour totals, so the 30-day range keeps filling). It shows the size of the
+  shared swing or an upper bound on it, and whether players do better after a window in which the site earned more.
+  Below that, the account's own deposits (from the synced history): wins against the shown chance in the 5 minutes
+  after each, split by how other players did in the half hour before and by the drop line's gold share in the 15
+  minutes before;
 - **look up a situation**: pick a shown-chance band and a time into the session to see the last 7 days' return per
   1 (95% range clustered by player), win rate and wins against the shown chance. The monitor cannot see deposits,
   so a session here starts after 20 minutes without play; in the account's own history the boost follows every
@@ -110,6 +118,23 @@ normal said nothing about the next one: the correlation between consecutive wind
 pairs) and −0.07 (1 hour, 49 pairs), and windows swung by 1.10 and 1.13 standard errors, where pure chance gives
 1.00. That is only the first 1.5 days of data, enough to rule out a large effect, not a small one; the dashboard's
 "Does the last 30 minutes predict the next?" section keeps checking.
+
+**Players are not lucky or unlucky together.** If the site lowered or raised the odds for everyone at times, players
+in the same window would share it. Over 7 to 15 November (81,000 upgrades from about 1,350 players, rows next to a
+discovery left out), the part of each window's spread that different players share was zero within noise at every
+window size from 30 minutes to a day, while each player's own results clustered (1.36 to 1.61 times the spread chance
+gives). A shared swing in the upgrade win rate of more than about 4.5% (1 standard deviation) at 30 minutes to 1 hour
+is ruled out. The site's margin in a window did not predict players' luck in the next (correlation −0.06 at 30
+minutes, −0.04 at 1 hour). Day by day the index against normal stayed between 0.98 and 1.04 for upgrades and 0.95
+and 1.08 for cases, each inside its range, while return per 1 swung from 0.95 to 1.58 on a few big wins. At about
+32,000 upgrades a day, ruling out a 2% hourly swing takes about 5 more weeks, a 1% day-to-day swing about 3 to 4.
+
+**What came before a deposit does not change the boost after it.** Over the account's 56 deposits from 8 to 15
+November, its wins against the shown chance in the 5 minutes after a deposit were 1.11 when other players had been
+winning in the half hour before (index 1.05 and up, 16 deposits), 1.14 when they were as usual (20) and 1.02 when
+they had been losing (20): within chance, correlation −0.10. The drop line's colours have been counted only since
+15 November, so the gold share before a deposit is not tested yet; gold is about half of the line most of the time.
+The dashboard's "Does the whole site shift together?" section keeps checking both.
 
 What this adds up to: the only pattern found is tied to the player's own deposits, not to the time of day or to
 how the site is treating everyone right now, and even at its best it loses money. That is what a mechanism made to
@@ -225,7 +250,9 @@ Tables and functions: `supabase/migrations/*_monitor*.sql` in the parent folder 
 - `monitor_rows`, `monitor_volume`, `monitor_feed`, `monitor_status`, `monitor_events`: written only by the monitor, with the
   project's **secret key** (it bypasses row level security, so it stays on the server, in `.env`).
 - `monitor_viewers`: Supabase Auth users allowed to read. Everyone else, signed in or not, reads nothing.
-- `monitor_report`, `monitor_volume_agg`, `monitor_feed_agg`: what the dashboard reads, for viewers only.
+- `monitor_report`, `monitor_volume_agg`, `monitor_feed_agg`, `monitor_window_sums`, `monitor_shared`: what the
+  dashboard reads, for viewers only. `monitor_shared` also reads the owner's synced deposits and upgrades
+  (`sync_events`) and returns only counts per deposit.
 - `monitor_private`, `monitor_watchdog`, `monitor_send_alert`: the alert URL and the watchdog; no one else can
   read or call them.
 - `monitor_derive`, `monitor_cal`, `monitor_derive_state`: the every-minute job that fills each row's session phase

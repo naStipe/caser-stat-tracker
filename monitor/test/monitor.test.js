@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, feedTier, feedItems, feedSample, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, STEP, DEFAULT_LAG } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, sharedShift, depositCheck, STEP, DEFAULT_LAG } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -694,6 +694,60 @@ test('dashboard view: whether a window predicts the next, a situation lookup, an
   assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.1, index: 1.5 }).strength, 'strong');
   assert.equal(againstNormal({ n: 100, obs: 30, exp: 20, se: 0.2, index: 1.5 }).strength, 'mild');
   assert.equal(againstNormal({ n: 100, obs: 24, exp: 20, se: 0.2, index: 1.2 }).strength, 'noise');
+});
+
+test('dashboard view: whether the whole site shifts together, and the own deposits by what came before', () => {
+  const H = 60 * 60000;
+  const start = Date.parse('2026-11-10T00:00:00Z');
+  const noise = (i) => { const x = Math.sin(i * 12.9898 + 4.1) * 43758.5453; return x - Math.floor(x) - 0.5; };
+  // 40 windows of 20 players, 100 expected wins each. No shared shift: cross products of different players
+  // scatter around 0, while players cluster on their own (ww 1.4 times v).
+  const win = (i, xc, extra = {}) => ({ bucket: String(start + i * H), kind: 'upgrade', n: 500, players: 20, obs: 100 + 10 * noise(i), exp: '100', v: 80, xc, xe: 9500, ww: 112, x: 1000, y: 970, ...extra });
+  const none = Array.from({ length: 40 }, (_, i) => win(i, 400 * noise(i + 7)));
+  const s = sharedShift(none, 'upgrade', { bucketMs: H, settledAt: start + 40 * H });
+  assert.equal(s.windows, 40);
+  assert.equal(s.verdict, 'none');
+  assert.ok(Math.abs(s.within - 1.4) < 1e-9);
+  assert.ok(s.upper > 0 && s.upper < 0.1, 'an upper bound on the shared swing');
+  // Everyone in a window shifted by about 5%: xc averages 0.0025 * xe.
+  const shared = Array.from({ length: 40 }, (_, i) => win(i, 0.0025 * 9500 + 100 * noise(i + 3)));
+  const t = sharedShift(shared, 'upgrade', { bucketMs: H, settledAt: start + 40 * H });
+  assert.equal(t.verdict, 'shared');
+  assert.ok(Math.abs(t.sd - 0.05) < 0.01);
+  // Windows still arriving and thin windows are left out; under 20 windows says so.
+  assert.equal(sharedShift(none, 'upgrade', { bucketMs: H, settledAt: start + 10 * H }).verdict, 'few');
+  assert.equal(sharedShift([win(0, 0, { v: 2 })], 'upgrade', { bucketMs: H, settledAt: start + 40 * H }).windows, 0);
+  assert.equal(sharedShift(none, 'case', { bucketMs: H, settledAt: start + 40 * H }).windows, 0);
+  // The site gives back: a window where it earned more is followed by one where players win more.
+  const give = Array.from({ length: 40 }, (_, i) => win(i, 0, { y: 1000 - 100 * noise(i), obs: 100 + 100 * noise(i - 1) }));
+  assert.equal(sharedShift(give, 'upgrade', { bucketMs: H, settledAt: start + 40 * H }).payback.verdict, 'gives');
+  assert.equal(s.payback.n, 39);
+
+  // Own deposits: other players hot or cold before, drop line gold share before.
+  const dep = (i, w, extra) => ({ ts: start + i * H, n: 10, w, e: '2', v: 1.6, ...extra });
+  const deps = [
+    ...Array.from({ length: 6 }, (_, i) => dep(i, 3, { siteW: 60, siteE: 50, seen: 20, gold: 15 })),
+    ...Array.from({ length: 6 }, (_, i) => dep(10 + i, 2, { siteW: 50, siteE: 50, seen: 20, gold: 10 })),
+    ...Array.from({ length: 6 }, (_, i) => dep(20 + i, 1 + (i % 2), { siteW: 40, siteE: 50, seen: 20, gold: 5 })),
+    dep(30, 2, { siteW: null, siteE: null, seen: 3, gold: 3 }),
+    dep(31, 0, { n: 0, e: 0 }),
+  ];
+  const c = depositCheck(deps);
+  assert.equal(c.all.deposits, 19, 'deposits with no upgrades after them are left out');
+  assert.equal(c.all.obs, 41);
+  assert.equal(c.site.deposits, 18);
+  assert.deepEqual(c.site.groups.map((g) => g.deposits), [6, 6, 6]);
+  assert.equal(c.site.groups[0].index, 1.5);
+  assert.equal(c.site.groups[2].index, 0.75);
+  assert.ok(c.site.z > 2);
+  assert.deepEqual(c.gold.groups.map((g) => g.deposits), [6, 6, 6], 'thirds by gold share; under 10 drops seen is not judged');
+  assert.equal(c.gold.groups[0].from, 0.75);
+  assert.equal(c.gold.groups[0].index, 1.5, 'most gold first');
+  assert.equal(c.gold.groups[2].to, 0.25);
+  assert.deepEqual(depositCheck(deps.slice(0, 7)).gold.groups.map((g) => g.deposits), [2, 3, 2]);
+  assert.equal(c.gold.meanGold, 0.5);
+  assert.ok(c.site.groups[2].se >= Math.sqrt(6 * 1.6) / 12, 'never below the binomial error');
+  assert.equal(depositCheck([]).all.index, null);
 });
 
 test('stats: win and hit index with a binomial range, and its comparison', () => {

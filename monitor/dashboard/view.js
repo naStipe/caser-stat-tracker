@@ -206,6 +206,131 @@ export function sumsToSeries(rows) {
       : { bucket: Number(r.bucket), kind: r.kind, nh: n0(r.n), h: n0(r.obs), eh: n0(r.exp), vh: n0(r.v) });
 }
 
+/** Window sizes (minutes) and ranges (days) the "does the whole site shift together?" check offers. */
+export const SHARED_WINDOWS = [30, 60, 180, 360, 1440];
+export const SHARED_DAYS = [7, 30];
+/** Windows with less variance than this (about 5 expected wins or hits) are left out. */
+const SHARED_MIN_V = 5;
+
+/** Pearson correlation of pairs with a 95% range through Fisher's z, or nulls under 20 pairs. */
+function correlation(pairs) {
+  const n = pairs.length;
+  if (n < 20) return { n, r: null, ci: null };
+  const mx = pairs.reduce((t, p) => t + p[0], 0) / n;
+  const my = pairs.reduce((t, p) => t + p[1], 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (const [x, y] of pairs) {
+    sxy += (x - mx) * (y - my);
+    sxx += (x - mx) ** 2;
+    syy += (y - my) ** 2;
+  }
+  const r = sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0;
+  const fz = Math.atanh(Math.max(-0.999999, Math.min(0.999999, r)));
+  const half = 1.959964 / Math.sqrt(n - 3);
+  return { n, r, ci: [Math.tanh(fz - half), Math.tanh(fz + half)] };
+}
+
+/**
+ * Does the whole site shift together? From monitor_shared windows (per window: obs, exp, v, and xc, xe, ww).
+ * If the site raised or lowered the odds for everyone at times, different players in one window would be lucky
+ * or unlucky together. xc holds only the products of different players' residuals, so it averages 0 without a
+ * shared shift, and tau^2 * xe with a relative shift of standard deviation tau common to everyone in a window:
+ *   tau2 = sum(xc) / sum(xe), its standard error from the spread of xc - tau2 * xe across windows.
+ * within = sum(ww) / sum(v): how much players' own results cluster inside a window (1 = not at all).
+ * spread = mean of z^2 per window (1 = pure chance), which mixes both.
+ * payback: the site's margin in a window ((staked - returned) / staked) against the next window's z. Positive
+ * means the site gives back after it earned; negative means it keeps taking.
+ * verdict: 'few' (under 20 windows) | 'shared' (tau2 clearly above 0) | 'none'.
+ */
+export function sharedShift(windows, kind, { bucketMs, settledAt }) {
+  const rows = [];
+  for (const raw of windows ?? []) {
+    if (raw.kind !== kind) continue;
+    const r = cleanRow(raw);
+    if (r.bucket + bucketMs > settledAt || !(r.v >= SHARED_MIN_V) || !(r.exp > 0)) continue;
+    rows.push(r);
+  }
+  rows.sort((a, b) => a.bucket - b.bucket);
+  const k = rows.length;
+  const sum = (f) => rows.reduce((t, r) => t + f(r), 0);
+  const sxe = sum((r) => r.xe);
+  const tau2 = k && sxe > 0 ? sum((r) => r.xc) / sxe : null;
+  const se = tau2 != null && k > 1 ? Math.sqrt(sum((r) => (r.xc - tau2 * r.xe) ** 2)) / sxe : null;
+  const within = k ? sum((r) => r.ww) / sum((r) => r.v) : null;
+  const spread = k ? sum((r) => (r.obs - r.exp) ** 2 / r.v) / k : null;
+  // A negative tau2 is noise (or the normal rates being fitted on the same rows), not a sign of less than no shared
+  // shift, so it counts as 0 for the bound; otherwise a lucky draw would claim a tighter bound than the data gives.
+  const upper = tau2 != null && se != null ? Math.sqrt(Math.max(0, tau2) + 1.959964 * se) : null;
+  const sd = tau2 != null ? Math.sqrt(Math.max(0, tau2)) : null;
+  const byStart = new Map(rows.map((r) => [r.bucket, r]));
+  const pairs = [];
+  for (const r of rows) {
+    const next = byStart.get(r.bucket + bucketMs);
+    if (next && r.x > 0) pairs.push([(r.x - r.y) / r.x, (next.obs - next.exp) / Math.sqrt(next.v)]);
+  }
+  const payback = correlation(pairs);
+  const verdict = k < 20 || se == null ? 'few' : tau2 - 1.959964 * se > 0 ? 'shared' : 'none';
+  return {
+    windows: k, rows: sum((r) => r.n), players: k ? sum((r) => r.players) / k : null,
+    tau2, se, sd, upper, within, spread, verdict,
+    payback: { ...payback, verdict: payback.r == null ? 'few' : payback.ci[0] > 0 ? 'gives' : payback.ci[1] < 0 ? 'takes' : 'none' },
+  };
+}
+
+/** Wins against the shown chance over a set of deposits, with a standard error clustered by deposit. */
+function depositIndex(list) {
+  const obs = list.reduce((t, d) => t + d.w, 0);
+  const exp = list.reduce((t, d) => t + d.e, 0);
+  const n = list.reduce((t, d) => t + d.n, 0);
+  if (!(exp > 0)) return { deposits: list.length, n, obs, exp, index: null, se: null, ci: null };
+  const index = obs / exp;
+  const k = list.length;
+  // A player's wins right after one deposit cluster, so the plain binomial error would be too small.
+  const clustered = k >= 5 ? Math.sqrt((list.reduce((t, d) => t + (d.w - index * d.e) ** 2, 0) * k) / (k - 1)) / exp : null;
+  const binomial = Math.sqrt(list.reduce((t, d) => t + d.v, 0)) / exp;
+  const se = Math.max(clustered ?? 0, binomial);
+  return { deposits: k, n, obs, exp, index, se, ci: [Math.max(0, index - 1.959964 * se), index + 1.959964 * se] };
+}
+
+/** First group against last group, in standard errors. */
+const groupZ = (a, b) => (a.se > 0 && b.se > 0 && a.index != null && b.index != null && a.deposits >= 5 && b.deposits >= 5
+  ? (a.index - b.index) / Math.sqrt(a.se ** 2 + b.se ** 2) : null);
+
+/** Gold share of the drop line in the 15 minutes before a deposit: these many drops seen are needed to judge it. */
+export const DEPOSIT_MIN_SEEN = 10;
+
+/**
+ * The owner's own deposits (monitor_shared.deposits): wins against the shown chance in the 5 minutes after each,
+ * split by how other players did in the half hour before it (wins against normal) and by the drop line's gold
+ * share in the 15 minutes before it. If the site loosened the odds for everyone at times, deposits made while
+ * others were winning, or while the line was full of gold, would show a bigger boost.
+ */
+export function depositCheck(deposits) {
+  const list = (deposits ?? []).map(cleanRow).filter((d) => d.n > 0 && d.e > 0);
+  const withSite = list.filter((d) => d.siteE >= 20);
+  const siteIx = (d) => d.siteW / d.siteE;
+  const site = [
+    { key: 'hot', label: 'Others winning (1.05 and up)', ...depositIndex(withSite.filter((d) => siteIx(d) >= 1.05)) },
+    { key: 'mid', label: 'Others as usual (0.95–1.05)', ...depositIndex(withSite.filter((d) => siteIx(d) >= 0.95 && siteIx(d) < 1.05)) },
+    { key: 'cold', label: 'Others losing (under 0.95)', ...depositIndex(withSite.filter((d) => siteIx(d) < 0.95)) },
+  ];
+  // Gold sits near half of the line almost all the time, so fixed cut-offs would put nearly every deposit in one
+  // group: split the deposits into thirds by their gold share instead, most gold first.
+  const share = (d) => d.gold / d.seen;
+  const withFeed = list.filter((d) => d.seen >= DEPOSIT_MIN_SEEN).sort((a, b) => share(b) - share(a));
+  const third = (i) => withFeed.slice(Math.round((i * withFeed.length) / 3), Math.round(((i + 1) * withFeed.length) / 3));
+  const gold = ['Most gold', 'Middle', 'Least gold'].map((label, i) => {
+    const part = third(i);
+    return { key: ['hot', 'mid', 'cold'][i], label, from: part.length ? share(part.at(-1)) : null, to: part.length ? share(part[0]) : null, ...depositIndex(part) };
+  });
+  const meanGold = withFeed.length ? withFeed.reduce((t, d) => t + share(d), 0) / withFeed.length : null;
+  return {
+    all: depositIndex(list),
+    site: { groups: site, z: groupZ(site[0], site[2]), corr: correlation(withSite.map((d) => [siteIx(d), d.w / d.e])), deposits: withSite.length },
+    gold: { groups: gold, z: groupZ(gold[0], gold[2]), corr: correlation(withFeed.map((d) => [share(d), d.w / d.e])), deposits: withFeed.length, meanGold },
+  };
+}
+
 function normCdf(z) {
   const x = Math.abs(z) / Math.SQRT2;
   const t = 1 / (1 + 0.3275911 * x);

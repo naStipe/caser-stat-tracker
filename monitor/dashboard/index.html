@@ -130,7 +130,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, SHARED_WINDOWS, SHARED_DAYS, sharedShift, depositCheck, DEPOSIT_MIN_SEEN, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -168,6 +168,10 @@ let pickBand = store.get('pulse.band', 'b');
 let pickPhase = Number(store.get('pulse.phase', 1));
 let predictMin = PREDICT_WINDOWS.includes(Number(store.get('pulse.predict', 10))) ? Number(store.get('pulse.predict', 10)) : 10;
 const predictCache = new Map(); // window minutes -> {at, rows} from monitor_window_sums, reused for 10 minutes
+let sharedMin = SHARED_WINDOWS.includes(Number(store.get('pulse.shared.win', 60))) ? Number(store.get('pulse.shared.win', 60)) : 60;
+let sharedDays = SHARED_DAYS.includes(Number(store.get('pulse.shared.days', 30))) ? Number(store.get('pulse.shared.days', 30)) : 30;
+const sharedCache = new Map(); // `${days}/${minutes}` -> {at, data} from monitor_shared, reused for 10 minutes
+let sharedError = null;
 const metric = {};
 for (const k of KINDS) { const m = store.get(`pulse.metric.${k}`, 'index'); metric[k] = METRICS[k].some(([v]) => v === m) ? m : 'index'; }
 let heatKind = store.get('pulse.heat', 'upgrade');
@@ -571,6 +575,58 @@ function persistenceChart({ kind, width }) {
   return h('div', null, h('h3', { text: NAMES[kind][0] }), h('div', { class: 'chart' }, svg), h('div', { class: 'faint small-text', text }));
 }
 
+/** Does the whole site shift together? Players' luck in the same windows, and the own deposits by what came before. */
+function sharedSection() {
+  const key = `${sharedDays}/${sharedMin}`;
+  const c = sharedCache.get(key);
+  const head = h('div', { class: 'sec-head' }, h('h2', { text: 'Does the whole site shift together?' }),
+    h('div', { class: 'row', style: 'gap:6px 12px' },
+      toggle(SHARED_DAYS.map((d) => [d, `${d} d`, `Last ${d} days`]), sharedDays, setSharedDays, 'Range'),
+      toggle(SHARED_WINDOWS.map((m) => [m, m >= 1440 ? '1 day' : m >= 60 ? `${m / 60} h` : `${m} min`, `${m}-minute windows`]), sharedMin, setSharedMin, 'Window')));
+  if (!c) return h('section', null, head, h('p', { class: sharedError ? 'error' : 'faint', text: sharedError ? `Could not load this check: ${sharedError}` : 'Loading…' }));
+  const settled = view?.settled?.at ?? Date.now();
+  const win = sharedMin >= 1440 ? 'day' : sharedMin >= 60 ? `${sharedMin / 60}-hour window` : `${sharedMin}-minute window`;
+  const pctOf = (v) => (ok(v) ? `${fmt(v * 100, 1)}%` : DASH);
+  const kindBlock = (kind) => {
+    const r = sharedShift(c.data.windows, kind, { bucketMs: sharedMin * 60000, settledAt: settled });
+    const word = r.verdict === 'few' ? 'Not enough windows yet'
+      : r.verdict === 'shared' ? 'Yes: players win and lose together'
+      : 'No shared shift found';
+    const detail = r.verdict === 'few'
+      ? `${fmtInt(r.windows)} settled windows; needs 20.`
+      : r.verdict === 'shared'
+        ? `Players in the same ${win} moved together by about ${pctOf(r.sd)} (1 standard deviation of the shared part), clearly more than chance allows.`
+        : `The part players share in a ${win} ${ok(r.tau2) && r.tau2 > 0 ? `comes out at about ${pctOf(r.sd)}, which chance alone can give` : 'is zero within noise'}. A site-wide swing of ${pctOf(r.upper)} or more (1 standard deviation) would have shown up; smaller ones cannot be ruled out yet.`;
+    const pb = r.payback;
+    const payText = pb.verdict === 'few'
+      ? `Gives back after earning? ${fmtInt(pb.n)} pairs of windows so far; needs 20.`
+      : `Gives back after earning? Correlation of the site’s margin in a window with players’ luck in the next: ${signed(pb.r)} (95% range ${signed(pb.ci[0])} to ${signed(pb.ci[1])}). ${pb.verdict === 'gives' ? 'Players do better after the site earned more.' : pb.verdict === 'takes' ? 'Players do worse after the site earned more.' : 'No link found.'}`;
+    return h('div', null, h('h3', { text: NAMES[kind][0] }),
+      h('div', { class: ['headline', r.verdict === 'shared' ? 'warn-text' : ''], style: 'font-size:15px;margin:2px 0 6px', text: word }),
+      h('div', { class: 'muted', text: detail }),
+      r.verdict === 'few' ? null : h('div', { class: 'faint small-text', style: 'margin-top:6px', text: `${fmtInt(r.windows)} windows, about ${fmtInt(r.players)} players each. Spread of each player’s own results inside a window: ${fmt2(r.within)} times what chance gives (1.00 = none). Spread of whole windows: ${fmt2(r.spread)}.` }),
+      h('div', { class: 'faint small-text', style: 'margin-top:6px', text: payText }));
+  };
+  const d = depositCheck(c.data.deposits);
+  const zText = (z) => (ok(z) ? `First against last group: ${z > 0 ? '+' : ''}${fmt(z, 1)} standard errors${Math.abs(z) < 2 ? ', within chance' : ''}.` : 'Too few deposits in the first or last group to compare.');
+  const depRows = (groups) => groups.map((g) => h('tr', null, h('td', null, g.label, ok(g.from) && g.deposits ? h('span', { class: 'ci', text: `${pct(g.from, 0) === pct(g.to, 0) ? pct(g.from, 0) : `${pct(g.from, 0)}–${pct(g.to, 0)}`} gold` }) : null), h('td', { class: 'num', text: fmtInt(g.deposits) }), h('td', { class: 'num', text: fmtInt(g.n) }), ixCell(g)));
+  const ownAll = d.all.index != null
+    ? `Over all ${fmtInt(d.all.deposits)} deposits in the range, your normal upgrades in the 5 minutes after a deposit won ${fmt2(d.all.index)} times the shown chance (95% range ${fmt2(d.all.ci[0])}–${fmt2(d.all.ci[1])}, ${fmtInt(d.all.n)} upgrades).`
+    : 'No deposits with upgrades after them in this range yet.';
+  return h('section', null, head,
+    h('div', { class: 'split' }, kindBlock('upgrade'), kindBlock('case')),
+    h('p', { class: 'hint', text: `If the site lowered or raised the odds for everyone at times, different players in the same ${win} would be lucky or unlucky together. Each window’s spread is split into the part players share (only products of different players’ results count, so it averages zero when they are independent) and the part inside each player. Against normal: upgrade wins against the usual rate for the chance band and session phase, case hits against each case’s usual rate. From the running half-hour totals, which are kept, so a longer range keeps adding data; windows still arriving are left out.` }),
+    h('h3', { class: 'muted small-text', style: 'margin:16px 0 4px;font-weight:600', text: 'Your deposits: does what happens before a deposit change the boost after it?' }),
+    h('p', { class: 'muted', style: 'margin:0 0 8px', text: ownAll }),
+    d.site.deposits ? tableOf(['Other players, 30 min before the deposit', 'Deposits', 'Upgrades', 'Your wins vs shown, first 5 min'], depRows(d.site.groups)) : h('p', { class: 'faint', text: 'No deposits while the monitor was collecting yet.' }),
+    d.site.deposits ? h('div', { class: 'faint small-text', style: 'margin-top:4px', text: `${zText(d.site.z)}${ok(d.site.corr.r) ? ` Correlation ${signed(d.site.corr.r)} (95% range ${signed(d.site.corr.ci[0])} to ${signed(d.site.corr.ci[1])}).` : ''}` }) : null,
+    d.gold.deposits
+      ? h('div', { style: 'margin-top:14px' }, tableOf(['Drop line, 15 min before the deposit', 'Deposits', 'Upgrades', 'Your wins vs shown, first 5 min'], depRows(d.gold.groups)))
+      : h('p', { class: 'faint', style: 'margin-top:10px', text: `No deposits yet with ${DEPOSIT_MIN_SEEN} or more drop-line drops seen in the 15 minutes before (the monitor began counting colours on 15 November).` }),
+    d.gold.deposits ? h('div', { class: 'faint small-text', style: 'margin-top:4px', text: `${zText(d.gold.z)} Gold was ${pctOf(d.gold.meanGold)} of the line before an average deposit.` }) : null,
+    h('p', { class: 'hint', text: 'From your own synced history: completed deposits, and your normal upgrades (no mystery, no super drop) in the 5 minutes after each, until the next deposit. “Other players” is their upgrade wins against normal in the whole half hour before the deposit. If the site loosened the odds for everyone at times, deposits made while others were winning, or while the line was full of gold, would show a bigger boost than the rest. Errors are clustered by deposit. Gold is about half of the line most of the time, since the line shows only big wins.' }));
+}
+
 /** The last 7 days for a chosen shown chance and time into the session. */
 function situationSection() {
   const st = situation(view.week, pickBand, pickPhase);
@@ -807,6 +863,7 @@ function nowTab(v, width) {
       toggle(PREDICT_WINDOWS.map((m) => [m, m >= 60 ? '1 h' : `${m} min`, `${m}-minute windows`]), predictMin, setPredict, 'Window')),
     h('div', { class: 'split' }, persistenceChart({ kind: 'upgrade', width: gw - 34 }), persistenceChart({ kind: 'case', width: gw - 34 })),
     h('p', { class: 'hint', text: `Each dot is one ${pm}-minute window of the last 7 days (x) against the one right after it (y), both as how far from normal they were in standard errors. If good windows were followed by good ones, the dots would lean along a rising line. A round cloud and a flat line mean checking “right now” tells you nothing about the next ${pm} minutes. Short windows hold few rows (windows with under 3 expected wins or hits are left out), so each dot is noisier, but there are more of them. A small positive value for upgrades can also come from the same players in both windows: the monitor does not see top-up deposits, so a player’s own boost after one shows up in two windows in a row.` })));
+  out.push(sharedSection());
   out.push(situationSection());
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does the pattern hold day by day?' })),
     dailyChart({ width }),
@@ -1151,6 +1208,46 @@ async function load() {
   }
   loading = false;
   renderDashboard();
+  if (view) loadShared();
+}
+
+/** The site-shift check reads up to 30 days, so it loads on its own and does not hold up the rest of the page. */
+let sharedLoading = false;
+async function loadShared() {
+  const key = `${sharedDays}/${sharedMin}`;
+  const c = sharedCache.get(key);
+  if (sharedLoading || (c && Date.now() - c.at < 10 * 60 * 1000)) return;
+  sharedLoading = true;
+  try {
+    const now = Date.now();
+    const to = Math.floor(now / (30 * 60000)) * 30 * 60000;
+    const args = { from_ms: to - sharedDays * 24 * HOUR, to_ms: to, bucket_ms: sharedMin * 60000 };
+    // A first read of 30 days can take several seconds while the database loads the synced history from disk;
+    // the second try finds it in memory.
+    const data = await rpc('monitor_shared', args).catch((e) => (/timeout/i.test(e?.message ?? '') ? rpc('monitor_shared', args) : Promise.reject(e)));
+    sharedCache.set(key, { at: now, data });
+    sharedError = null;
+  } catch (e) {
+    sharedError = e.message || String(e);
+  }
+  sharedLoading = false;
+  if (tab === 'now') renderDashboard();
+  // A toggle pressed while this was loading asks for another key.
+  if (`${sharedDays}/${sharedMin}` !== key) loadShared();
+}
+function setSharedMin(m) {
+  sharedMin = SHARED_WINDOWS.includes(Number(m)) ? Number(m) : 60;
+  store.set('pulse.shared.win', String(sharedMin));
+  sharedError = null;
+  renderDashboard();
+  loadShared();
+}
+function setSharedDays(d) {
+  sharedDays = SHARED_DAYS.includes(Number(d)) ? Number(d) : 30;
+  store.set('pulse.shared.days', String(sharedDays));
+  sharedError = null;
+  renderDashboard();
+  loadShared();
 }
 
 function setRange(k) {
