@@ -41,9 +41,11 @@ export function createCloud({ fetch, url, key }) {
      * fills in columns older versions did not send); a volume sample or feed count already there is left as it is.
      */
     async push(rows, volume, feed = [], snaps = [], hits = []) {
-      if (rows.length) {
+      // Rows marked addOnly (the case-list re-read) never replace a stored row; the rest do.
+      for (const [list, resolution] of [[rows.filter((r) => !r.addOnly), 'merge-duplicates'], [rows.filter((r) => r.addOnly), 'ignore-duplicates']]) {
+        if (!list.length) continue;
         // One request must not hold the same id twice (Postgres refuses to update a row twice).
-        const byId = new Map(rows.map((r) => [r.id, r]));
+        const byId = new Map(list.map((r) => [r.id, r]));
         await insert(
           'monitor_rows',
           'id',
@@ -60,7 +62,7 @@ export function createCloud({ fetch, url, key }) {
             tier: r.tier ?? null,
             won: typeof r.won === 'boolean' ? r.won : null,
           })),
-          'merge-duplicates',
+          resolution,
         );
       }
       if (volume.length) {

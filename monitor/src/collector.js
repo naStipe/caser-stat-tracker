@@ -49,6 +49,7 @@ export const DEFAULTS = {
   statsEveryMs: 60_000,
   casesEveryMs: 6 * HOUR,
   watchEveryMs: 5 * 60 * 1000, // watched cases: their page (opens and chances) read this often
+  rescanPages: 20, // the one-time re-read of case lists: pages per player at most
   profileEveryMs: 90 * 1000, // one list per turn, so each list about every 3 min
   watchMs: 2 * HOUR, // follow time after a player is found
   idleDropMs: 40 * 60 * 1000, // stop following a player with no new rows for this long
@@ -99,6 +100,11 @@ export function fieldNames(body) {
   return out.slice(0, 80);
 }
 const STREAMS = ['upgrade', 'case'];
+// One-time re-read of case lists. Before 16 November 2026 every open of a custom case (made by a player) was dropped,
+// because its price was asked only from the official endpoint. Known players who opened cases in the last
+// `historyMs` get their case list read again, most recent first, keeping only rows of cases outside the site's
+// case list. Their progress is saved, so a restart continues it; a new key would start another one.
+const RESCAN_KEY = 'custom-cases-2026-11-16';
 
 const histJob = (j) => (j && Number.isFinite(j.offset) && j.offset >= 0 ? { offset: j.offset, pages: Number(j.pages) || 0 } : j === null ? null : undefined);
 
@@ -160,6 +166,14 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     pageProbe = initial.pageProbe;
   }
   const triedSlugs = new Set();
+  // Players whose case list is read again: site id -> {offset, pages}, most recent case play first.
+  const rescan = new Map();
+  if (initial.rescanKey === RESCAN_KEY) {
+    for (const [id, job] of initial.rescan ?? []) if (known.has(String(id)) && job && Number.isFinite(job.offset)) rescan.set(String(id), { offset: job.offset, pages: Number(job.pages) || 0 });
+  } else {
+    const since = now() - opt.historyMs;
+    for (const [id] of [...known].filter(([, k]) => k.newest.case >= since).sort((a, b) => b[1].newest.case - a[1].newest.case)) rescan.set(id, { offset: 0, pages: 0 });
+  }
   let turn = 0;
   let profileProbed = !!initial.profileProbed;
   let countersOff = !opt.counterChecks;
@@ -451,6 +465,29 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     return true;
   }
 
+  /**
+   * One page of the one-time case-list re-read (see RESCAN_KEY). Only rows of cases outside the site's case list are
+   * kept, as new rows (not history, so they do not move where a player's discovery is placed), and only added: a row
+   * already stored stays as it is.
+   */
+  async function readRescan() {
+    const [id, job] = rescan.entries().next().value;
+    if (!known.has(id)) {
+      rescan.delete(id);
+      return false;
+    }
+    const cut = now() - opt.historyMs;
+    const u = await hashUser(id);
+    const { parse, len, full } = await readPage(id, u, 'case', job.offset);
+    const all = parse({});
+    const rows = parse({ skip: skips.get(id), back: false }).filter((r) => r.ts >= cut && r.slug && !prices.listed.has(r.slug)).map((r) => ({ ...r, addOnly: true }));
+    await save(rows, true);
+    const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
+    if (full && oldest >= cut && job.pages + 1 < opt.rescanPages) rescan.set(id, { offset: job.offset + len, pages: job.pages + 1 });
+    else rescan.delete(id);
+    return true;
+  }
+
   /** The known player most overdue for a check, with whether they are playing now; null if none is due. */
   function dueRevisit() {
     const t = now();
@@ -593,9 +630,13 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     if (kind === 'hot' || kind === 'revisit') {
       // Players on the site now come first: they are what "right now" is made of.
       const due = dueRevisit();
-      return due && (due.hot || kind === 'revisit') ? revisit(due) : false;
+      if (due?.hot) return revisit(due);
+      // While the case-list re-read runs, it takes the turn of players who are not on the site now.
+      if (kind === 'revisit' && rescan.size && (await readRescan())) return true;
+      return due && kind === 'revisit' ? revisit(due) : false;
     }
     if (kind === 'history') {
+      if (rescan.size && (await readRescan())) return true;
       const job = nextHistory();
       return job ? readHistory(job) : false;
     }
@@ -685,6 +726,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
         pageSize,
         pageProbe,
         profileProbed,
+        rescanKey: RESCAN_KEY,
+        rescan: [...rescan],
       };
     },
     status() {
@@ -703,6 +746,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
         feedEveryMs: feedGap, // current feed interval
         watchedCases: watched.length,
+        rescanLeft: rescan.size, // players whose case list is still to be read again (custom cases)
         counterChecks: !countersOff,
         counterMisses, // counter checks that said "no new play" when the list later showed some
         requestsLastHour: requests.length,

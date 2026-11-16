@@ -300,6 +300,50 @@ test('case watch: the page read gives opens, price and chances; the drop line gi
   assert.equal(c.status().watchedCases, 1, 'a slug that is not one is left out');
 });
 
+test('collector: the one-time case-list re-read adds custom-case rows of recent players, most recent first', async () => {
+  const site = fakeSite();
+  site.feed = { liveDrops: [] };
+  site.inv[42] = [caseRow(30, T0 - 3 * HOUR, 'magnum', 19), caseRow(31, T0 - 2 * HOUR, 'case-mine', 40)];
+  site.inv[43] = [caseRow(40, T0 - HOUR, 'case-mine', 40)];
+  site.inv[44] = [caseRow(50, T0 - 9 * 24 * HOUR, 'case-mine', 40)];
+  const orig = site.getJson;
+  const order = [];
+  site.getJson = async (path) => {
+    const m = path.match(/^\/api\/users\/(\w+)\/inventory\/history/);
+    if (m) order.push(m[1]);
+    if (path === '/api/game/custom-cases/case-mine') return { slug: 'case-mine', price: '25', items: [] };
+    return orig(path);
+  };
+  const known = [
+    { id: '42', seen: T0, revisited: T0, newest: { upgrade: 0, case: T0 - 2 * HOUR }, hist: { upgrade: null, case: null } },
+    { id: '43', seen: T0, revisited: T0, newest: { upgrade: 0, case: T0 - HOUR }, hist: { upgrade: null, case: null } },
+    { id: '44', seen: T0, revisited: T0, newest: { upgrade: 0, case: T0 - 9 * 24 * HOUR }, hist: { upgrade: null, case: null } },
+  ];
+  let t = T0;
+  const saved = [];
+  let budget = 25;
+  const c = createCollector({
+    getJson: async (p) => { if (--budget === 0) c.stop(); return site.getJson(p); },
+    hashUser: async (id) => `h${id}`, saveRows: async (rows) => saved.push(...rows), saveVolume: async () => {},
+    initial: { known }, now: () => t, sleep: async (ms) => { t += ms; },
+    options: { gapMs: 1000, counterChecks: false, revisitStaleMs: 1e12, revisitColdMs: 1e12, revisitMs: 1e12, revisitWarmMs: 1e12, revisitHotMs: 1e12 },
+  });
+  await c.start();
+  assert.deepEqual(order.filter((x, i) => order.indexOf(x) === i).slice(0, 2), ['43', '42'], 'the most recent case player first');
+  assert.ok(!order.includes('44'), 'a player with no case play in the last 7 days is not read');
+  const added = saved.filter((r) => r.addOnly);
+  assert.deepEqual(added.map((r) => r.id).sort(), ['case:31', 'case:40'], 'only custom-case rows, not the listed case');
+  assert.ok(added.every((r) => r.back === false && r.slug === 'case-mine' && r.stake === 25));
+  const st = c.exportState();
+  assert.equal(st.rescanKey, 'custom-cases-2026-11-16');
+  assert.deepEqual(st.rescan, [], 'done');
+  assert.equal(c.status().rescanLeft, 0);
+
+  // A restart with the key set does not start it again.
+  const c2 = createCollector({ getJson: async () => { c2.stop(); return {}; }, hashUser: async (id) => id, saveRows: async () => {}, saveVolume: async () => {}, initial: { known, rescanKey: st.rescanKey, rescan: [] }, now: () => t, sleep: async () => {} });
+  assert.equal(c2.status().rescanLeft, 0);
+});
+
 test('collector: 429 pauses, 401 stops', async () => {
   const site = fakeSite();
   const { c } = harness(site);
@@ -961,14 +1005,14 @@ const quietPlayer = (id, played, revisited, ctr) => ({ id, seen: played, revisit
 test('collector: a quiet player whose counters did not move costs one request; a moved counter reads only its list', async () => {
   const site = pagedSite({ upgrades: 3, cases: 2 });
   site.feed = { liveDrops: [] };
-  const still = run(site, { budget: 4, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 2 })] } });
+  const still = run(site, { budget: 4, initial: { profileProbed: true, rescanKey: 'custom-cases-2026-11-16', known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 2 })] } });
   await still.done;
   assert.equal(site.calls.at(-1), '/api/users/q/stats');
   assert.ok(!site.calls.some((p) => /history/.test(p)), 'no list read');
   assert.equal(still.c.status().counterChecks, true);
 
   site.calls.length = 0;
-  const moved = run(site, { budget: 5, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 1 })] } });
+  const moved = run(site, { budget: 5, initial: { profileProbed: true, rescanKey: 'custom-cases-2026-11-16', known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, { upgrade: 3, case: 1 })] } });
   await moved.done;
   assert.ok(site.calls.some((p) => p.includes('/api/users/q/inventory/history')), 'case list read');
   assert.ok(!site.calls.some((p) => p.includes('public-history')), 'upgrade list not read');
@@ -978,7 +1022,7 @@ test('collector: a quiet player whose counters did not move costs one request; a
 test('collector: the first counter check only sets the base', async () => {
   const site = pagedSite({ upgrades: 3 });
   site.feed = { liveDrops: [] };
-  const { c, done } = run(site, { budget: 5, initial: { profileProbed: true, known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3)] } });
+  const { c, done } = run(site, { budget: 5, initial: { profileProbed: true, rescanKey: 'custom-cases-2026-11-16', known: [quietPlayer('q', T0 - 2 * DAY_MS, T0 - 7 * 3600e3)] } });
   await done;
   assert.ok(site.calls.includes('/api/users/q/stats'));
   assert.ok(!site.calls.some((p) => /history/.test(p)));
@@ -994,7 +1038,7 @@ test('collector: cold tiers by recency, and the most overdue for its tier goes f
     quietPlayer('cold', T0 - 2 * DAY_MS, T0 - 7 * 3600e3, ctr), // 6 h tier, 7 h ago: 1.17 times
     quietPlayer('later', T0 - 10 * DAY_MS, T0 - 20 * 3600e3, ctr), // 24 h tier, not due
   ];
-  const { c, done } = run(site, { budget: 6, initial: { profileProbed: true, known } });
+  const { c, done } = run(site, { budget: 6, initial: { profileProbed: true, rescanKey: 'custom-cases-2026-11-16', known } });
   await done;
   const order = site.calls.filter((p) => p.endsWith('/stats')).map((p) => p.split('/')[3]);
   assert.deepEqual(order, ['cold', 'stale']);

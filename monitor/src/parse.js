@@ -49,6 +49,7 @@ const SHOWN_CHANCE_FACTOR = 1.03;
 export class CasePrices {
   constructor() {
     this.bySlug = new Map();
+    this.listed = new Set(); // slugs from the site's case list (official cases)
   }
   add(c) {
     const o = obj(c);
@@ -57,7 +58,10 @@ export class CasePrices {
   /** /api/game/cases answer. */
   learnList(body) {
     const d = unwrap(body);
-    for (const c of arr(obj(d)?.cases ?? obj(d)?.items ?? d)) this.add(c);
+    for (const c of arr(obj(d)?.cases ?? obj(d)?.items ?? d)) {
+      this.add(c);
+      if (obj(c)?.slug) this.listed.add(String(c.slug));
+    }
   }
   /** /api/game/cases/{slug} answer ({case: {slug, price}}), or /api/game/custom-cases/{slug} ({slug, price}). */
   learnOne(body) {
