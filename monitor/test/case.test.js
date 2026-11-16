@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { caseSlugFrom, caseSpec, caseReport, CASE_RANGES, publishedOdds, watchReport } from '../dashboard/case.js';
+import { caseSlugFrom, caseSpec, caseReport, CASE_RANGES, publishedOdds, watchReport, playerIdFrom } from '../dashboard/case.js';
+
+test('player lookup: the id from a profile link or the id itself', () => {
+  for (const s of ['https://caser.gg/en/profile/824180', 'caser.gg/profile/824180/', 'https://caser.gg/en/profile/824180?tab=x', ' 824180 ']) assert.equal(playerIdFrom(s), '824180', s);
+  assert.equal(playerIdFrom('https://caser.gg/en/cases/case-e180f124'), null);
+  assert.equal(playerIdFrom('abc'), null);
+  assert.equal(playerIdFrom(''), null);
+});
 
 const HOUR = 3600000;
 

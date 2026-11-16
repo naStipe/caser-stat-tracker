@@ -90,6 +90,15 @@ export function createCloud({ fetch, url, key }) {
         })), 'ignore-duplicates');
       }
     },
+    /** The oldest player read the dashboard asked for and the monitor has not finished: {id, player, slug} or null. */
+    async nextFetch() {
+      const list = await call('GET', '/rest/v1/monitor_player_fetch?select=id,player,slug&status=in.(queued,reading)&order=id.asc&limit=1', undefined, undefined, true);
+      return Array.isArray(list) && list.length ? list[0] : null;
+    },
+    /** Progress of a player read. */
+    async updateFetch(id, fields) {
+      await call('PATCH', `/rest/v1/monitor_player_fetch?id=eq.${Number(id)}`, { ...fields, updated_at: new Date().toISOString() }, 'return=minimal');
+    },
     /** Slugs of the cases watched from the dashboard. */
     async watchList() {
       const list = await call('GET', '/rest/v1/monitor_case_watch?select=slug', undefined, undefined, true);

@@ -344,6 +344,42 @@ test('collector: the one-time case-list re-read adds custom-case rows of recent 
   assert.equal(c2.status().rescanLeft, 0);
 });
 
+test('collector: a player read asked for from the dashboard reads their case list and reports progress', async () => {
+  const site = fakeSite();
+  site.feed = { liveDrops: [] };
+  site.inv[77] = [caseRow(60, T0 - 2 * HOUR, 'case-mine', 40), caseRow(61, T0 - HOUR, 'case-mine', 40), caseRow(62, T0 - HOUR, 'magnum', 19), caseRow(63, T0 - 10 * 24 * HOUR, 'case-mine', 40)];
+  const orig = site.getJson;
+  site.getJson = async (path) => {
+    if (path === '/api/game/custom-cases/case-mine') return { slug: 'case-mine', price: '25', items: [] };
+    if (path.startsWith('/api/users/999/')) throw new HttpError(404, path);
+    return orig(path);
+  };
+  const jobs = [{ id: 1, player: '77', slug: 'case-mine' }, { id: 2, player: '999', slug: null }];
+  const updates = [];
+  let t = T0;
+  const saved = [];
+  let budget = 20;
+  const c = createCollector({
+    getJson: async (p) => { if (--budget === 0) c.stop(); return site.getJson(p); },
+    hashUser: async (id) => `h${id}`, saveRows: async (rows) => saved.push(...rows), saveVolume: async () => {},
+    nextFetch: async () => jobs.find((j) => !updates.some((u) => u.id === j.id && (u.status === 'done' || u.status === 'failed'))) ?? null,
+    updateFetch: async (id, fields) => updates.push({ id, ...fields }),
+    now: () => t, sleep: async (ms) => { t += ms; }, options: { gapMs: 1000, fetchCheckMs: 1000 },
+  });
+  await c.start();
+  const done = updates.find((u) => u.id === 1 && u.status === 'done');
+  assert.ok(updates.find((u) => u.id === 1 && u.status === 'reading' && u.u === 'h77'), 'reading, with the hash');
+  assert.ok(done, 'the first read finishes');
+  assert.equal(done.player, null, 'the site id is cleared when done');
+  assert.equal(done.rows, 3, 'rows older than 9 days are not kept');
+  assert.equal(done.matched, 2, 'two opens of the asked case');
+  const mine = saved.filter((r) => r.u === 'h77');
+  assert.ok(mine.every((r) => r.addOnly && r.back === false));
+  const missing = updates.find((u) => u.id === 2 && u.status === 'failed');
+  assert.ok(missing && /no player/.test(missing.message) && missing.player === null, 'an unknown player fails without stopping the monitor');
+  assert.equal(c.status().stopReason, null);
+});
+
 test('collector: 429 pauses, 401 stops', async () => {
   const site = fakeSite();
   const { c } = harness(site);

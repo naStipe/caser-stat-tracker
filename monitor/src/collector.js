@@ -50,6 +50,9 @@ export const DEFAULTS = {
   casesEveryMs: 6 * HOUR,
   watchEveryMs: 5 * 60 * 1000, // watched cases: their page (opens and chances) read this often
   rescanPages: 20, // the one-time re-read of case lists: pages per player at most
+  fetchCheckMs: 30_000, // how often the dashboard's player reads are looked for
+  fetchPages: 100, // a requested player's case list: pages at most
+  fetchKeepMs: 9 * 24 * HOUR, // and rows back to this age (the raw rows' retention)
   profileEveryMs: 90 * 1000, // one list per turn, so each list about every 3 min
   watchMs: 2 * HOUR, // follow time after a player is found
   idleDropMs: 40 * 60 * 1000, // stop following a player with no new rows for this long
@@ -138,9 +141,11 @@ function importKnown(k, t, opt) {
  * @param {() => Promise<string[]>} [o.loadWatch]  slugs of the watched cases (the dashboard's case watch)
  * @param {(snap: any) => Promise<void>} [o.saveCaseSnap]  a watched case's page: total opens, price, items and chances
  * @param {(hits: any[]) => Promise<void>} [o.saveCaseHits]  drop-line drops of a watched case's items worth its price
+ * @param {() => Promise<{id: number, player: string, slug: string|null}|null>} [o.nextFetch]  the oldest player read asked for from the dashboard
+ * @param {(id: number, fields: any) => Promise<void>} [o.updateFetch]  progress of that read
  * @param {Partial<typeof DEFAULTS>} [o.options]
  */
-export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveFeed = async () => {}, loadWatch = async () => [], saveCaseSnap = async () => {}, saveCaseHits = async () => {}, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
+export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveFeed = async () => {}, loadWatch = async () => [], saveCaseSnap = async () => {}, saveCaseHits = async () => {}, nextFetch = async () => null, updateFetch = async () => {}, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
   const prices = new CasePrices();
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
@@ -191,6 +196,9 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
   let watched = [];
   const watchQueue = [];
   const watchHits = new Map(); // slug -> Set of item names
+  // A player read asked for from the dashboard: {id, player, slug, u, offset, pages, rows, matched, oldest}.
+  let fetchJob = null;
+  let lastFetchCheck = -Infinity;
   let pausedUntil = 0;
   let backoff = opt.backoffMs;
   let error = null;
@@ -340,6 +348,64 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
       await saveCaseSnap(snap);
       return;
     }
+  }
+
+  /** Picks up the oldest player read the dashboard asked for (a database read, no site request). */
+  async function checkFetch() {
+    lastFetchCheck = now();
+    let j;
+    try {
+      j = await nextFetch();
+    } catch (e) {
+      event('warn', 'player-read', `Could not look for player reads: ${e.message}`);
+      return;
+    }
+    if (!j) return;
+    if (!/^[0-9]{1,20}$/.test(String(j.player ?? ''))) {
+      await updateFetch(j.id, { status: 'failed', player: null, message: 'Not a player id.' }).catch(() => {});
+      return;
+    }
+    const u = await hashUser(String(j.player));
+    fetchJob = { id: j.id, player: String(j.player), slug: j.slug ?? null, u, offset: 0, pages: 0, rows: 0, matched: 0, oldest: null };
+    await updateFetch(j.id, { status: 'reading', u, pages: 0, rows: 0, matched: 0 });
+  }
+
+  async function finishFetch(status, message) {
+    const j = fetchJob;
+    fetchJob = null;
+    await updateFetch(j.id, { status, player: null, pages: j.pages, rows: j.rows, matched: j.matched, oldest: j.oldest, message });
+  }
+
+  /**
+   * One page of a requested player's case list. Rows go in like the re-read's (only added, as new rows); the list
+   * is read back to `fetchKeepMs` or `fetchPages` pages.
+   */
+  async function readFetchPage() {
+    const j = fetchJob;
+    const cut = now() - opt.fetchKeepMs;
+    let page;
+    try {
+      page = await readPage(j.player, j.u, 'case', j.offset);
+    } catch (e) {
+      // One player the site will not show is not a block of the monitor; a real block refuses the next request too.
+      if (isHttp(e, 400, 403, 404)) {
+        await finishFetch('failed', e.status === 404 || e.status === 400 ? 'The site has no player with this id.' : 'The site refused this player’s history (HTTP 403).');
+        return true;
+      }
+      throw e;
+    }
+    const all = page.parse({});
+    const rows = page.parse({ back: false }).filter((r) => r.ts >= cut).map((r) => ({ ...r, addOnly: true }));
+    await save(rows, true);
+    j.pages++;
+    j.offset += page.len;
+    j.rows += rows.length;
+    j.matched += rows.filter((r) => r.slug === j.slug).length;
+    for (const r of rows) if (j.oldest == null || r.ts < j.oldest) j.oldest = r.ts;
+    const oldest = all.reduce((m, r) => Math.min(m, r.ts), Infinity);
+    if (page.full && oldest >= cut && j.pages < opt.fetchPages) await updateFetch(j.id, { pages: j.pages, rows: j.rows, matched: j.matched, oldest: j.oldest }).catch(() => {});
+    else await finishFetch('done', j.pages >= opt.fetchPages && page.full ? `Stopped after ${j.pages} pages.` : null);
+    return true;
   }
 
   async function readStats() {
@@ -650,6 +716,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     if (t - lastStats >= opt.statsEveryMs) return readStats();
     if (t - lastWatch >= opt.watchEveryMs) await startWatchRound();
     if (watchQueue.length) return readWatched(watchQueue.shift());
+    if (!fetchJob && t - lastFetchCheck >= opt.fetchCheckMs) await checkFetch();
+    if (fetchJob) return readFetchPage();
     if (!profileProbed && known.size) return probeProfile();
     const n = opt.turns.length;
     const start = turn++ % n;
@@ -747,6 +815,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
         feedEveryMs: feedGap, // current feed interval
         watchedCases: watched.length,
         rescanLeft: rescan.size, // players whose case list is still to be read again (custom cases)
+        playerRead: fetchJob ? { pages: fetchJob.pages, rows: fetchJob.rows } : null,
         counterChecks: !countersOff,
         counterMisses, // counter checks that said "no new play" when the list later showed some
         requestsLastHour: requests.length,

@@ -39,6 +39,14 @@ export function caseSlugFrom(text) {
   return /^[A-Za-z0-9_-]{1,200}$/.test(slug) ? slug : null;
 }
 
+/** Player id from a profile link (https://caser.gg/en/profile/824180) or the id itself. Null when it is neither. */
+export function playerIdFrom(text) {
+  const s = String(text ?? '').trim();
+  if (/^[0-9]{1,20}$/.test(s)) return s;
+  const m = s.match(/(?:^|\/)(?:profile|users?)\/([0-9]{1,20})(?:[/?#].*)?$/i);
+  return m ? m[1] : null;
+}
+
 /** Range and window for a lookup, in whole half hours; the current half hour is included. */
 export function caseSpec(key, now) {
   const r = CASE_RANGES[key] ?? CASE_RANGES['7d'];

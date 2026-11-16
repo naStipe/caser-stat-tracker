@@ -160,6 +160,12 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
       if (state.pendingFeed.length > MAX_PENDING_VOLUME) state.pendingFeed = state.pendingFeed.slice(-MAX_PENDING_VOLUME);
     },
     loadWatch: () => cloud.watchList(),
+    nextFetch: () => cloud.nextFetch(),
+    // The page loads the player's rows once the read says done, so they are written first.
+    updateFetch: async (id, fields) => {
+      if (fields.status === 'done') await flush();
+      await cloud.updateFetch(id, fields);
+    },
     saveCaseSnap: async (x) => {
       state.pendingSnaps.push(x);
       if (state.pendingSnaps.length > MAX_PENDING_VOLUME) state.pendingSnaps = state.pendingSnaps.slice(-MAX_PENDING_VOLUME);
