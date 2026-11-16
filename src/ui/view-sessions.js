@@ -10,8 +10,35 @@ const SESSION_PAGE = 20;
 /** Chance of a loss run at least this long; nothing to show when there were no losses. */
 const runChance = (len, p) => (len > 0 ? fmtPct(p, 0) : DASH);
 
+/**
+ * How one session compares with the shown odds, from weakest to strongest finding:
+ * too few to judge, normal, unusually lucky/unlucky (p < 0.05 for this session alone),
+ * beyond luck (still significant after Holm correction across all sessions).
+ */
+function verdictOf(x) {
+  if (!(x.oddsN >= 10) || !ok(x.p) || !ok(x.z)) {
+    return { label: 'Too few', tone: 'faint', text: 'Fewer than 10 normal upgrades: too few to judge.' };
+  }
+  const down = x.z < 0;
+  if (x.significant) {
+    return down
+      ? { label: 'Beyond bad luck', tone: 'bad-strong', text: 'Far more losses than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this bad.' }
+      : { label: 'Beyond good luck', tone: 'good-strong', text: 'Far more wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this good.' };
+  }
+  if (x.p < 0.05) {
+    return down
+      ? { label: 'Unlucky', tone: 'warn', text: 'Unusually unlucky, but still within luck: with this many sessions, a few this bad are expected.' }
+      : { label: 'Lucky', tone: 'good', text: 'Unusually lucky, but still within luck: with this many sessions, a few this good are expected.' };
+  }
+  return { label: 'Normal', tone: '', text: 'A normal session: the gap to the shown odds is ordinary luck.' };
+}
+
+function verdictBadge(v) {
+  return h('span', { class: ['badge', v.tone], text: v.label, 'data-tip': v.text });
+}
+
 export function viewSessions(ctx) {
-  const { state, memo, call, cur, render, errorBox, emptyState, table, th, sigBadge, kpi, sectionHead, more, callout, edgeEditor } = ctx;
+  const { state, memo, call, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx;
   const ev = state.events;
   if (!ev.some(settledUpgrade)) return emptyState('No upgrades yet', 'This view splits your upgrades into sessions and checks each one against the shown odds.');
   const ce = state.edges && state.edges.chance;
@@ -45,7 +72,10 @@ export function viewSessions(ctx) {
     h(
       'section',
       null,
-      sectionHead('Sessions', 'Newest first. Click a session for its win rate per chance level. Win rates use normal upgrades without the super-drop card.'),
+      sectionHead(
+        'Sessions',
+        'Newest first. Normal: ordinary luck. Lucky / Unlucky: unusual for one session, but a few are expected over many sessions. Beyond good / bad luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level.',
+      ),
       h('div', { class: 'list' }, shown.map(sessionRow)),
       sessions.length > shown.length
         ? h(
@@ -138,7 +168,7 @@ export function viewSessions(ctx) {
               .join(' · '),
           }),
         ),
-        h('div', { class: 'r' }, h('div', { class: ['num', signClass(x.net)], text: fmtMoney(x.net, c, { sign: true }) }), x.significant ? h('div', { style: { marginTop: '3px' } }, sigBadge(x)) : null),
+        h('div', { class: 'r' }, h('div', { class: ['num', signClass(x.net)], text: fmtMoney(x.net, c, { sign: true }) }), verdictOf(x).tone === 'faint' ? null : h('div', { style: { marginTop: '4px' } }, verdictBadge(verdictOf(x)))),
       ),
       open ? sessionBody(x) : null,
     );
@@ -152,12 +182,7 @@ export function viewSessions(ctx) {
   }
 
   function sessionBody(x) {
-    const judged =
-      x.oddsN < 10
-        ? 'Fewer than 10 upgrades: too few to judge.'
-        : x.significant
-          ? 'Too far from the shown odds to be luck, even after correcting for the number of sessions.'
-          : 'Within normal luck.';
+    const v = verdictOf(x);
     return h(
       'div',
       { class: 'sess-body' },
@@ -169,7 +194,7 @@ export function viewSessions(ctx) {
         kpi('Longest losing run', fmtInt(x.longestLosses), x.longestLosses > 0 ? `chance ${fmtPct(x.longestP, 0)}` : null),
         kpi('Deposits', fmtInt(x.deposits), x.deposits ? fmtMoney(x.deposited, '') : x.cases ? `${fmtInt(x.cases)} case opens` : null),
       ),
-      x.oddsN ? h('p', { class: 'hint', text: judged, 'data-tip': `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` }) : null,
+      h('div', { class: ['verdict', v.tone] }, verdictBadge(v), h('span', { text: v.text, 'data-tip': x.oddsN ? `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` : null })),
       (x.byChance || []).length
         ? table(
             [th('Chance'), th('Upgrades'), th('Won'), th('Expected', 'Sum of the shown chances'), th('Rate'), th('Shown')],
@@ -204,7 +229,7 @@ export function viewSessions(ctx) {
       rigged ? 'bad' : 'warn',
       rigged ? 'Some sessions are too far below the odds to be luck' : 'Sessions swing more than luck usually does',
       rigged
-        ? `${fmtInt(s.significantBelow)} ${s.significantBelow === 1 ? 'session is' : 'sessions are'} below the shown odds even after correcting for the number of sessions. Look for the "Below odds" badge.`
+        ? `${fmtInt(s.significantBelow)} ${s.significantBelow === 1 ? 'session is' : 'sessions are'} below the shown odds even after correcting for the number of sessions. Look for the "Beyond bad luck" badge.`
         : 'Your win rate changes between sessions more than fair odds explain. Check again after more sessions.',
       details,
     );

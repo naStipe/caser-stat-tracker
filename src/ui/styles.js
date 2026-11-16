@@ -250,6 +250,12 @@ td .second { display: block; color: var(--muted); font-size: 11px; margin-top: 1
 }
 .badge.bad { color: var(--neg); border-color: #4a2a2c; background: #1f1517; }
 .badge.good { color: var(--pos); border-color: #234635; background: #121d17; }
+.badge.warn { color: var(--warn); border-color: #4d3d22; background: #1d1912; }
+.badge.faint { color: var(--faint); background: transparent; }
+.badge.bad-strong { color: #160b0b; border-color: var(--neg); background: var(--neg); }
+.badge.good-strong { color: #08160f; border-color: var(--pos); background: var(--pos); }
+.verdict { display: flex; align-items: baseline; gap: 10px; color: var(--muted); font-size: 12px; }
+.verdict .badge { flex: none; }
 
 /* ---- lists with expandable rows ---- */
 .list { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
