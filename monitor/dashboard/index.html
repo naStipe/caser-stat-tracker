@@ -1002,7 +1002,7 @@ async function loadCase() {
   caseLoadingKey = null;
   caseState = next;
   if (tab === 'tables') renderDashboard();
-  if (playerFetch?.status === 'done') loadPlayerCase();
+  if (playerFetch?.u && (playerFetch.status === 'done' || playerFetch.status === 'reading')) loadPlayerCase();
 }
 
 const fmtAmount = (v) => (ok(v) ? (Math.abs(v) >= 100 ? fmtInt(v) : fmt(v, 2)) : DASH);
@@ -1149,17 +1149,23 @@ async function pollPlayer() {
   } catch (e) {
     playerError = e.message || String(e);
   }
-  if (playerFetch && (playerFetch.status === 'queued' || playerFetch.status === 'reading')) playerPoll = setTimeout(pollPlayer, 4000);
+  const f = playerFetch;
+  if (f && (f.status === 'queued' || f.status === 'reading')) playerPoll = setTimeout(pollPlayer, 4000);
   if (tab === 'tables') renderDashboard();
-  if (playerFetch?.status === 'done') loadPlayerCase();
+  // While the list is read, the chart and numbers follow it: load again whenever more opens have come in.
+  const pc = playerCase;
+  if (f?.status === 'done' && (pc?.status !== 'done' || pc.slug !== caseState?.slug)) loadPlayerCase();
+  else if (f?.status === 'reading' && f.u && (f.rows !== pc?.rows || pc?.slug !== caseState?.slug)) loadPlayerCase();
 }
 async function loadPlayerCase() {
   const slug = caseState?.slug;
-  if (!playerFetch?.u || !slug) return;
+  const f = playerFetch;
+  if (!f?.u || !slug) return;
   const spec = caseSpec(caseRange, Date.now());
   try {
-    const data = await rpc('monitor_player_case', { player_u: playerFetch.u, case_slug: slug, from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket });
-    playerCase = { slug, spec, report: caseReport(data, spec), others: Array.isArray(data?.otherCases) ? data.otherCases : [] };
+    const data = await rpc('monitor_player_case', { player_u: f.u, case_slug: slug, from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket });
+    if (playerFetch?.id !== f.id) return; // another player was asked for meanwhile
+    playerCase = { slug, spec, status: f.status, rows: f.rows, report: caseReport(data, spec), others: Array.isArray(data?.otherCases) ? data.otherCases : [] };
   } catch (e) {
     playerError = e.message || String(e);
   }
@@ -1183,10 +1189,12 @@ function playerBlock(width) {
     out.push(h('p', { class: f.status === 'failed' ? 'error' : 'muted', text }));
   }
   const pc = playerCase;
-  if (f?.status === 'done' && pc && pc.slug === caseState?.slug) {
+  const live = f?.status === 'reading';
+  if ((f?.status === 'done' || live) && pc && pc.slug === caseState?.slug) {
     const r = pc.report;
-    if (!r.n) out.push(h('p', { class: 'muted', text: `No opens of ${pc.slug} by this player in the last ${pc.spec.label}.` }));
+    if (!r.n) out.push(h('p', { class: 'muted', text: live ? `No opens of ${pc.slug} in the last ${pc.spec.label} read yet.` : `No opens of ${pc.slug} by this player in the last ${pc.spec.label}.` }));
     else {
+      if (live) out.push(h('p', { class: 'faint small-text', text: `So far, from the ${fmtInt(pc.rows)} opens read: the numbers and chart update as each page comes in, newest first.` }));
       const m = r.money;
       const day = (t) => new Date(t).toLocaleDateString([], { month: 'short', day: 'numeric' });
       out.push(h('div', { class: 'kpis' },
@@ -1199,7 +1207,7 @@ function playerBlock(width) {
     if (pc.others.length) out.push(h('p', { class: 'faint small-text' }, 'Their other cases in this range: ',
       ...pc.others.flatMap((o, i) => [i ? ', ' : '', h('button', { type: 'button', class: 'linkish', text: `${o.slug} (${fmtInt(o.n)})`, onclick: () => lookupCase(o.slug) })])));
   }
-  out.push(h('p', { class: 'hint', text: 'Paste a player’s profile link (or their id) and press the button: the monitor reads their whole case list, back 9 days and at most 100 pages, at its usual pace of one request every 8 seconds, so a heavy player takes a few minutes. Their opens of this case then show here with every open counted, including those right around a big win, since this is one player’s own record, not a sample. The range treats each open as its own sample. Their opens also join the stored rows; the database keeps only the monitor’s salted code for the player, not their id.' }));
+  out.push(h('p', { class: 'hint', text: 'Paste a player’s profile link (or their id) and press the button: the monitor reads their whole case list, back 9 days and at most 100 pages, at its usual pace of one request every 8 seconds, so a heavy player takes a few minutes. Their opens of this case show here as the pages come in, with every open counted, including those right around a big win, since this is one player’s own record, not a sample. The range treats each open as its own sample. Their opens also join the stored rows; the database keeps only the monitor’s salted code for the player, not their id.' }));
   return out;
 }
 

@@ -161,9 +161,12 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
     },
     loadWatch: () => cloud.watchList(),
     nextFetch: () => cloud.nextFetch(),
-    // The page loads the player's rows once the read says done, so they are written first.
+    // The page loads the player's rows as the read goes, so every page's rows are written before its progress.
+    // A push already on its way may have started before this page's rows came in: wait for it, then push again.
     updateFetch: async (id, fields) => {
-      if (fields.status === 'done') await flush();
+      if (fields.status === 'reading' && !fields.pages) { await cloud.updateFetch(id, fields); return; }
+      if (flushing) await flushing.catch(() => {});
+      await flush();
       await cloud.updateFetch(id, fields);
     },
     saveCaseSnap: async (x) => {
