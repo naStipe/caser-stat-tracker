@@ -2,6 +2,7 @@
 export { summarize, caseRoi, upgradeByChance, upgradeByStake } from './tables.js';
 export { factor } from './factor.js';
 export { sessions } from './sessions.js';
+export { upgradeSessions, lossRunProbability, longestLossRun } from './upgradesessions.js';
 export { calibration, calibrationCurve, edgeMap, upgradeQuote } from './calibration.js';
 export { upgradeOutlook, outlookModel, OUTLOOK_WINDOWS, OUTLOOK_CHANCE_EDGES } from './outlook.js';
 export { superDropStats } from './superdrop.js';

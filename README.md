@@ -6,6 +6,10 @@ and shows:
 - ROI per case, with a confidence interval, hit rate, best and median drop.
 - Upgrade win rate per shown-chance bucket and per stake bucket, compared with the odds the site showed.
 - Calibration: do your wins match the shown odds, with a significance test.
+- Sessions: upgrades split into sessions (a session ends after 1 hour with no upgrade, case open or deposit). Each
+  session shows wins against the wins the shown odds predict, a luck test, the longest losing run and how likely a run
+  that long is, and a breakdown per shown chance. A summary tells whether sessions swing more than luck allows, and a
+  "Losses in a row" table compares how often you lost 10, 20 or 30 times between wins with what fair draws give.
 - Edge map: what the shown odds promise vs the return you actually got, per chance bucket and mode.
 - Factors: hour, weekday, part of day, session position, loss streaks, mode, multiplier and more.
   Every factor carries a significance test with multiple-comparison correction, so random noise

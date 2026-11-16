@@ -142,6 +142,14 @@ factor(events, key, opts?) -> { key, rows: Array<Metrics & { value, label }>, te
   // a simpler one-way comparison is acceptable if documented.
 
 sessions(events, gapMinutes = 30) -> Array<{ start, end, n, cost, returned, net, kinds: {case, upgrade} }>
+upgradeSessions(events, { gapMinutes = 60, chanceEdges } = {}) -> { gapMinutes, summary, sessions, streaks }
+  // Sessions end after gapMinutes with no upgrade, case or deposit; only sessions with settled upgrades are kept,
+  // newest first. Each session: start, end, upgrades, cases, deposits, deposited, cost, returned, net, rtp,
+  // oddsN (= n), wins, winRate, expectedRate, expectedWins, z, p, significant (Holm across sessions with n >= 10),
+  // longestLosses, longestP (exact chance of a loss run that long at the shown odds), byChance rows.
+  // summary: sessions, tested, below/above (p < 0.05), expectedEachSide, significantBelow/Above, unluckyShare,
+  // spreadChi/spreadDf/spreadP (sum of z^2 over tested sessions vs chi-square), overall n, wins, expectedWins, z, p.
+  // streaks: per chance bucket, share of win gaps with >= 5/10/15/20/30 losses vs (1 - mean chance)^k.
   // a new session starts when the gap between consecutive events exceeds gapMinutes.
 
 calibration(events) -> { n, wins, expectedWins, z, p, verdict: 'consistent' | 'below' | 'above', impliedRtp }

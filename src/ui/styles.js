@@ -212,6 +212,15 @@ td.name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .row .l .t { font-weight: 550; }
 .row .l .d { color: var(--muted); font-size: 11.5px; }
 .row .r { text-align: right; flex: none; }
+.sess { border-bottom: 1px solid var(--border); }
+.sess:last-child { border-bottom: 0; }
+.sess > summary { list-style: none; cursor: pointer; border-bottom: 0; }
+.sess > summary::-webkit-details-marker { display: none; }
+.sess > summary:hover { background: var(--surface); }
+.sess > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sess[open] > summary { background: var(--surface); }
+.sess-body { padding: 10px 12px 12px; background: var(--bg); display: grid; gap: 10px; }
+.sess-body .hint { margin: 0; }
 
 .edges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
 .edges label { color: var(--muted); font-size: 12px; }

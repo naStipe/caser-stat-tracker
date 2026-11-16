@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.11.0
+// @version      0.12.0
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -1567,6 +1567,8 @@
     fSf: () => fSf,
     factor: () => factor,
     holm: () => holm,
+    longestLossRun: () => longestLossRun,
+    lossRunProbability: () => lossRunProbability,
     moneyFlow: () => moneyFlow,
     mysteryStats: () => mysteryStats,
     normalCdf: () => normalCdf,
@@ -1581,6 +1583,7 @@
     upgradeByStake: () => upgradeByStake,
     upgradeOutlook: () => upgradeOutlook,
     upgradeQuote: () => upgradeQuote,
+    upgradeSessions: () => upgradeSessions,
     wilson: () => wilson
   });
 
@@ -2440,6 +2443,184 @@
     return { key, rows, test };
   }
 
+  // src/stats/upgradesessions.js
+  var UPGRADE_SESSION_GAP_MIN = 60;
+  var STREAK_LENGTHS = [5, 10, 15, 20, 30];
+  var isActivity = (e) => e && typeof e === "object" && (e.kind === "upgrade" || e.kind === "case" || e.kind === "deposit");
+  var isSettledUpgrade = (e) => e.kind === "upgrade" && e.status !== "pending";
+  function longestLossRun(ups) {
+    let best = 0;
+    let run = 0;
+    for (const e of ups) {
+      run = isWin(e) ? 0 : run + 1;
+      if (run > best) best = run;
+    }
+    return best;
+  }
+  function lossRunProbability(ps, len) {
+    if (!(len > 0)) return 1;
+    if (len > ps.length) return 0;
+    let f = new Float64Array(len);
+    f[0] = 1;
+    let hit = 0;
+    for (const p0 of ps) {
+      const p = Math.min(Math.max(num(p0), 0), 1);
+      const q = 1 - p;
+      const g = new Float64Array(len);
+      let alive = 0;
+      for (let r = 0; r < len; r++) alive += f[r];
+      g[0] = alive * p;
+      for (let r = 0; r + 1 < len; r++) g[r + 1] = f[r] * q;
+      hit += f[len - 1] * q;
+      f = g;
+    }
+    return Math.min(Math.max(hit, 0), 1);
+  }
+  function bucketRows(odds, edges) {
+    const buckets = makeBuckets(edges, "%");
+    const groups = buckets.map(() => []);
+    for (const e of odds) {
+      const i = bucketIndex(num(e.chanceShown), edges);
+      if (i >= 0) groups[i].push(e);
+    }
+    return buckets.map((b, i) => {
+      const g = groups[i];
+      if (!g.length) return null;
+      const w = winMetrics(g);
+      const longest = longestLossRun(g);
+      return {
+        label: b.label,
+        lo: b.lo,
+        hi: b.hi,
+        n: g.length,
+        wins: w.wins,
+        winRate: w.winRate,
+        expectedRate: w.expectedRate,
+        expectedWins: g.reduce((s2, e) => s2 + chanceOf(e), 0),
+        longestLosses: longest,
+        longestP: lossRunProbability(g.map(chanceOf), longest)
+      };
+    }).filter(Boolean);
+  }
+  function streakTable(odds, edges) {
+    const buckets = makeBuckets(edges, "%");
+    const groups = buckets.map(() => []);
+    for (const e of odds) {
+      const i = bucketIndex(num(e.chanceShown), edges);
+      if (i >= 0) groups[i].push(e);
+    }
+    return buckets.map((b, i) => {
+      const g = groups[i];
+      if (!g.length) return null;
+      const stretches = [];
+      let run = 0;
+      for (const e of g) {
+        if (isWin(e)) {
+          stretches.push(run);
+          run = 0;
+        } else run++;
+      }
+      if (run > 0) stretches.push(run);
+      const meanP = g.reduce((s2, e) => s2 + chanceOf(e), 0) / g.length;
+      const share = {};
+      const expected = {};
+      for (const k of STREAK_LENGTHS) {
+        share[k] = stretches.length ? stretches.filter((x) => x >= k).length / stretches.length : null;
+        expected[k] = Math.pow(1 - meanP, k);
+      }
+      const longest = stretches.length ? Math.max(...stretches) : 0;
+      return {
+        label: b.label,
+        lo: b.lo,
+        hi: b.hi,
+        n: g.length,
+        stretches: stretches.length,
+        meanChance: meanP,
+        share,
+        expected,
+        longestLosses: longest,
+        longestP: lossRunProbability(g.map(chanceOf), longest)
+      };
+    }).filter(Boolean);
+  }
+  function upgradeSessions(events, opts = {}) {
+    const gapMinutes = num(opts.gapMinutes) > 0 ? num(opts.gapMinutes) : UPGRADE_SESSION_GAP_MIN;
+    const edges = Array.isArray(opts.chanceEdges) && opts.chanceEdges.length >= 2 ? opts.chanceEdges : DEFAULT_CHANCE_EDGES;
+    const list = Array.isArray(events) ? events.filter(isActivity) : [];
+    const sorted = sortByTime(list);
+    const allOdds = [];
+    const rows = [];
+    for (const evs of sessionize(sorted, gapMinutes)) {
+      const ups = evs.filter(isSettledUpgrade);
+      if (!ups.length) continue;
+      const odds = ups.filter((e) => isOdds(e));
+      allOdds.push(...odds);
+      const base = baseMetrics(ups);
+      const win = winMetrics(odds);
+      const deposits = evs.filter((e) => e.kind === "deposit" && e.status === "completed");
+      const longest = longestLossRun(odds);
+      rows.push({
+        start: num(evs[0].ts),
+        end: num(evs[evs.length - 1].ts),
+        upgrades: ups.length,
+        cases: evs.filter((e) => e.kind === "case").length,
+        deposits: deposits.length,
+        deposited: deposits.reduce((s2, e) => s2 + num(e.amount), 0),
+        cost: base.cost,
+        returned: base.returned,
+        net: base.net,
+        rtp: base.cost > 0 ? base.returned / base.cost : null,
+        oddsN: odds.length,
+        n: odds.length,
+        wins: win.wins,
+        winRate: win.winRate,
+        winRateCI: win.winRateCI,
+        expectedRate: win.expectedRate,
+        expectedWins: odds.reduce((s2, e) => s2 + chanceOf(e), 0),
+        z: win.z,
+        p: win.p,
+        significant: false,
+        longestLosses: longest,
+        longestP: lossRunProbability(odds.map(chanceOf), longest),
+        byChance: bucketRows(odds, edges)
+      });
+    }
+    const eligible = rows.filter((r) => r.oddsN >= MIN_N && Number.isFinite(r.p));
+    const flags = holm(eligible.map((r) => r.p), ALPHA);
+    eligible.forEach((r, i) => {
+      r.significant = flags[i];
+    });
+    const below = eligible.filter((r) => r.p < ALPHA && r.z < 0).length;
+    const above = eligible.filter((r) => r.p < ALPHA && r.z > 0).length;
+    const zs = eligible.map((r) => r.z).filter(Number.isFinite);
+    const chi = zs.reduce((s2, z) => s2 + z * z, 0);
+    const all = winMetrics(allOdds);
+    const summary = {
+      sessions: rows.length,
+      tested: eligible.length,
+      below,
+      above,
+      expectedEachSide: eligible.length * (ALPHA / 2),
+      significantBelow: eligible.filter((r) => r.significant && r.z < 0).length,
+      significantAbove: eligible.filter((r) => r.significant && r.z > 0).length,
+      unluckyShare: zs.length ? zs.filter((z) => z < 0).length / zs.length : null,
+      // Sum of z² over sessions ~ chi-square(k) if every session is luck around the shown odds.
+      // A small p means sessions swing more than luck allows (some rigged against you, some for).
+      spreadChi: zs.length ? chi : null,
+      spreadDf: zs.length,
+      spreadP: zs.length ? chiSquareSf(chi, zs.length) : null,
+      n: allOdds.length,
+      wins: all.wins,
+      winRate: all.winRate,
+      expectedRate: all.expectedRate,
+      expectedWins: allOdds.reduce((s2, e) => s2 + chanceOf(e), 0),
+      z: all.z,
+      p: all.p
+    };
+    rows.sort((a, b) => b.start - a.start);
+    return { gapMinutes, summary, sessions: rows, streaks: streakTable(sortByTime(allOdds), edges) };
+  }
+
   // src/stats/outlook.js
   var OUTLOOK_CHANCE_EDGES = [0, 15, 30, 50, 75, 100];
   var OUTLOOK_WINDOWS = [
@@ -3098,6 +3279,15 @@ td.name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .row .l .t { font-weight: 550; }
 .row .l .d { color: var(--muted); font-size: 11.5px; }
 .row .r { text-align: right; flex: none; }
+.sess { border-bottom: 1px solid var(--border); }
+.sess:last-child { border-bottom: 0; }
+.sess > summary { list-style: none; cursor: pointer; border-bottom: 0; }
+.sess > summary::-webkit-details-marker { display: none; }
+.sess > summary:hover { background: var(--surface); }
+.sess > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sess[open] > summary { background: var(--surface); }
+.sess-body { padding: 10px 12px 12px; background: var(--bg); display: grid; gap: 10px; }
+.sess-body .hint { margin: 0; }
 
 .edges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
 .edges label { color: var(--muted); font-size: 12px; }
@@ -3583,10 +3773,10 @@ option { background: var(--surface); color: var(--text); }
     const x0 = labelW + 8;
     const x1 = W - valueW;
     const H = padT + rows.length * rowH + 4;
-    const ok6 = (v) => typeof v === "number" && Number.isFinite(v);
+    const ok7 = (v) => typeof v === "number" && Number.isFinite(v);
     const vals = [0];
     if (band) vals.push(band[0], band[1]);
-    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok6(v)) vals.push(v);
+    for (const r of rows) for (const v of [r.value, r.lo, r.hi]) if (ok7(v)) vals.push(v);
     let lo = Math.max(clamp[0], Math.min(...vals));
     let hi = Math.min(clamp[1], Math.max(...vals));
     if (hi - lo < minSpan) {
@@ -3619,7 +3809,7 @@ option { background: var(--surface); color: var(--text); }
       svg.append(
         s("text", { class: "lbl", x: 0, y: cy + 4, "text-anchor": "start", text: label.length > 16 ? label.slice(0, 15) + "\u2026" : label })
       );
-      if (!ok6(r.value) || !r.n) {
+      if (!ok7(r.value) || !r.n) {
         svg.append(s("text", { x: x1 + valueW, y: cy + 4, "text-anchor": "end", text: "no data" }));
         return;
       }
@@ -3636,7 +3826,7 @@ option { background: var(--surface); color: var(--text); }
           "fill-opacity": r.significant ? 0.95 : 0.45
         })
       );
-      if (ok6(r.lo) && ok6(r.hi)) {
+      if (ok7(r.lo) && ok7(r.hi)) {
         const wl = x(r.lo);
         const wh = x(r.hi);
         svg.append(
@@ -4454,12 +4644,268 @@ option { background: var(--surface); color: var(--text); }
     return ok3(v) ? v : Number(v) || 0;
   }
 
+  // src/ui/view-sessions.js
+  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
+  var settledUpgrade2 = (e) => e && e.kind === "upgrade" && e.status !== "pending";
+  var SESSION_PAGE = 30;
+  var runChance = (len, p) => len > 0 ? fmtPct(p, 0) : DASH;
+  function kpiSub2(k, v, sub, cls) {
+    return h(
+      "div",
+      { class: "kpi" },
+      h("div", { class: "k", text: k }),
+      h("div", { class: ["v", "num", cls], text: v, title: v }),
+      sub ? h("div", { class: "s", text: sub, title: sub }) : null
+    );
+  }
+  function viewSessions(ctx2) {
+    const { state, memo, call, cur, render, errorBox, emptyState, goDataButton, table, th, sigBadge } = ctx2;
+    const ev = state.events;
+    if (!ev.some(settledUpgrade2)) {
+      return emptyState(
+        "No upgrades yet",
+        "This tab splits your upgrades into sessions and checks each one against the shown odds. Make some upgrades or import your history from the Data tab.",
+        goDataButton()
+      );
+    }
+    const ce = state.edges && state.edges.chance;
+    const res = memo(
+      `upgradeSessions:${ce ? ce.join(",") : "default"}`,
+      () => call("upgradeSessions", ev, ce ? { chanceEdges: ce } : {})
+    );
+    if (res.error) return [errorBox(res.error)];
+    const { summary: s2 = {}, sessions: sessions2 = [], streaks = [], gapMinutes = 60 } = res.value || {};
+    const c = cur();
+    if (!state.sessionOpen) state.sessionOpen = /* @__PURE__ */ new Set();
+    if (!state.sessionLimit) state.sessionLimit = SESSION_PAGE;
+    const luckSide = `luck: about ${fmtNumber(s2.expectedEachSide, 1)}`;
+    const out = [];
+    out.push(
+      h(
+        "section",
+        null,
+        luckCallout(s2),
+        h(
+          "div",
+          { class: "kpis" },
+          kpiSub2("Sessions", fmtInt(s2.sessions || 0), `${fmtInt(s2.tested || 0)} tested`),
+          kpiSub2("Below the odds", fmtPct(s2.unluckyShare, 0), "luck: about 50%"),
+          kpiSub2("Clearly unlucky", fmtInt(s2.below || 0), luckSide),
+          kpiSub2("Clearly lucky", fmtInt(s2.above || 0), luckSide)
+        ),
+        h("p", {
+          class: "hint",
+          text: `A session ends after ${fmtInt(gapMinutes)} minutes with no upgrade, case open or deposit. Tested sessions have 10 or more normal upgrades. "Below the odds" is the share of tested sessions where you won fewer upgrades than the shown chances predict. "Clearly" means p below 0.05 for that session alone: pure luck puts about 1 session in 40 there on each side. Win rates use normal upgrades without the super-drop card.`
+        })
+      )
+    );
+    if (streaks.length) out.push(streakSection(streaks));
+    const shown = sessions2.slice(0, state.sessionLimit);
+    out.push(
+      h(
+        "section",
+        null,
+        h("h3", { text: "Sessions" }),
+        h("div", { class: "list" }, shown.map(sessionRow)),
+        sessions2.length > shown.length ? h("button", {
+          class: "btn",
+          type: "button",
+          style: { marginTop: "10px" },
+          text: `Show ${fmtInt(Math.min(SESSION_PAGE, sessions2.length - shown.length))} more`,
+          on: {
+            click: () => {
+              state.sessionLimit += SESSION_PAGE;
+              render();
+            }
+          }
+        }) : null,
+        h("p", { class: "hint", text: "Newest first. Open a session for its win rate per shown chance." })
+      )
+    );
+    return out;
+    function streakSection(rows) {
+      const cell = (r, k) => h(
+        "td",
+        { class: "num" },
+        h("span", {
+          class: ok4(r.share[k]) && r.stretches >= 20 ? signClass(r.expected[k] - r.share[k]) : "",
+          text: fmtPct(r.share[k], 1)
+        }),
+        h("span", { class: "ci", text: `luck ${fmtPct(r.expected[k], 1)}` })
+      );
+      return h(
+        "section",
+        null,
+        h("h3", { text: "Losses in a row" }),
+        table(
+          [
+            th("Shown chance"),
+            th("Upgrades"),
+            th("Gaps", "Stretches of losses that ended in a win (or are still running)"),
+            th("10+ losses", "Share of gaps with 10 or more losses in a row. Second line: the share fair draws at the shown chance give"),
+            th("20+ losses"),
+            th("30+ losses"),
+            th("Longest", "Longest run of losses. Second line: chance of a run that long or longer at the shown odds")
+          ],
+          rows.map(
+            (r) => h(
+              "tr",
+              null,
+              h("td", { class: "num", text: r.label }),
+              h("td", { class: "num", text: fmtInt(r.n) }),
+              h("td", { class: "num", text: fmtInt(r.stretches) }),
+              cell(r, 10),
+              cell(r, 20),
+              cell(r, 30),
+              h("td", { class: "num" }, fmtInt(r.longestLosses), h("span", { class: "ci", text: `chance ${runChance(r.longestLosses, r.longestP)}` }))
+            )
+          )
+        ),
+        h("p", {
+          class: "hint",
+          text: "Between two wins, how often did you lose 10, 20 or 30 times in a row? The second line is how often that happens when every upgrade is a fair draw at the shown chance. At 10% a run of 10+ losses is normal (about 1 gap in 3) and 20+ happens about 1 gap in 8. Long runs feel common because they are the ones you remember. Upgrades are counted per chance bucket in time order."
+        })
+      );
+    }
+    function sessionRow(x) {
+      const id = String(x.start);
+      const open = state.sessionOpen.has(id);
+      const d = h(
+        "details",
+        { class: "sess", open },
+        h(
+          "summary",
+          { class: "row" },
+          h(
+            "div",
+            { class: "l" },
+            h("div", { class: "t num", text: `${fmtDateShort(x.start)}, ${fmtTime(x.start)}${DASH}${fmtTime(x.end)}` }),
+            h("div", {
+              class: "d",
+              text: [
+                `${fmtInt(x.upgrades)} ${x.upgrades === 1 ? "upgrade" : "upgrades"}`,
+                x.oddsN ? `won ${fmtInt(x.wins)} of ${fmtInt(x.oddsN)}, ${fmtNumber(x.expectedWins, 1)} expected` : null,
+                fmtDuration(x.end - x.start)
+              ].filter(Boolean).join(" \xB7 ")
+            })
+          ),
+          h(
+            "div",
+            { class: "r" },
+            h("div", { class: ["num", signClass(x.net)], text: fmtMoney(x.net, c, { sign: true }) }),
+            h("div", { style: { marginTop: "3px" } }, sigBadge(x))
+          )
+        ),
+        open ? sessionBody(x) : null
+      );
+      d.addEventListener("toggle", () => {
+        if (d.open === state.sessionOpen.has(id)) return;
+        if (d.open) state.sessionOpen.add(id);
+        else state.sessionOpen.delete(id);
+        render();
+      });
+      return d;
+    }
+    function sessionBody(x) {
+      const judged = x.oddsN < 10 ? "Fewer than 10 upgrades: too few to judge." : x.significant ? "Too far from the shown odds to be luck, even after correcting for the number of sessions." : "Within what luck produces.";
+      return h(
+        "div",
+        { class: "sess-body" },
+        h(
+          "div",
+          { class: "kpis", style: { marginTop: "0" } },
+          kpiSub2(
+            "Real win rate",
+            fmtPct(x.winRate, 1),
+            `shown ${fmtPct(x.expectedRate, 1)}`,
+            ok4(x.winRate) && ok4(x.expectedRate) && x.oddsN >= 10 ? signClass(x.winRate - x.expectedRate) : ""
+          ),
+          kpiSub2("RTP", fmtPct(x.rtp, 1), `staked ${fmtMoney(x.cost, c)}`, ok4(x.rtp) ? signClass(x.rtp - 1) : ""),
+          kpiSub2("Longest losing run", fmtInt(x.longestLosses), x.longestLosses > 0 ? `chance ${fmtPct(x.longestP, 0)}` : null),
+          kpiSub2(
+            "Deposits",
+            fmtInt(x.deposits),
+            x.deposits ? fmtMoney(x.deposited, c) : x.cases ? `${fmtInt(x.cases)} case opens` : null
+          )
+        ),
+        x.oddsN ? h("p", { class: "hint", text: `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}. ${judged}` }) : null,
+        (x.byChance || []).length ? table(
+          [
+            th("Shown chance"),
+            th("Upgrades"),
+            th("Wins"),
+            th("Expected", "Sum of the shown chances"),
+            th("Real"),
+            th("Shown"),
+            th("Longest", "Longest run of losses. Second line: chance of a run that long or longer at these odds")
+          ],
+          x.byChance.map(
+            (r) => h(
+              "tr",
+              null,
+              h("td", { class: "num", text: r.label }),
+              h("td", { class: "num", text: fmtInt(r.n) }),
+              h("td", { class: "num", text: fmtInt(r.wins) }),
+              h("td", { class: "num", text: fmtNumber(r.expectedWins, 1) }),
+              h("td", {
+                class: ["num", ok4(r.winRate) && r.n >= 10 ? signClass(r.winRate - r.expectedRate) : ""],
+                text: fmtPct(r.winRate, 1)
+              }),
+              h("td", { class: "num", text: fmtPct(r.expectedRate, 1) }),
+              h("td", { class: "num" }, fmtInt(r.longestLosses), h("span", { class: "ci", text: runChance(r.longestLosses, r.longestP) }))
+            )
+          )
+        ) : null
+      );
+    }
+  }
+  function luckCallout(s2) {
+    if (!s2 || !s2.tested) {
+      return h(
+        "div",
+        { class: "callout neutral" },
+        h("div", { class: "headline", text: "Not enough sessions yet" }),
+        h("p", { class: "detail", text: "A session needs at least 10 normal upgrades to be tested." })
+      );
+    }
+    const swings = ok4(s2.spreadP) && s2.spreadP < 0.05;
+    const rigged = s2.significantBelow > 0;
+    const total = `Over all sessions: ${fmtInt(s2.wins)} wins out of ${fmtInt(s2.n)} upgrades, ${fmtNumber(s2.expectedWins, 1)} expected from the shown odds (${fmtPEq(s2.p)}).`;
+    const spread = ok4(s2.spreadP) ? ` Spread test over ${fmtInt(s2.spreadDf)} sessions: ${fmtPEq(s2.spreadP)}.` : "";
+    if (!swings && !rigged) {
+      return h(
+        "div",
+        { class: "callout neutral" },
+        h("div", { class: "headline", text: "Your sessions swing the way luck does" }),
+        h("p", {
+          class: "detail",
+          text: "Good and bad sessions come about as often as fair draws at the shown chance produce. Nothing points to the site lowering the odds in some sessions."
+        }),
+        h("p", { class: "detail", text: total + spread })
+      );
+    }
+    return h(
+      "div",
+      { class: ["callout", rigged ? "bad" : "warn"] },
+      h("div", {
+        class: "headline",
+        text: rigged ? "Some sessions are too far below the odds to be luck" : "Sessions swing more than luck usually does"
+      }),
+      h("p", {
+        class: "detail",
+        text: rigged ? `${fmtInt(s2.significantBelow)} ${s2.significantBelow === 1 ? "session is" : "sessions are"} below the shown odds even after correcting for the number of sessions. Look for the "Below odds" badge in the list.` : "The win rate changes from session to session more than fair draws explain. Check again after more sessions before acting on it."
+      }),
+      h("p", { class: "detail", text: total + spread })
+    );
+  }
+
   // src/ui/dashboard.js
   var TABS = [
     ["overview", "Overview"],
     ["odds", "Odds"],
     ["cases", "Cases"],
     ["upgrades", "Upgrades"],
+    ["sessions", "Sessions"],
     ["mystery", "Mystery"],
     ["factors", "Factors"],
     ["money", "Money"],
@@ -4490,8 +4936,8 @@ option { background: var(--surface); color: var(--text); }
     chance: { storeKey: "cst.ui.edges.chance", def: [0, 2, 5, 10, 20, 30, 50, 75, 100], allowInf: false },
     stake: { storeKey: "cst.ui.edges.stake", def: [0, 100, 500, 1e3, 5e3, 2e4, Infinity], allowInf: true }
   };
-  var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
-  var num3 = (v) => ok4(v) ? v : Number(v) || 0;
+  var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
+  var num3 = (v) => ok5(v) ? v : Number(v) || 0;
   function edgesToText(arr3) {
     return arr3.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
   }
@@ -4788,6 +5234,7 @@ option { background: var(--surface); color: var(--text); }
           odds: () => viewOdds(ctx2),
           cases: viewCases,
           upgrades: viewUpgrades,
+          sessions: () => viewSessions(ctx2),
           mystery: () => viewMystery(ctx2),
           factors: viewFactors,
           money: () => viewMoney(ctx2),
@@ -4881,7 +5328,7 @@ option { background: var(--surface); color: var(--text); }
       if (!u || !u.available) return v;
       if (u.newer) return `${v}, v${u.latest} available`;
       if (u.error) return `${v}, update check failed: ${u.error}`;
-      if (ok4(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
+      if (ok5(u.checkedAt)) return `${v}, latest (checked ${fmtAgo(u.checkedAt)})`;
       return v;
     }
     function errorBox(err, prefix = "Could not compute this view") {
@@ -5062,7 +5509,7 @@ option { background: var(--surface); color: var(--text); }
           "p",
           { class: "detail" },
           `z = ${fmtZ(r.z)}, ${fmtPEq(r.p)}`,
-          ok4(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
+          ok5(r.impliedRtp) ? `. Upgrades paid back ${fmtPct(r.impliedRtp, 1)} of what you staked.` : ""
         ),
         r.n < 30 ? h("p", { class: "detail", text: "Fewer than 30 upgrades: this check is weak for now." }) : null
       );
@@ -5345,7 +5792,7 @@ option { background: var(--surface); color: var(--text); }
             h(
               "td",
               { class: "num" },
-              h("span", { class: ok4(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
+              h("span", { class: ok5(r.realRtp) ? signClass(r.realRtp - 1) : "", text: fmtPct(r.realRtp, 1) }),
               r.realRtpCI ? h("span", { class: "ci", text: fmtCI(r.realRtpCI) }) : null
             )
           )
@@ -5425,10 +5872,10 @@ option { background: var(--surface); color: var(--text); }
         return out;
       }
       const isUp = kind === "upgrade";
-      const hasAdj = isUp && rows.some((x) => ok4(x.zAdj));
+      const hasAdj = isUp && rows.some((x) => ok5(x.zAdj));
       out.push(h("section", null, testCallout(r.test, kind, fdef)));
       if (hasAdj) {
-        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok4(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
+        const bars = rows.map((x) => ({ label: x.label ?? x.value, n: x.n, value: ok5(x.zAdj) ? x.zAdj : null, significant: !!x.significantAdj }));
         out.push(
           h(
             "section",
@@ -5453,14 +5900,14 @@ option { background: var(--surface); color: var(--text); }
         const bars = rows.map((x) => {
           if (isUp) {
             const e = num3(x.expectedRate);
-            if (!(e > 0) || !ok4(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
+            if (!(e > 0) || !ok5(x.winRate)) return { label: x.label ?? x.value, n: x.n, value: null };
             const ci2 = x.winRateCI || [];
             return {
               label: x.label ?? x.value,
               n: x.n,
               value: x.winRate / e - 1,
-              lo: ok4(ci2[0]) ? ci2[0] / e - 1 : null,
-              hi: ok4(ci2[1]) ? ci2[1] / e - 1 : null,
+              lo: ok5(ci2[0]) ? ci2[0] / e - 1 : null,
+              hi: ok5(ci2[1]) ? ci2[1] / e - 1 : null,
               significant: !!x.significant
             };
           }
@@ -5529,7 +5976,7 @@ option { background: var(--surface); color: var(--text); }
       return out;
     }
     function zCell(z, significant, n) {
-      if (!ok4(z)) return h("td", { class: "num faint", text: DASH });
+      if (!ok5(z)) return h("td", { class: "num faint", text: DASH });
       let badge;
       if (!(n >= 10)) badge = h("span", { class: "badge", text: "Too few" });
       else if (significant) badge = h("span", { class: ["badge", z < 0 ? "bad" : "good"], text: z < 0 ? "Below" : "Above" });
@@ -5537,7 +5984,7 @@ option { background: var(--surface); color: var(--text); }
       return h("td", { class: "num" }, `z ${fmtNumber(z, 2, { sign: true })}`, h("span", { class: "second" }, badge));
     }
     function testCallout(t, kind, fdef) {
-      if (!t || !ok4(t.p)) {
+      if (!t || !ok5(t.p)) {
         return h(
           "div",
           { class: "callout neutral" },
@@ -5547,9 +5994,9 @@ option { background: var(--surface); color: var(--text); }
       }
       const isUp = kind === "upgrade";
       const statName = isUp ? "\u03C7\xB2" : "Test statistic";
-      const dfText = ok4(t.df) ? `, df = ${fmtInt(t.df)}` : "";
+      const dfText = ok5(t.df) ? `, df = ${fmtInt(t.df)}` : "";
       const shownLine = `${statName} = ${fmtNumber(t.statistic, 2)}${dfText}, ${fmtPEq(t.p)}`;
-      const useAdj = isUp && ok4(t.pAdj);
+      const useAdj = isUp && ok5(t.pAdj);
       const sig = useAdj ? typeof t.significantAdj === "boolean" ? t.significantAdj : t.pAdj < 0.05 : !!t.significant;
       const lines = useAdj ? [
         `Adjusted for the real odds curve: ${statName} = ${fmtNumber(t.statisticAdj, 2)}${dfText}, ${fmtPEq(t.pAdj)}.`,
@@ -5662,7 +6109,7 @@ option { background: var(--surface); color: var(--text); }
         );
         return sec;
       }
-      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok4(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
+      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok5(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
       const shown = state.cloudKeyShown ? h("input", {
         type: "text",
         readonly: true,
@@ -5798,7 +6245,7 @@ option { background: var(--surface); color: var(--text); }
       const nDep = ev.filter((e) => e.kind === "deposit").length;
       const nWd = ev.filter((e) => e.kind === "withdrawal").length;
       const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
-      const totalEvents = state.accounts && ok4(state.accounts.total) ? state.accounts.total : ev.length;
+      const totalEvents = state.accounts && ok5(state.accounts.total) ? state.accounts.total : ev.length;
       const busy = !!state.busy;
       const btn = (name, label, cls, onClick, extra = {}) => h("button", {
         type: "button",
@@ -5851,9 +6298,9 @@ option { background: var(--surface); color: var(--text); }
               text: `${fmtInt(ev.length)} (${fmtInt(nCase)} case drops, ${fmtInt(nUp)} upgrades${nDep ? `, ${fmtInt(nDep)} deposits` : ""}${nWd ? `, ${fmtInt(nWd)} withdrawals` : ""})`
             }),
             h("dt", { text: "Last event" }),
-            h("dd", { class: "num", text: ok4(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
+            h("dd", { class: "num", text: ok5(st.lastEventTs) ? `${fmtDateTime(st.lastEventTs)}, ${fmtAgo(st.lastEventTs)}` : "none yet" }),
             h("dt", { text: "Last sync" }),
-            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok4(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
+            h("dd", { class: "num", text: st.syncing ? `Syncing\u2026 ${st.syncing}` : ok5(st.lastSync) ? `${fmtDateTime(st.lastSync)}, ${fmtAgo(st.lastSync)}` : "never" }),
             h("dt", { text: "Storage", title: "Whether the browser promised not to clear the stored history on its own" }),
             h("dd", { text: st.storagePersisted === true ? "Kept by the browser" : st.storagePersisted === false ? "Browser may clear it when space runs low" : DASH }),
             h("dt", { text: "Unknown responses", title: "Site responses the parser did not recognise" }),
@@ -6041,16 +6488,16 @@ option { background: var(--surface); color: var(--text); }
   var MIN_HISTORY = 30;
   var REAL_MIN_N = 100;
   function curveRowFor(rows, chance) {
-    if (!Array.isArray(rows) || !ok5(chance)) return null;
+    if (!Array.isArray(rows) || !ok6(chance)) return null;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
-      if (!r || !ok5(r.lo) || !ok5(r.hi)) continue;
+      if (!r || !ok6(r.lo) || !ok6(r.hi)) continue;
       const last = i === rows.length - 1;
       if (chance >= r.lo && (chance < r.hi || last && chance <= r.hi)) return r;
     }
     return null;
   }
-  var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
+  var ok6 = (v) => typeof v === "number" && Number.isFinite(v);
   function icon(d) {
     return s(
       "svg",
@@ -6063,20 +6510,20 @@ option { background: var(--surface); color: var(--text); }
   var CHEVRON_DOWN = "M4 6l4 4 4-4";
   var CLOSE = "M4.5 4.5l7 7M11.5 4.5l-7 7";
   function verdictFor(q, stake, currency, real = null, targetPrice = null) {
-    if (real && ok5(real.rate) && ok5(targetPrice)) {
+    if (real && ok6(real.rate) && ok6(targetPrice)) {
       const perTry = real.rate * targetPrice - stake;
-      const sub2 = ok5(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
+      const sub2 = ok6(real.bucketRate) ? `At ${real.label || "this"} shown chance you really won ${fmtPct(real.bucketRate, 1)} vs ${fmtPct(real.bucketShown, 1)} shown (${fmtInt(real.n)} upgrades).` : `Real win rate from ${fmtInt(real.n)} of your upgrades at this level.`;
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
-    if (ok5(q.realEdge)) {
+    if (ok6(q.realEdge)) {
       const perTry = q.realEdge * stake;
       const sub2 = "Based on your own upgrades at similar chances.";
       if (Math.abs(perTry) < 5e-3) return { text: "On average you break even at these odds.", tone: "", sub: sub2 };
       return perTry < 0 ? { text: `On average you lose ${fmtMoney(-perTry, currency)} per try at these odds.`, tone: "neg", sub: sub2 } : { text: `On average you gain ${fmtMoney(perTry, currency)} per try at these odds.`, tone: "pos", sub: sub2 };
     }
     const sub = `By the shown odds only. Your real results here are unknown until ${MIN_HISTORY} upgrades at similar chances.`;
-    if (!ok5(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
+    if (!ok6(q.ev) || Math.abs(q.ev) < 5e-3) return { text: "By the shown odds you break even on average.", tone: "", sub };
     return q.ev < 0 ? { text: `On average you lose ${fmtMoney(-q.ev, currency)} per try at these odds.`, tone: "neg", sub } : { text: `The shown odds promise ${fmtMoney(q.ev, currency)} per try on average.`, tone: "", sub };
   }
   var pctCapped = (p) => p > 0.99 ? ">99%" : p < 0.01 ? "<1%" : fmtPct(p, 0);
@@ -6090,7 +6537,7 @@ option { background: var(--surface); color: var(--text); }
     const t = OUTLOOK_TEXT[ol.verdict];
     const ctx2 = ol.context || {};
     const kellyEl = kellyLine(ol, currency, balance);
-    const since = ctx2.minutesSinceDeposit === null || !ok5(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
+    const since = ctx2.minutesSinceDeposit === null || !ok6(ctx2.minutesSinceDeposit) ? "No deposit recorded yet." : `${fmtDuration(ctx2.minutesSinceDeposit * 6e4)} since your last deposit, upgrade #${fmtInt((ctx2.upgradesSinceDeposit || 0) + 1)} after it, ${fmtMoney(ctx2.netSinceDeposit, currency, { sign: true })} since then.`;
     const rows = [];
     for (const w of ol.windows || []) {
       const cur = w.key === (ol.window && ol.window.key);
@@ -6134,7 +6581,7 @@ option { background: var(--surface); color: var(--text); }
     if (!(k.half > 0)) {
       return h("p", { class: "ol-kelly", text: "Suggested stake: 0 \u2014 skip this one." });
     }
-    const amount = ok5(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
+    const amount = ok6(balance) && balance > 0 ? ` (\u2248 ${fmtMoney(k.half * balance, currency)})` : "";
     return h(
       "p",
       { class: "ol-kelly", title: "Half-Kelly: the stake that grows a bankroll fastest for this edge, halved because the real chance is an estimate" },
@@ -6159,7 +6606,7 @@ option { background: var(--surface); color: var(--text); }
     root.append(wrap);
     let collapsed = !!store.get(COLLAPSED_KEY, false);
     let pos = store.get(POS_KEY, null);
-    if (!pos || !ok5(pos.x) || !ok5(pos.y)) pos = null;
+    if (!pos || !ok6(pos.x) || !ok6(pos.y)) pos = null;
     const grip = h("button", { type: "button", class: "iconbtn grip", "aria-label": "Move card. Use arrow keys, hold Shift for bigger steps." }, icon(GRIP));
     const toggle = h("button", {
       type: "button",
@@ -6306,7 +6753,7 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const input = { stake, targetPrice };
-      if (ok5(sel.chanceShown)) input.chanceShown = sel.chanceShown;
+      if (ok6(sel.chanceShown)) input.chanceShown = sel.chanceShown;
       const qKey = `${stake}|${targetPrice}|${input.chanceShown}|${version}`;
       const res = quoteCache && quoteCache.key === qKey ? quoteCache.res : safe(() => {
         if (typeof stats.upgradeQuote !== "function") throw new Error("stats.upgradeQuote is missing");
@@ -6318,9 +6765,9 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       const q = res.value;
-      const chance = ok5(q.chanceShown) ? q.chanceShown : ok5(sel.chanceShown) ? sel.chanceShown : null;
+      const chance = ok6(q.chanceShown) ? q.chanceShown : ok6(sel.chanceShown) ? sel.chanceShown : null;
       const row = curveRowFor(curveRows, chance);
-      const real = row && row.n >= REAL_MIN_N && ok5(row.winRate) && ok5(chance) ? {
+      const real = row && row.n >= REAL_MIN_N && ok6(row.winRate) && ok6(chance) ? {
         rate: row.expectedRate > 0 ? Math.min(1, chance / 100 * (row.winRate / row.expectedRate)) : row.winRate,
         bucketRate: row.winRate,
         bucketShown: row.expectedRate,
@@ -6354,7 +6801,7 @@ option { background: var(--surface); color: var(--text); }
           h("span", { class: "ci", text: `${fmtPct(q.evPct, 1, { sign: true })} of stake` })
         ),
         h("dt", { text: "Real edge", title: "From your history at similar chances: real return minus 1" }),
-        ok5(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
+        ok6(q.realEdge) ? h("dd", { class: ["num", signClass(q.realEdge)], text: fmtPct(q.realEdge, 1, { sign: true }) }) : h("dd", { class: "muted" }, "not enough data", h("span", { class: "ci", text: `needs ${MIN_HISTORY} upgrades` })),
         h("dt", { text: "Your similar tries", title: "Same chance bucket and same stake bucket" }),
         sim.n ? h(
           "dd",
@@ -6372,7 +6819,7 @@ option { background: var(--surface); color: var(--text); }
           "div",
           { class: "line" },
           h("span", { text: "5\u201395% range" }),
-          h("span", { class: "num", text: ok5(lr.p05) && ok5(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
+          h("span", { class: "num", text: ok6(lr.p05) && ok6(lr.p95) ? `${fmtMoney(lr.p05, "", { sign: true })} to ${fmtMoney(lr.p95, c, { sign: true })}` : DASH })
         ),
         h("div", { class: "line" }, h("span", { text: "Chance to end in profit" }), h("span", { class: "num", text: fmtPct(lr.probProfit, 0) }))
       );
@@ -6380,7 +6827,7 @@ option { background: var(--surface); color: var(--text); }
       let balance = null;
       try {
         const hv = o.getHoldings ? o.getHoldings() : null;
-        if (hv && ok5(hv.balance)) balance = hv.balance;
+        if (hv && ok6(hv.balance)) balance = hv.balance;
       } catch {
       }
       const olEl = ol.value ? outlookBlock(ol.value, c, balance) : null;
@@ -6968,7 +7415,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.11.0" : "dev";
+  var VERSION = true ? "0.12.0" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
