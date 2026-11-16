@@ -535,17 +535,27 @@ function glanceCard(kind, width) {
     : p.verdict === 'none'
       ? `It does not predict the next ${durationText(m)}: over 7 days, consecutive windows were unrelated (correlation ${signed(p.r)}, range ${signed(p.ci[0])} to ${signed(p.ci[1])}).`
       : `Over 7 days a window like this ${p.verdict === 'carry' ? 'tended to be followed by a similar one' : 'tended to be followed by the opposite'} (correlation ${signed(p.r)}, range ${signed(p.ci[0])} to ${signed(p.ci[1])}).`;
+  // A link of 0.3 or more is strong enough to read a direction from: the next window's expected z is r times this one's.
+  // Green or red only when that direction is clear, i.e. this window is itself at least 1 z away from normal.
+  const strong = (p.verdict === 'carry' || p.verdict === 'reverse') && Math.abs(p.r) >= STRONG_R;
+  const nextZ = strong && ok(c.z) ? p.r * c.z : null;
+  const lean = ok(nextZ) && Math.abs(c.z) >= 1 ? (nextZ > 0 ? 'up' : 'down') : null;
+  const forecast = !strong ? ''
+    : lean ? ` Strong link: expect the next ${durationText(m)} ${lean === 'up' ? 'above' : 'below'} normal (z about ${signed(nextZ)}).`
+    : ' Strong link, but this window is close to normal, so the next one should be too.';
   return h('section', { class: cls },
     h('div', { class: 'glance-top' },
       h('div', null, h('div', { class: 'kind', text: `${NAMES[kind][0]}, last ${durationText(m)}` }), h('div', { class: 'headline', text: word })),
       h('div', { class: ['big', 'num', !ok(c.index) ? 'faint' : cls === 'good' ? 'pos' : cls === 'bad' ? 'neg' : ''] }, fmt2(c.index), h('small', { text: kind === 'upgrade' ? '× normal' : '× usual hits' }))),
     glanceLine({ kind, width }),
     h('div', { class: 'muted', text: detail + before }),
-    h('div', { class: ['predicts', p.verdict === 'carry' || p.verdict === 'reverse' ? 'warn-text' : 'muted'], text: predicts }),
+    h('div', { class: ['predicts', lean === 'up' ? 'pos' : lean === 'down' ? 'neg' : p.verdict === 'carry' || p.verdict === 'reverse' ? 'warn-text' : 'muted'], text: predicts + forecast }),
     h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${!lag.known ? `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured` : lag.capped ? `80% take over 2 hours to arrive; windows count as complete after 2 hours` : `80% arrive within ${Math.round(lag.lagMs / 60000)} min`}).` }));
 }
 
 const signed = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 2)}` : DASH);
+/** Correlation from which one window's direction is taken as a forecast for the next one. */
+const STRONG_R = 0.3;
 
 /** Each settled window against the next one, as z-scores: a round cloud means one says nothing about the other. */
 function persistenceChart({ kind, width }) {
@@ -1159,10 +1169,31 @@ function renderNotViewer() {
     h('pre', { class: 'num', style: 'white-space:pre-wrap;color:var(--text)', text: `insert into public.monitor_viewers (user_id) values ('${id}');` })));
 }
 
+// The database has a small, shared CPU: reads sent all at once slow each other past its 8 s statement timeout.
+// At most RPC_SLOTS run at a time, and a read cancelled by the timeout is tried once more.
+const RPC_SLOTS = 3;
+let rpcBusy = 0;
+const rpcQueue = [];
+async function rpcOnce(name, args) {
+  if (rpcBusy >= RPC_SLOTS) await new Promise((go) => rpcQueue.push(go));
+  rpcBusy++;
+  try {
+    const { data, error } = await sb.rpc(name, args);
+    if (error) throw error;
+    return data ?? [];
+  } finally {
+    rpcBusy--;
+    rpcQueue.shift()?.();
+  }
+}
+const isTimeout = (e) => e?.code === '57014' || /statement timeout/i.test(e?.message ?? '');
 async function rpc(name, args) {
-  const { data, error } = await sb.rpc(name, args);
-  if (error) throw error;
-  return data ?? [];
+  try {
+    return await rpcOnce(name, args);
+  } catch (e) {
+    if (!isTimeout(e)) throw e;
+    return rpcOnce(name, args);
+  }
 }
 
 async function load() {
@@ -1223,8 +1254,8 @@ async function loadShared() {
     const to = Math.floor(now / (30 * 60000)) * 30 * 60000;
     const args = { from_ms: to - sharedDays * 24 * HOUR, to_ms: to, bucket_ms: sharedMin * 60000 };
     // A first read of 30 days can take several seconds while the database loads the synced history from disk;
-    // the second try finds it in memory.
-    const data = await rpc('monitor_shared', args).catch((e) => (/timeout/i.test(e?.message ?? '') ? rpc('monitor_shared', args) : Promise.reject(e)));
+    // rpc() tries a timed-out read once more, and the second try finds it in memory.
+    const data = await rpc('monitor_shared', args);
     sharedCache.set(key, { at: now, data });
     sharedError = null;
   } catch (e) {
