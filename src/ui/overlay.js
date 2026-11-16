@@ -182,7 +182,7 @@ export function mountUpgradeOverlay(opts = {}) {
   });
   const off =
     typeof o.onTurnOff === 'function'
-      ? h('button', { type: 'button', class: 'iconbtn', 'aria-label': 'Turn off upgrade odds', title: 'Turn off. Turn it back on in Stats, Data tab.', on: { click: () => o.onTurnOff() } }, icon(CLOSE))
+      ? h('button', { type: 'button', class: 'iconbtn', 'aria-label': 'Turn off upgrade odds', title: 'Turn off. Turn it back on in Stats → Settings.', on: { click: () => o.onTurnOff() } }, icon(CLOSE))
       : null;
   const bar = h('div', { class: 'bar' }, grip, h('span', { class: 'ttl', text: 'Upgrade odds' }), toggle, off);
   const content = h('div', { class: 'content', id: 'cst-overlay-content' });

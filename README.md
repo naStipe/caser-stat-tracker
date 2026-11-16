@@ -1,16 +1,17 @@
 # Caser Stat Tracker
 
 A Tampermonkey userscript for caser.gg and caser.one. It records your own case opens and upgrades
-and shows:
+and shows, in a Stats panel with five tabs (Overview, Cases, Upgrades with Odds / Sessions / Mystery views,
+Money, Factors) and a settings view behind the gear button. Each view leads with the plain result; test
+statistics and method notes sit in "?" tooltips and "more" expanders:
 
 - ROI per case, with a confidence interval, hit rate, best and median drop.
-- Upgrade win rate per shown-chance bucket and per stake bucket, compared with the odds the site showed.
+- Upgrade win rate and RTP per shown-chance bucket and per stake bucket, compared with the odds the site showed.
 - Calibration: do your wins match the shown odds, with a significance test.
 - Sessions: upgrades split into sessions (a session ends after 1 hour with no upgrade, case open or deposit). Each
   session shows wins against the wins the shown odds predict, a luck test, the longest losing run and how likely a run
   that long is, and a breakdown per shown chance. A summary tells whether sessions swing more than luck allows, and a
   "Losses in a row" table compares how often you lost 10, 20 or 30 times between wins with what fair draws give.
-- Edge map: what the shown odds promise vs the return you actually got, per chance bucket and mode.
 - Factors: hour, weekday, part of day, session position, loss streaks, mode, multiplier and more.
   Every factor carries a significance test with multiple-comparison correction, so random noise
   is labelled as noise.
@@ -21,7 +22,7 @@ and shows:
   since the last deposit and the upgrade number after a deposit.
 - Upgrade overlay: for the upgrade you have selected, shows shown vs fair chance, the real chance at that
   level from your history, EV, and a 100-try projection. If the upgrade page lags, turn the card off with its ×
-  button or in Stats, Data tab, Panels; it then does no work at all.
+  button or in Stats → Settings (gear button); it then does no work at all.
 - Outlook on the overlay: "Likely profitable", "Likely losing" or "Unclear" for the selected upgrade, from your
   real win rate at that chance level and at this moment (0-5 min, 5-15 min or 15+ min after your last deposit),
   with how confident the estimate is.
@@ -68,7 +69,7 @@ domain with old data copies that data over. Open tabs on both domains also pick 
 
 The script header has `@updateURL` / `@downloadURL` pointing at the raw file above. Tampermonkey checks it
 (once a day by default, or right away with "Check for userscript updates") and installs any build with a higher
-`@version`. The panel title shows the running version; Data → Updates checks right away (the tracker also
+`@version`. The panel title shows the running version; Settings → Updates checks right away (the tracker also
 checks every 6 hours) and "Install" opens Tampermonkey's update page. To ship a change: bump `version` in `package.json`, run `npm run build`, commit `dist/`, push to `main`.
 
 ### Several site accounts
@@ -83,7 +84,7 @@ every account. Events recorded before 0.9.0 without an account id count for the 
 ### Owner lock
 
 By default the tracker is in guest view: it shows only the signed-in account, exports only that account, and hides
-"Clear all" and cloud sync (the sync key opens every account). Enter the owner password in Data → Owner lock (or the
+"Clear all" and cloud sync (the sync key opens every account). Enter the owner password in Settings → Owner lock (or the
 "Unlock" button under the title) to see every account. It locks again on page reload or when another account signs
 in, unless "Stay unlocked while … is signed in" is ticked; "Lock now" undoes that for the signed-in account. The
 password is built in and stored only as a salted PBKDF2 hash (`OWNER_LOCK` in `src/store/lock.js`). The lock only

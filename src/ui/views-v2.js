@@ -1,36 +1,25 @@
-// Dashboard tabs added in v2: Odds, Mystery, Money (see docs/CONTRACT.md, "UI v2").
+// Upgrade sub-views Odds and Mystery, and the Money tab (see docs/CONTRACT.md, "UI v2").
 // Each view gets the dashboard's shared helpers through ctx and returns an array of nodes.
 // Every stats call goes through ctx.memo + ctx.call, so a missing or failing function shows an error box.
+// Plain answer first; statistics go into ctx.tip / ctx.more.
 
 import { h } from './dom.js';
 import { calibrationChart, histogramChart, moneyChart } from './charts.js';
-import { fmtMoney, fmtNumber, fmtInt, fmtPct, fmtCI, fmtP, fmtPEq, fmtZ, fmtDate, fmtMult, signClass, DASH } from './format.js';
+import { fmtMoney, fmtNumber, fmtInt, fmtPct, fmtCI, fmtPEq, fmtZ, fmtDate, fmtMult, signClass, DASH } from './format.js';
 
 const ok = (v) => typeof v === 'number' && Number.isFinite(v);
 const numOrNull = (v) => (v === null || v === undefined || v === '' ? null : ok(Number(v)) ? Number(v) : null);
+const num = (v) => (ok(v) ? v : Number(v) || 0);
 const settledUpgrade = (e) => e && e.kind === 'upgrade' && e.status !== 'pending';
 
 /** RTP (returned / cost) from roi. */
 const rtpOf = (roi) => (ok(roi) ? 1 + roi : null);
 const rtpCI = (ci) => (Array.isArray(ci) && ok(ci[0]) && ok(ci[1]) ? [ci[0] + 1, ci[1] + 1] : null);
 
-function rtpCell(rtp, ci) {
-  return h(
-    'td',
-    { class: 'num' },
-    h('span', { class: ok(rtp) ? signClass(rtp - 1) : '', text: fmtPct(rtp, 1) }),
-    ci ? h('span', { class: 'ci', text: fmtCI(ci) }) : null,
-  );
-}
+const RTP_TIP = 'Return to player: what came back per unit staked. Below 100% loses money on average.';
 
-function kpiSub(k, v, sub, cls) {
-  return h(
-    'div',
-    { class: 'kpi' },
-    h('div', { class: 'k', text: k }),
-    h('div', { class: ['v', 'num', cls], text: v, title: v }),
-    sub ? h('div', { class: 's', text: sub }) : null,
-  );
+function rtpCell(rtp, ci) {
+  return h('td', { class: 'num' }, h('span', { class: ok(rtp) ? signClass(rtp - 1) : '', text: fmtPct(rtp, 1), 'data-tip': ci ? `95% range ${fmtCI(ci)}` : null }));
 }
 
 function joinLabels(rows) {
@@ -40,52 +29,44 @@ function joinLabels(rows) {
 // ---------------- Odds ----------------
 
 export function viewOdds(ctx) {
-  const { state, memo, call, contentWidth, errorBox, emptyState, goDataButton, table, th, sigBadge } = ctx;
+  const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, sigBadge, sectionHead, more, edgeEditor } = ctx;
   const ev = state.events;
   if (!ev.some((e) => settledUpgrade(e) && !e.mystery)) {
-    return emptyState(
-      'No upgrades yet',
-      'This tab compares the chance the site shows with how often you really win. Make some upgrades or import your history from the Data tab.',
-      goDataButton(),
-    );
+    return emptyState('No normal upgrades yet', 'This view compares the chance the site shows with how often you really win.');
   }
   const out = [];
   const curve = memo('calibrationCurve', () => call('calibrationCurve', ev));
-  if (curve.error) out.push(h('section', null, h('h3', { text: 'Shown chance vs real win rate' }), errorBox(curve.error)));
+  if (curve.error) out.push(h('section', null, errorBox(curve.error)));
   else {
     const rows = (curve.value || []).filter((r) => r && r.n > 0);
     const total = rows.reduce((a, r) => a + r.n, 0);
-    if (!rows.length) {
-      out.push(h('section', null, h('h3', { text: 'Shown chance vs real win rate' }), h('p', { class: 'muted', text: 'No normal upgrades to compare yet.' })));
-    } else {
-      out.push(h('section', null, curveCallout(rows, total)));
+    if (!rows.length) out.push(h('section', null, h('p', { class: 'muted', text: 'No normal upgrades to compare yet.' })));
+    else {
+      out.push(h('section', null, curveCallout(ctx, rows, total)));
       out.push(
         h(
           'section',
           null,
-          h('h3', { text: 'Shown chance vs real win rate' }),
+          sectionHead(
+            'Shown chance vs real win rate',
+            'Each dot is one chance bucket. The dashed diagonal is what the site promises. Dots above it win more often than shown, below it less often. The vertical line is the 95% range.',
+          ),
           calibrationChart({ rows, width: contentWidth() }),
-          h('p', {
-            class: 'hint',
-            text: 'Each dot is one bucket of shown chance. The dashed diagonal is what the site promises. Dots above it win more often than shown, below it less often. The vertical line is the 95% range.',
-          }),
         ),
       );
       out.push(
         h(
           'section',
           null,
-          h('h3', { text: 'By shown chance' }),
+          sectionHead('By shown chance', 'Normal upgrades only. Mystery upgrades have no shown chance; upgrades with the super-drop card are left out because the card changes the odds.'),
           table(
             [
-              th('Shown chance'),
+              th('Chance'),
               th('Upgrades'),
-              th('Wins'),
               th('Shown', 'Average chance the site showed'),
-              th('Real', 'Your real win rate. Second line: 95% Wilson interval'),
-              th('Real ÷ shown'),
-              th('RTP', 'Returned divided by staked'),
-              th('Result', 'Holm-corrected across buckets'),
+              th('Won', 'Your real win rate. Hover a value for its 95% range.'),
+              th('RTP', RTP_TIP),
+              th('Result', 'Is the gap between shown and won too big to be luck? Corrected for the number of buckets.'),
             ],
             rows.map((r) =>
               h(
@@ -93,36 +74,65 @@ export function viewOdds(ctx) {
                 null,
                 h('td', { class: 'num', text: r.label ?? `${r.lo}${DASH}${r.hi}%` }),
                 h('td', { class: 'num', text: fmtInt(r.n) }),
-                h('td', { class: 'num', text: fmtInt(r.wins) }),
                 h('td', { class: 'num', text: fmtPct(r.expectedRate, 1) }),
-                h('td', { class: 'num' }, fmtPct(r.winRate, 1), r.winRateCI ? h('span', { class: 'ci', text: fmtCI(r.winRateCI) }) : null),
-                h('td', {
-                  class: 'num',
-                  text: ok(r.winRate) && r.expectedRate > 0 ? fmtMult(r.winRate / r.expectedRate) : DASH,
-                }),
+                h('td', { class: ['num', ok(r.winRate) && r.significant ? signClass(r.winRate - r.expectedRate) : ''] }, h('span', {
+                  text: fmtPct(r.winRate, 1),
+                  'data-tip': `${fmtInt(r.wins)} wins${r.winRateCI ? `, 95% range ${fmtCI(r.winRateCI)}` : ''}${ok(r.winRate) && r.expectedRate > 0 ? `, ${fmtMult(r.winRate / r.expectedRate)} the shown chance` : ''}`,
+                })),
                 rtpCell(r.realRtp, null),
                 h('td', null, sigBadge(r)),
               ),
             ),
           ),
-          h('p', {
-            class: 'hint',
-            text: 'Normal upgrades only. Mystery upgrades have no shown chance, and upgrades where the super-drop card appeared are left out because the card changes the odds (see below).',
-          }),
         ),
       );
     }
   }
+
+  // By stake
+  const se = state.edges.stake;
+  const seKey = se ? se.join(',') : 'default';
+  const byStake = memo(`byStake:${seKey}`, () => (se ? call('upgradeByStake', ev, se) : call('upgradeByStake', ev)));
+  const c = cur();
+  const stakeRows = byStake.error ? [] : (byStake.value || []).filter((r) => r && r.n > 0);
+  out.push(
+    h(
+      'section',
+      null,
+      sectionHead('By stake', 'Do bigger bets win less often? Same upgrades as above, grouped by stake.', c ? `Stake in ${c}` : null),
+      byStake.error
+        ? errorBox(byStake.error)
+        : stakeRows.length
+          ? table(
+              [th('Stake'), th('Upgrades'), th('Shown'), th('Won', 'Hover a value for its 95% range.'), th('RTP', RTP_TIP), th('Result')],
+              stakeRows.map((r) =>
+                h(
+                  'tr',
+                  null,
+                  h('td', { class: 'num', text: r.label ?? DASH }),
+                  h('td', { class: 'num', text: fmtInt(r.n) }),
+                  h('td', { class: 'num', text: fmtPct(r.expectedRate, 1) }),
+                  h('td', { class: 'num' }, h('span', { text: fmtPct(r.winRate, 1), 'data-tip': r.winRateCI ? `95% range ${fmtCI(r.winRateCI)}` : null })),
+                  rtpCell(rtpOf(r.roi), null),
+                  h('td', null, sigBadge(r)),
+                ),
+              ),
+            )
+          : h('p', { class: 'muted', text: 'No upgrades fall into these stake groups.' }),
+      more('stake-edges', 'Change stake groups', edgeEditor('stake', `Edges${c ? `, ${c}` : ''}`), 'Comma-separated. Use inf for no upper limit.'),
+    ),
+  );
+
   out.push(superDropSection(ctx));
   return out;
 }
 
-function curveCallout(rows, total) {
+function curveCallout(ctx, rows, total) {
   const above = rows.filter((r) => r.significant && r.winRate > r.expectedRate);
   const below = rows.filter((r) => r.significant && r.winRate < r.expectedRate);
   let headline;
   let tone = 'neutral';
-  if (!above.length && !below.length) headline = 'Your wins match the shown odds at every level';
+  if (!above.length && !below.length) headline = 'Your wins match the shown odds';
   else if (above.length && below.length) {
     headline = 'The shown odds are off, in both directions';
     tone = 'warn';
@@ -134,21 +144,15 @@ function curveCallout(rows, total) {
     tone = 'good';
   }
   const parts = [];
-  if (above.length) parts.push(`More often than shown at ${joinLabels(above)}.`);
-  if (below.length) parts.push(`Less often than shown at ${joinLabels(below)}.`);
-  if (!parts.length) parts.push('Every bucket is within random noise of the shown chance.');
-  parts.push(`Based on ${fmtInt(total)} normal upgrades.`);
-  return h(
-    'div',
-    { class: ['callout', tone] },
-    h('div', { class: 'headline', text: headline }),
-    h('p', { class: 'detail', text: parts.join(' ') }),
-    above.length
-      ? h('p', {
-          class: 'detail',
-          text: 'Winning more often than shown does not mean profit: check the RTP column. Below 100% you still lose money on average.',
-        })
-      : null,
+  if (above.length) parts.push(`More often at ${joinLabels(above)}.`);
+  if (below.length) parts.push(`Less often at ${joinLabels(below)}.`);
+  if (!parts.length) parts.push('Every chance level is within normal luck.');
+  parts.push(`${fmtInt(total)} normal upgrades.`);
+  return ctx.callout(
+    tone,
+    headline,
+    parts.join(' '),
+    above.length ? 'Winning more often than shown is not profit: check the RTP column. Below 100% you still lose money on average.' : null,
   );
 }
 
@@ -157,21 +161,21 @@ function sideBox(title, m) {
   return h(
     'div',
     { class: 'box' },
-    h('div', { class: 'k', text: `${title}: ${fmtInt(m.n)}` }),
+    h('div', { class: 'k', text: `${title} · ${fmtInt(m.n)}` }),
     h(
       'div',
       { class: 'v num' },
       h('span', { class: ok(m.winRate) && ok(m.expectedRate) ? signClass(m.winRate - m.expectedRate) : '', text: `${fmtPct(m.winRate, 1)} won` }),
-      h('span', { class: 'muted', text: `  vs ${fmtPct(m.expectedRate, 1)} shown` }),
+      h('span', { class: 'muted', text: ` · ${fmtPct(m.expectedRate, 1)} shown` }),
     ),
-    h('div', { class: 's num', text: `RTP ${fmtPct(m.rtp, 1)} · z = ${fmtZ(m.z)}, ${fmtPEq(m.p)}` }),
+    h('div', { class: 's num', text: `RTP ${fmtPct(m.rtp, 1)}`, 'data-tip': `z = ${fmtZ(m.z)}, ${fmtPEq(m.p)}` }),
   );
 }
 
 function superDropSection(ctx) {
-  const { state, memo, call, errorBox } = ctx;
+  const { state, memo, call, errorBox, sectionHead, more } = ctx;
   const res = memo('superDropStats', () => call('superDropStats', state.events));
-  const head = h('h3', { text: 'Super-drop card' });
+  const head = sectionHead('Super-drop card', 'A card the site sometimes shows on an upgrade. When it appears, the win can be multiplied.');
   if (res.error) return h('section', null, head, errorBox(res.error));
   const sd = res.value || {};
   if (!sd.n) return h('section', null, head, h('p', { class: 'muted', text: 'No normal upgrades yet.' }));
@@ -182,41 +186,33 @@ function superDropSection(ctx) {
   const verdict = !shown.n
     ? 'The card has not appeared on your upgrades yet.'
     : cardWins && shown.winRate > shown.expectedRate
-      ? `With the card shown you win more often than the shown chance (${fmtPct(shown.winRate, 0)} vs ${fmtPct(shown.expectedRate, 0)}). That is why these upgrades are left out of the odds tests.`
+      ? 'With the card you win more often than shown. That is why these upgrades are left out of the odds checks.'
       : cardWins
-        ? `With the card shown you win less often than the shown chance (${fmtPct(shown.winRate, 0)} vs ${fmtPct(shown.expectedRate, 0)}).`
-        : 'With the card shown, your win rate is within random noise of the shown chance.';
+        ? 'With the card you win less often than shown.'
+        : 'With the card your win rate is within normal luck.';
   return h(
     'section',
     null,
     head,
-    h(
-      'div',
-      { class: 'callout neutral' },
-      h('div', { class: 'headline', text: `The card appeared on ${fmtPct(sd.shownRate, 1)} of your upgrades` }),
-      h('p', { class: 'detail', text: `${fmtInt(sd.shownN)} of ${fmtInt(sd.n)} normal upgrades. ${verdict}` }),
-    ),
-    h('div', { class: 'split' }, sideBox('Card shown', shown), sideBox('No card', notShown)),
+    h('p', { class: 'hint', style: { marginTop: '0', marginBottom: '10px' }, text: `Shown on ${fmtPct(sd.shownRate, 1)} of upgrades (${fmtInt(sd.shownN)} of ${fmtInt(sd.n)}). ${verdict}` }),
+    h('div', { class: 'split', style: { marginTop: '0' } }, sideBox('Card shown', shown), sideBox('No card', notShown)),
     hits.n
-      ? h('p', {
-          class: 'hint',
-          text: `${fmtInt(hits.n)} super-drop wins. The card multiplied the win by ${fmtMult(hits.avgMultiplier)} on average (from ${fmtMult(hits.minMultiplier)} to ${fmtMult(hits.maxMultiplier)}).`,
-        })
-      : h('p', { class: 'hint', text: 'No super-drop wins yet.' }),
+      ? more(
+          'superdrop-hits',
+          'Super-drop wins',
+          `${fmtInt(hits.n)} wins with the card. It multiplied the win by ${fmtMult(hits.avgMultiplier)} on average (from ${fmtMult(hits.minMultiplier)} to ${fmtMult(hits.maxMultiplier)}).`,
+        )
+      : null,
   );
 }
 
 // ---------------- Mystery ----------------
 
 export function viewMystery(ctx) {
-  const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell } = ctx;
+  const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, moneyCell, kpi, hero, sectionHead, more, callout } = ctx;
   const ev = state.events;
   if (!ev.some((e) => settledUpgrade(e) && e.mystery)) {
-    return emptyState(
-      'No mystery upgrades yet',
-      'Mystery upgrades hide the chance and always give you an item. This tab shows what they really pay back.',
-      goDataButton(),
-    );
+    return emptyState('No mystery upgrades yet', 'Mystery upgrades hide the chance and always give you an item. This view shows what they really pay back.');
   }
   const res = memo('mysteryStats', () => call('mysteryStats', ev));
   if (res.error) return [errorBox(res.error)];
@@ -230,35 +226,21 @@ export function viewMystery(ctx) {
     h(
       'section',
       null,
-      h(
-        'div',
-        { class: 'hero' },
-        h(
-          'div',
-          null,
-          h('div', { class: 'cap', text: 'Mystery RTP' }),
-          h('div', { class: ['big', 'num', ok(rtp) ? signClass(rtp - 1) : ''], text: fmtPct(rtp, 1) }),
-          ci ? h('div', { class: 'cap num', text: `95% range ${fmtCI(ci)}`, style: { marginTop: '4px' } }) : null,
-        ),
-        h(
-          'div',
-          { style: { textAlign: 'right' } },
-          h('div', { class: 'cap', text: 'Net' }),
-          h('div', { class: ['roi', 'num', signClass(m.net)], text: fmtMoney(m.net, c, { sign: true }) }),
-        ),
+      hero(
+        'Mystery RTP',
+        fmtPct(rtp, 1),
+        ok(rtp) ? signClass(rtp - 1) : '',
+        { cap: 'Net', value: fmtMoney(m.net, c, { sign: true }), cls: signClass(m.net) },
+        `${RTP_TIP}${ci ? ` 95% range ${fmtCI(ci)}.` : ''}`,
       ),
       h(
         'div',
         { class: 'kpis' },
-        kpiSub('Upgrades', fmtInt(m.n || 0), `spent ${fmtMoney(m.cost, c)}`),
-        kpiSub('Hit rate', fmtPct(m.hitRate, 1), m.hitRateCI ? fmtCI(m.hitRateCI) : 'multiplier x1 or more'),
-        kpiSub('Mean multiplier', fmtMult(m.meanMultiplier)),
-        kpiSub('Median', fmtMult(m.medianMultiplier)),
+        kpi('Upgrades', fmtInt(m.n || 0), `spent ${fmtMoney(m.cost, '')}`),
+        kpi('Hit rate', fmtPct(m.hitRate, 1), null, null, 'Share that gave back at least the stake (multiplier ×1 or more).'),
+        kpi('Average', fmtMult(m.meanMultiplier), null, null, 'Average multiplier: value received divided by stake.'),
+        kpi('Median', fmtMult(m.medianMultiplier), null, null, 'Half of your mystery upgrades got less than this.'),
       ),
-      h('p', {
-        class: 'hint',
-        text: `RTP is what you got back per unit staked. ${ok(rtp) && rtp < 1 ? `On average a mystery upgrade returned ${fmtPct(rtp, 0)} of its stake.` : ''} Hit rate is the share that gave back at least the stake.`,
-      }),
     ),
   );
 
@@ -268,24 +250,34 @@ export function viewMystery(ctx) {
       h(
         'section',
         null,
-        h('h3', { text: 'What multiplier you got' }),
+        sectionHead('Multipliers you got', 'Red bars returned less than the stake, green bars at least the stake. Percent is the share of your mystery upgrades.'),
         histogramChart({ bins, width: contentWidth() }),
-        h('p', { class: 'hint', text: 'Red bars returned less than the stake, green bars at least the stake. Percent is the share of your mystery upgrades.' }),
       ),
     );
   }
 
   const byStake = (Array.isArray(m.byStake) ? m.byStake : []).filter((r) => r && r.n > 0);
   if (byStake.length) {
+    const t = m.test;
+    let verdict = null;
+    if (t && ok(t.p)) {
+      const df = Array.isArray(t.df) ? t.df.map((d) => fmtInt(d)).join(', ') : ok(t.df) ? fmtInt(t.df) + (ok(t.dfWithin) ? `, ${fmtInt(t.dfWithin)}` : '') : null;
+      const method = /^anova$/i.test(String(t.method || '')) ? 'ANOVA' : t.method || 'Test';
+      const line = `${method}: statistic = ${fmtNumber(t.statistic, 2)}${df ? `, df = ${df}` : ''}, ${fmtPEq(t.p)}.`;
+      verdict =
+        t.p >= 0.05
+          ? callout('neutral', 'Stake size does not matter', 'Differences between stake sizes are normal luck.', more('mystery-test', 'Test details', line))
+          : callout('warn', 'Stake size may change the multiplier', 'The groups differ more than luck usually explains. Check again after more data.', more('mystery-test', 'Test details', line));
+    }
     out.push(
       h(
         'section',
         null,
-        h('h3', { text: 'By stake' }),
-        mysteryTest(m.test),
-        h('div', { style: { height: '12px' } }),
+        sectionHead('By stake', null, c ? `Money in ${c}` : null),
+        verdict,
+        verdict ? h('div', { style: { height: '10px' } }) : null,
         table(
-          [th('Stake'), th('Upgrades'), th('Spent'), th('RTP', 'Second line: 95% range'), th('Hit rate'), th('Mean mult.')],
+          [th('Stake'), th('Upgrades'), th('Spent'), th('RTP', `${RTP_TIP} Hover a value for its 95% range.`), th('Hit rate'), th('Average')],
           byStake.map((r) =>
             h(
               'tr',
@@ -305,40 +297,6 @@ export function viewMystery(ctx) {
   return out;
 }
 
-function mysteryTest(t) {
-  if (!t || !ok(t.p)) {
-    return h(
-      'div',
-      { class: 'callout neutral' },
-      h('div', { class: 'headline', text: 'Not enough data for a test yet' }),
-      h('p', { class: 'detail', text: 'Treat differences between stake sizes as random noise for now.' }),
-    );
-  }
-  const df = Array.isArray(t.df)
-    ? t.df.map((d) => fmtInt(d)).join(', ')
-    : ok(t.df)
-      ? fmtInt(t.df) + (ok(t.dfWithin) ? `, ${fmtInt(t.dfWithin)}` : '')
-      : null;
-  const method = /^anova$/i.test(String(t.method || '')) ? 'ANOVA' : t.method || 'Test';
-  const line = `${method}: statistic = ${fmtNumber(t.statistic, 2)}${df ? `, df = ${df}` : ''}, ${fmtPEq(t.p)}`;
-  if (t.p >= 0.05) {
-    return h(
-      'div',
-      { class: 'callout neutral', role: 'note' },
-      h('div', { class: 'headline', text: 'No real effect: differences are within random noise.' }),
-      h('p', { class: 'detail', text: 'Stake size does not change the mystery multiplier beyond what luck produces.' }),
-      h('p', { class: 'detail', text: line }),
-    );
-  }
-  return h(
-    'div',
-    { class: 'callout warn', role: 'note' },
-    h('div', { class: 'headline', text: 'Stake size may change the multiplier' }),
-    h('p', { class: 'detail', text: 'The rows differ more than luck usually explains. Check again after more data before acting on it.' }),
-    h('p', { class: 'detail', text: line }),
-  );
-}
-
 // ---------------- Money ----------------
 
 function dayLabel(day) {
@@ -348,7 +306,7 @@ function dayLabel(day) {
 }
 
 export function viewMoney(ctx) {
-  const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render } = ctx;
+  const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render, kpi, hero, sectionHead } = ctx;
   const ev = state.events;
   const hv = state.holdings || {};
   const balance = numOrNull(hv.balance);
@@ -356,11 +314,7 @@ export function viewMoney(ctx) {
   const hasFlow = ev.some((e) => e && (e.kind === 'deposit' || e.kind === 'withdrawal'));
   if (!hasFlow) {
     const held = balance === null && inventoryValue === null ? '' : ` You hold ${fmtMoney((balance || 0) + (inventoryValue || 0), cur())} right now.`;
-    return emptyState(
-      'No deposits or withdrawals yet',
-      `Import your history from the Data tab to load your payments. Withdrawn items come from your inventory history.${held}`,
-      goDataButton(),
-    );
+    return emptyState('No deposits or withdrawals yet', `Import your history to load your payments and withdrawn items.${held}`, goDataButton());
   }
   const res = memo(`moneyFlow:${balance}:${inventoryValue}`, () => call('moneyFlow', ev, { balance, inventoryValue }));
   if (res.error) return [errorBox(res.error)];
@@ -371,89 +325,82 @@ export function viewMoney(ctx) {
   const out = [];
 
   const holdingsKnown = ok(mf.holdings);
+  const depTip = [
+    'Completed payments only. Failed and expired payments are not money in.',
+    dep.failedN ? `${fmtInt(dep.failedN)} failed, ${fmtMoney(dep.failedSum, c)} in total.` : null,
+    dep.n ? `From ${fmtDate(dep.firstTs)} to ${fmtDate(dep.lastTs)}${ok(dep.perDay) ? `, about ${fmtMoney(dep.perDay, c)} per day` : ''}.` : null,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const approx = wd.n > 0 && ok(wd.exactTimeN) && wd.exactTimeN < wd.n;
   out.push(
     h(
       'section',
       null,
-      h(
-        'div',
-        { class: 'hero' },
-        h(
-          'div',
-          null,
-          h('div', { class: 'cap', text: 'Real money result' }),
-          h('div', { class: ['big', 'num', signClass(mf.net)], text: fmtMoney(mf.net, c, { sign: true }) }),
-          h('div', { class: 'cap', text: holdingsKnown ? 'Withdrawn + what you hold now − deposited' : 'Withdrawn − deposited (holdings unknown)', style: { marginTop: '4px' } }),
-        ),
+      hero(
+        'Real money result',
+        fmtMoney(mf.net, c, { sign: true }),
+        signClass(mf.net),
+        null,
+        holdingsKnown ? 'Withdrawn + what you hold now − deposited.' : 'Withdrawn − deposited. What you hold now is unknown, so it is left out.',
       ),
       h(
         'div',
-        { class: 'kpis' },
-        kpiSub('Deposited', fmtMoney(dep.sum, c), `${fmtInt(dep.n || 0)} completed`),
-        kpiSub('Withdrawn', fmtMoney(wd.value, c), `${fmtInt(wd.n || 0)} items`),
-        kpiSub(
+        { class: 'kpis k3' },
+        kpi('Deposited', fmtMoney(dep.sum, ''), `${fmtInt(dep.n || 0)} payments`, null, depTip),
+        kpi('Withdrawn', fmtMoney(wd.value, ''), `${fmtInt(wd.n || 0)} items`, null, approx ? 'Item value at withdrawal. Times are approximate for imported items.' : 'Item value at withdrawal.'),
+        kpi(
           'Holdings',
-          holdingsKnown ? fmtMoney(mf.holdings, c) : 'unknown',
-          holdingsKnown ? `cash ${balance === null ? DASH : fmtMoney(balance, '')}, skins ${inventoryValue === null ? DASH : fmtMoney(inventoryValue, '')}` : 'not read from the site yet',
+          holdingsKnown ? fmtMoney(mf.holdings, '') : 'unknown',
+          holdingsKnown ? `cash ${balance === null ? DASH : fmtMoney(balance, '')} · skins ${inventoryValue === null ? DASH : fmtMoney(inventoryValue, '')}` : 'not read from the site yet',
+          null,
+          'Your site balance plus the value of skins in your inventory right now.',
         ),
-        kpiSub('Failed deposits', fmtInt(dep.failedN || 0), dep.failedN ? fmtMoney(dep.failedSum, c) : 'none'),
       ),
       state.holdingsError ? errorBox(state.holdingsError, 'Could not read holdings') : null,
-      dep.n
-        ? h('p', {
-            class: 'hint',
-            text: `Deposits from ${fmtDate(dep.firstTs)} to ${fmtDate(dep.lastTs)}${ok(dep.perDay) ? `, about ${fmtMoney(dep.perDay, c)} per day` : ''}. Failed and expired payments are not counted as money in.`,
-          })
-        : null,
     ),
   );
 
   const series = Array.isArray(mf.series) ? mf.series.filter((p) => p && ok(p.ts) && ok(p.cumulativeNet)) : [];
-  const approx = wd.n > 0 && ok(wd.exactTimeN) && wd.exactTimeN < wd.n;
   if (series.length) {
     out.push(
       h(
         'section',
         null,
-        h('h3', { text: 'Deposits and withdrawals over time' }),
+        sectionHead('Withdrawn minus deposited', 'Running total of everything withdrawn minus everything deposited. It leaves out what you hold now.'),
         moneyChart({ series, width: contentWidth(), currency: c }),
-        h('p', { class: 'hint', text: 'The line is everything withdrawn minus everything deposited so far. It leaves out what you hold now.' }),
-        approx ? h('p', { class: 'hint', text: 'Withdrawal times are approximate for imported items.' }) : null,
       ),
     );
-  } else if (approx) {
-    out.push(h('p', { class: 'hint', text: 'Withdrawal times are approximate for imported items.' }));
   }
 
-  const daily = (Array.isArray(mf.daily) ? mf.daily : []).filter((d) => d && (num(d.deposited) || num(d.withdrawn))).slice().sort((a, b) => (a.day < b.day ? 1 : -1));
+  const daily = (Array.isArray(mf.daily) ? mf.daily : [])
+    .filter((d) => d && (num(d.deposited) || num(d.withdrawn)))
+    .slice()
+    .sort((a, b) => (a.day < b.day ? 1 : -1));
   if (daily.length) {
-    const LIMIT = 14;
+    const LIMIT = 7;
     const shown = state.dailyAll ? daily : daily.slice(0, LIMIT);
     out.push(
       h(
         'section',
         null,
-        h('div', { class: 'section-head' }, h('h3', { text: 'By day' }), c ? h('span', { class: 'muted', text: `Money in ${c}` }) : null),
+        sectionHead('By day', null, c ? `Money in ${c}` : null),
         table(
-          [th('Day'), th('Deposited'), th('Withdrawn'), th('Withdrawn − deposited')],
+          [th('Day'), th('Deposited'), th('Withdrawn'), th('Net', 'Withdrawn minus deposited that day')],
           shown.map((d) =>
-            h(
-              'tr',
-              null,
-              h('td', { class: 'num', text: dayLabel(d.day) }),
-              moneyCell(num(d.deposited)),
-              moneyCell(num(d.withdrawn)),
-              moneyCell(num(d.withdrawn) - num(d.deposited), true),
-            ),
+            h('tr', null, h('td', { class: 'num', text: dayLabel(d.day) }), moneyCell(num(d.deposited)), moneyCell(num(d.withdrawn)), moneyCell(num(d.withdrawn) - num(d.deposited), true)),
           ),
         ),
         daily.length > LIMIT
-          ? h('div', { style: { marginTop: '10px' } },
+          ? h(
+              'div',
+              { class: 'list-foot' },
+              h('span', { class: 'muted', text: `${fmtInt(shown.length)} of ${fmtInt(daily.length)} days` }),
               h('button', {
                 type: 'button',
-                class: 'btn ghost',
+                class: 'btn',
                 'data-fk': 'daily-toggle',
-                text: state.dailyAll ? 'Show fewer days' : `Show all ${fmtInt(daily.length)} days`,
+                text: state.dailyAll ? 'Show fewer' : 'Show all days',
                 on: {
                   click: () => {
                     state.dailyAll = !state.dailyAll;
@@ -468,8 +415,4 @@ export function viewMoney(ctx) {
     );
   }
   return out;
-}
-
-function num(v) {
-  return ok(v) ? v : Number(v) || 0;
 }

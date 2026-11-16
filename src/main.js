@@ -178,7 +178,7 @@ function guest() {
 }
 
 function requireOwner() {
-  if (guest()) throw new Error('Locked. Enter the owner password in Data → Owner lock first.');
+  if (guest()) throw new Error('Locked. Enter the owner password in Stats → Settings → Owner lock first.');
 }
 
 function lockState() {
