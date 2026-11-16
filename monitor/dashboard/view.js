@@ -398,6 +398,30 @@ export function dailyPattern(week) {
   return [...days.values()].sort((a, b) => a.day - b.day).map((d) => ({ day: d.day, fresh: indexOf(d.fresh), high: indexOf(d.high) }));
 }
 
+/** Earlier windows the arrival reference needs, per hours after their end it compares with, before it is shown. */
+export const ARRIVAL_MIN_WINDOWS = { 24: 12, 12: 6 };
+
+/**
+ * How complete the compared window probably is. From monitor_arrival: over the last 3 days, the rows earlier
+ * windows had at the same age, against what they had 24 hours after they ended (once 12 windows have that), else
+ * 12 hours after (6 windows). null while neither reference is big enough. expected: the window's rows scaled up.
+ * @param {any} arr  monitor_arrival's answer, {upgrade_24: {windows, present, final, p10, p90}, ...}
+ * @param {'upgrade'|'case'} kind
+ * @param {number} n  the window's rows so far
+ */
+export function arrivalShare(arr, kind, n) {
+  for (const hours of [24, 12]) {
+    const a = arr?.[`${kind}_${hours}`];
+    const windows = n0(a?.windows);
+    const present = n0(a?.present);
+    const final = n0(a?.final);
+    if (windows < ARRIVAL_MIN_WINDOWS[hours] || !(final > 0)) continue;
+    const share = present / final;
+    return { hours, windows, share, p10: numOrNull(a.p10), p90: numOrNull(a.p90), expected: share > 0 && n > 0 ? n / share : null };
+  }
+  return null;
+}
+
 /** How far from the range average (in standard errors) the extreme-window counts are taken. */
 export const TAIL_Z = [2, 3];
 

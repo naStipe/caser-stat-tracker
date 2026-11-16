@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, feedTier, feedItems, feedSample, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, sharedShift, depositCheck, STEP, DEFAULT_LAG, tailCounts } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, sharedShift, depositCheck, STEP, DEFAULT_LAG, tailCounts, arrivalShare } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -1218,4 +1218,27 @@ test('tailCounts: windows beyond 2 and 3 standard errors on each side, against c
   assert.ok(Math.abs(t.levels[0].expected - 22.75) < 0.05, 'one tail beyond 2: 2.28% of windows');
   assert.ok(Math.abs(t.levels[1].expected - 1.35) < 0.01, 'one tail beyond 3: 0.135% of windows');
   assert.deepEqual(tailCounts([]), { windows: 0, levels: [{ z: 2, low: 0, high: 0, expected: 0 }, { z: 3, low: 0, high: 0, expected: 0 }] });
+});
+
+test('arrivalShare: share of rows earlier windows had at the same age, 24-hour reference first', () => {
+  const arr = {
+    upgrade_12: { windows: 12, present: '600', final: '1000', p10: 0.4, p90: 0.86 },
+    upgrade_24: { windows: 3, present: 300, final: 800, p10: 0.3, p90: 0.5 },
+    case_12: { windows: 5, present: 500, final: 600 },
+    case_24: { windows: 12, present: 450, final: 900, p10: null, p90: null },
+  };
+  const up = arrivalShare(arr, 'upgrade', 477);
+  assert.equal(up.hours, 12, 'too few windows have 24 hours yet, so the 12-hour reference is used');
+  assert.equal(up.share, 0.6);
+  assert.equal(up.windows, 12);
+  assert.deepEqual([up.p10, up.p90], [0.4, 0.86]);
+  assert.equal(up.expected, 795, '477 rows at 60% may end near 795');
+  const cs = arrivalShare(arr, 'case', 0);
+  assert.equal(cs.hours, 24);
+  assert.equal(cs.share, 0.5);
+  assert.equal(cs.expected, null, 'no rows, no scaled estimate');
+  assert.equal(cs.p10, null);
+  assert.equal(arrivalShare({ upgrade_12: { windows: 5, present: 1, final: 2 } }, 'upgrade', 10), null, 'under 6 windows: not measured');
+  assert.equal(arrivalShare({ upgrade_12: { windows: 8, present: 0, final: 0 } }, 'upgrade', 10), null);
+  assert.equal(arrivalShare(null, 'upgrade', 10), null);
 });

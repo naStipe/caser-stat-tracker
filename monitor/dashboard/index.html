@@ -130,7 +130,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, SHARED_WINDOWS, SHARED_DAYS, sharedShift, depositCheck, DEPOSIT_MIN_SEEN, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport } from './view.js';
+import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, SHARED_WINDOWS, SHARED_DAYS, sharedShift, depositCheck, DEPOSIT_MIN_SEEN, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport, arrivalShare, ARRIVAL_MIN_WINDOWS } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 const root = document.getElementById('root');
@@ -172,6 +172,8 @@ let sharedMin = SHARED_WINDOWS.includes(Number(store.get('pulse.shared.win', 60)
 let sharedDays = SHARED_DAYS.includes(Number(store.get('pulse.shared.days', 30))) ? Number(store.get('pulse.shared.days', 30)) : 30;
 const sharedCache = new Map(); // `${days}/${minutes}` -> {at, data} from monitor_shared, reused for 10 minutes
 let sharedError = null;
+const arrivalCache = new Map(); // compare minutes -> {at, data} from monitor_arrival, reused for 10 minutes
+let arrivalError = null;
 const metric = {};
 for (const k of KINDS) { const m = store.get(`pulse.metric.${k}`, 'index'); metric[k] = METRICS[k].some(([v]) => v === m) ? m : 'index'; }
 let heatKind = store.get('pulse.heat', 'upgrade');
@@ -567,8 +569,21 @@ function glanceCard(kind, width) {
       h('div', { class: ['big', 'num', !ok(c.index) ? 'faint' : cls === 'good' ? 'pos' : cls === 'bad' ? 'neg' : ''] }, fmt2(c.index), h('small', { text: kind === 'upgrade' ? '× normal' : '× usual hits' }))),
     glanceLine({ kind, width }),
     h('div', { class: 'muted', text: detail + before }),
+    completenessLine(kind, c.n, m),
     h('div', { class: ['predicts', lean === 'up' ? 'pos' : lean === 'down' ? 'neg' : p.verdict === 'carry' || p.verdict === 'reverse' ? 'warn-text' : 'muted'], text: predicts + forecast }),
-    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${!lag.known ? `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured` : lag.capped ? `80% take over 2 hours to arrive; windows count as complete after 2 hours` : `80% arrive within ${Math.round(lag.lagMs / 60000)} min`}).` }));
+    h('div', { class: 'hint', text: `Return per 1: ${fmt3(mo.recent.ratio)}, before ${fmt3(mo.base.ratio)}. Rows after ${clock(lag.at)} are still arriving (${!lag.known ? `assumed ${Math.round(lag.lagMs / 60000)} min until enough arrival times are measured` : lag.capped ? `80% take over 2 hours to arrive; windows count as complete after 2 hours` : `80% arrive within ${Math.round(lag.lagMs / 60000)} min`}). Rows so far compares this window with the earlier ones of the last 3 days at the same age: the rows they had then, against the rows they had 24 hours after they ended (12 hours until a day of such windows exists). Most rows come from reading newly found players' history, so this share swings a lot from hour to hour; early rows are not luckier or unluckier than late ones, but a low share means the reading can still move a lot.` }));
+}
+
+/** How complete the compared window probably is, from monitor_arrival (loaded after the rest of the page). */
+function completenessLine(kind, n, m) {
+  const c = arrivalCache.get(m);
+  if (!c) return h('div', { class: 'faint', text: arrivalError ? `How complete this ${durationText(m)} is could not be loaded: ${arrivalError}` : `Measuring how complete this ${durationText(m)} is…` });
+  const a = arrivalShare(c.data, kind, n);
+  if (!a) return h('div', { class: 'faint', text: `How complete this ${durationText(m)} is: not measured yet (needs ${ARRIVAL_MIN_WINDOWS[12]} earlier windows whose 12 hours have passed).` });
+  const spread = ok(a.p10) && ok(a.p90) ? `; single windows ranged ${pct(a.p10, 0)}–${pct(a.p90, 0)}` : '';
+  const end = ok(a.expected) ? ` It may end up near ${fmtInt(a.expected)} ${NAMES[kind][1]}.` : '';
+  return h('div', { class: a.share < 0.8 ? 'warn-text' : 'muted', style: 'margin-top:6px',
+    text: `Rows so far: about ${pct(a.share, 0)} of what earlier windows this old went on to have after ${a.hours} hours (${fmtInt(a.windows)} windows${spread}).${end}` });
 }
 
 const signed = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 2)}` : DASH);
@@ -1258,7 +1273,26 @@ async function load() {
   }
   loading = false;
   renderDashboard();
-  if (view) loadShared();
+  if (view) { loadShared(); loadArrival(); }
+}
+
+/** How complete the "Right now" window usually is at its age; loads on its own, the card says so meanwhile. */
+let arrivalLoading = false;
+async function loadArrival() {
+  const m = view.compareMinutes;
+  const c = arrivalCache.get(m);
+  if (arrivalLoading || (c && Date.now() - c.at < 10 * 60 * 1000)) return;
+  arrivalLoading = true;
+  try {
+    const args = { to_ms: view.settled.at, window_ms: m * 60000, age_ms: Math.max(0, view.now - view.settled.at) };
+    arrivalCache.set(m, { at: Date.now(), data: await rpc('monitor_arrival', args) });
+    arrivalError = null;
+  } catch (e) {
+    arrivalError = e.message || String(e);
+  }
+  arrivalLoading = false;
+  if (tab === 'now') renderDashboard();
+  if (view.compareMinutes !== m) loadArrival();
 }
 
 /** The site-shift check reads up to 30 days, so it loads on its own and does not hold up the rest of the page. */
