@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.13.2
+// @version      0.13.3
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -1180,16 +1180,27 @@
   var DAY_PREFIX = "ev:d:";
   var REV_KEY = "ev:rev";
   var CLEARED_KEY = "ev:clearedAt";
+  var KEEP_DAYS = 14;
+  var DAY_MS = 864e5;
   function dayKey(ts) {
     const d = new Date(Number.isFinite(ts) ? ts : 0);
     return DAY_PREFIX + (Number.isNaN(d.getTime()) ? "1970-01-01" : d.toISOString().slice(0, 10));
   }
-  function createSharedStore(gm) {
+  function createSharedStore(gm, { now = Date.now, keepDays = KEEP_DAYS } = {}) {
     const readDay = (key) => {
       const v = gm.get(key, null);
       return Array.isArray(v) ? v : [];
     };
-    const dayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
+    const oldestKey = () => dayKey(now() - (keepDays - 1) * DAY_MS);
+    const allDayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
+    const dayKeys = () => {
+      const min = oldestKey();
+      return allDayKeys().filter((k) => k >= min);
+    };
+    function prune() {
+      const min = oldestKey();
+      for (const k of allDayKeys()) if (k < min) gm.del(k);
+    }
     function bumpRev(days) {
       gm.set(REV_KEY, { at: Date.now(), days, nonce: Math.random().toString(36).slice(2) });
     }
@@ -1203,7 +1214,8 @@
       /** Events of the given day keys (as sent in a rev change). */
       readDays(keys) {
         const out = [];
-        for (const k of keys ?? []) if (typeof k === "string" && k.startsWith(DAY_PREFIX)) out.push(...readDay(k));
+        const min = oldestKey();
+        for (const k of keys ?? []) if (typeof k === "string" && k.startsWith(DAY_PREFIX) && k >= min) out.push(...readDay(k));
         return out;
       },
       /**
@@ -1211,10 +1223,13 @@
        * Only days that actually change are written. Returns the changed day keys.
        */
       merge(events) {
+        prune();
+        const min = oldestKey();
         const byDay = /* @__PURE__ */ new Map();
         for (const ev of events) {
           if (!ev || typeof ev.id !== "string") continue;
           const k = dayKey(ev.ts);
+          if (k < min) continue;
           if (!byDay.has(k)) byDay.set(k, []);
           byDay.get(k).push(ev);
         }
@@ -1259,7 +1274,7 @@
       },
       /** Delete every shared event and tell the other domains to drop theirs. Returns the clear time. */
       clear() {
-        for (const k of dayKeys()) gm.del(k);
+        for (const k of allDayKeys()) gm.del(k);
         const at = Date.now();
         gm.set(CLEARED_KEY, at);
         bumpRev([]);
@@ -2827,7 +2842,7 @@
   }
 
   // src/stats/money.js
-  var DAY_MS = 864e5;
+  var DAY_MS2 = 864e5;
   var pad22 = (n) => String(n).padStart(2, "0");
   var dayKey2 = (ts) => {
     const d = new Date(ts);
@@ -2872,7 +2887,7 @@
         failedSum: failed.reduce((s2, e) => s2 + num(e.amount), 0),
         firstTs,
         lastTs,
-        perDay: done.length ? sum / Math.max(1, (lastTs - firstTs) / DAY_MS) : null
+        perDay: done.length ? sum / Math.max(1, (lastTs - firstTs) / DAY_MS2) : null
       },
       withdrawals: { n: withdrawals.length, value: withdrawn, exactTimeN: withdrawals.filter((w) => w.exactTime === true).length },
       holdings: holdings2,
@@ -7359,7 +7374,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.13.2" : "dev";
+  var VERSION = true ? "0.13.3" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");

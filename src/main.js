@@ -427,7 +427,7 @@ const historyProgress = {
 
 /**
  * Pull the other domains' events into this domain, then push this domain's events out.
- * The first run on a domain copies its whole IndexedDB history into the shared storage.
+ * The first run on a domain copies its recent IndexedDB history (KEEP_DAYS) into the shared storage.
  */
 async function syncShared() {
   if (!shared) return;

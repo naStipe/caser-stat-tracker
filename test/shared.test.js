@@ -22,12 +22,14 @@ function fakeGm() {
 
 const DAY = 86400000;
 const t0 = Date.UTC(2026, 10, 10, 12);
+// A fixed clock so the window of kept days does not move under the tests.
+const opts = { now: () => t0 + 3 * DAY };
 const up = (id, ts, extra = {}) => ({ id, kind: 'upgrade', ts, source: 'import', status: 'won', ...extra });
 
 test('events from two domains end up in one list', () => {
   const gm = fakeGm();
-  const gg = createSharedStore(gm);
-  const one = createSharedStore(gm);
+  const gg = createSharedStore(gm, opts);
+  const one = createSharedStore(gm, opts);
   gg.merge([up('upgrade:1', t0, { site: 'caser.gg' }), up('upgrade:2', t0 + DAY, { site: 'caser.gg' })]);
   one.merge([up('upgrade:2', t0 + DAY, { site: 'caser.one' }), up('upgrade:3', t0 + 2 * DAY, { site: 'caser.one' })]);
   assert.deepEqual(one.readAll().map((e) => e.id), ['upgrade:1', 'upgrade:2', 'upgrade:3']);
@@ -35,14 +37,14 @@ test('events from two domains end up in one list', () => {
 
 test('only changed days are written, and a repeat merge writes nothing', () => {
   const gm = fakeGm();
-  const s = createSharedStore(gm);
+  const s = createSharedStore(gm, opts);
   assert.deepEqual(s.merge([up('a', t0), up('b', t0 + DAY)]), [dayKey(t0), dayKey(t0 + DAY)]);
   assert.deepEqual(s.merge([up('a', t0), up('b', t0 + DAY)]), []);
   assert.deepEqual(s.merge([up('c', t0 + DAY)]), [dayKey(t0 + DAY)]);
 });
 
 test('a resolved upgrade replaces the pending one, live wins over import', () => {
-  const s = createSharedStore(fakeGm());
+  const s = createSharedStore(fakeGm(), opts);
   s.merge([up('u', t0, { status: 'pending', source: 'live', balanceBefore: 5 })]);
   s.merge([up('u', t0 + 1000, { status: 'won', source: 'import' })]);
   const [e] = s.readAll();
@@ -54,7 +56,7 @@ test('a resolved upgrade replaces the pending one, live wins over import', () =>
 
 test('remove and clear', () => {
   const gm = fakeGm();
-  const s = createSharedStore(gm);
+  const s = createSharedStore(gm, opts);
   s.merge([up('a', t0), up('b', t0), up('c', t0 + DAY)]);
   s.remove(['a', 'c']);
   assert.deepEqual(s.readAll().map((e) => e.id), ['b']);
@@ -66,9 +68,33 @@ test('remove and clear', () => {
 
 test('other tabs hear which days changed', () => {
   const gm = fakeGm();
-  const s = createSharedStore(gm);
+  const s = createSharedStore(gm, opts);
   const seen = [];
   s.onRemoteChange((rev) => seen.push(...s.readDays(rev.days).map((e) => e.id)));
   s.merge([up('x', t0)]);
   assert.deepEqual(seen, ['x']);
+});
+
+test('only the last KEEP_DAYS days are kept', () => {
+  const gm = fakeGm();
+  let now = t0;
+  const s = createSharedStore(gm, { now: () => now, keepDays: 3 });
+  // t0 - 3 days is outside a 3-day window (t0 - 2 days .. t0), so it is never written.
+  assert.deepEqual(s.merge([up('old', t0 - 3 * DAY), up('edge', t0 - 2 * DAY), up('new', t0)]), [dayKey(t0 - 2 * DAY), dayKey(t0)]);
+  assert.deepEqual(s.readAll().map((e) => e.id), ['edge', 'new']);
+  // A day later the edge day falls out: hidden from reads, then deleted by the next write.
+  now = t0 + DAY;
+  assert.deepEqual(s.readAll().map((e) => e.id), ['new']);
+  assert.deepEqual(s.readDays([dayKey(t0 - 2 * DAY)]), []);
+  s.merge([up('next', t0 + DAY)]);
+  assert.equal(gm.data.has(dayKey(t0 - 2 * DAY)), false);
+  assert.equal(gm.data.has(dayKey(t0)), true);
+});
+
+test('a write prunes days left over from older versions', () => {
+  const gm = fakeGm();
+  for (let i = 0; i < 400; i++) gm.set(dayKey(t0 - (20 + i) * DAY), [up(`old${i}`, t0 - (20 + i) * DAY)]);
+  const s = createSharedStore(gm, { now: () => t0 });
+  s.merge([up('n', t0)]);
+  assert.deepEqual(gm.list().filter((k) => k.startsWith('ev:d:')), [dayKey(t0)]);
 });

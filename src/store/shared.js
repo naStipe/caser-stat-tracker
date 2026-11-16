@@ -6,12 +6,19 @@
 // Events are kept in one value per UTC day ("ev:2026-11-12"), so a new event rewrites only that
 // day. "ev:rev" changes after every write so open tabs on another domain can pick up new events,
 // and "ev:clearedAt" records the last "clear all data" so other domains drop their copies too.
+//
+// Only the last KEEP_DAYS days are kept. The userscript manager sends the script's whole value
+// storage to every page load, and Tampermonkey refuses to start a script once that message passes
+// 64 MiB. Older events are already in each domain's IndexedDB, and site history and cloud sync
+// fill in the rest.
 
 import { shouldReplace, mergeEvent } from './db.js';
 
 const DAY_PREFIX = 'ev:d:';
 const REV_KEY = 'ev:rev';
 const CLEARED_KEY = 'ev:clearedAt';
+export const KEEP_DAYS = 14;
+const DAY_MS = 86400000;
 
 export function dayKey(ts) {
   const d = new Date(Number.isFinite(ts) ? ts : 0);
@@ -22,12 +29,23 @@ export function dayKey(ts) {
  * @param {{get: (key: string, def?: any) => any, set: (key: string, v: any) => void, del: (key: string) => void,
  *   list: () => string[], listen?: (key: string, cb: (value: any, remote: boolean) => void) => void}} gm
  */
-export function createSharedStore(gm) {
+export function createSharedStore(gm, { now = Date.now, keepDays = KEEP_DAYS } = {}) {
   const readDay = (key) => {
     const v = gm.get(key, null);
     return Array.isArray(v) ? v : [];
   };
-  const dayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
+  // Day keys sort as text ("ev:d:2026-11-02" < "ev:d:2026-11-12").
+  const oldestKey = () => dayKey(now() - (keepDays - 1) * DAY_MS);
+  const allDayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
+  const dayKeys = () => {
+    const min = oldestKey();
+    return allDayKeys().filter((k) => k >= min);
+  };
+  /** Delete days that fell out of the window. Not announced: other domains keep their copies. */
+  function prune() {
+    const min = oldestKey();
+    for (const k of allDayKeys()) if (k < min) gm.del(k);
+  }
 
   function bumpRev(days) {
     gm.set(REV_KEY, { at: Date.now(), days, nonce: Math.random().toString(36).slice(2) });
@@ -44,7 +62,8 @@ export function createSharedStore(gm) {
     /** Events of the given day keys (as sent in a rev change). */
     readDays(keys) {
       const out = [];
-      for (const k of keys ?? []) if (typeof k === 'string' && k.startsWith(DAY_PREFIX)) out.push(...readDay(k));
+      const min = oldestKey();
+      for (const k of keys ?? []) if (typeof k === 'string' && k.startsWith(DAY_PREFIX) && k >= min) out.push(...readDay(k));
       return out;
     },
 
@@ -53,10 +72,13 @@ export function createSharedStore(gm) {
      * Only days that actually change are written. Returns the changed day keys.
      */
     merge(events) {
+      prune();
+      const min = oldestKey();
       const byDay = new Map();
       for (const ev of events) {
         if (!ev || typeof ev.id !== 'string') continue;
         const k = dayKey(ev.ts);
+        if (k < min) continue;
         if (!byDay.has(k)) byDay.set(k, []);
         byDay.get(k).push(ev);
       }
@@ -103,7 +125,7 @@ export function createSharedStore(gm) {
 
     /** Delete every shared event and tell the other domains to drop theirs. Returns the clear time. */
     clear() {
-      for (const k of dayKeys()) gm.del(k);
+      for (const k of allDayKeys()) gm.del(k);
       const at = Date.now();
       gm.set(CLEARED_KEY, at);
       bumpRev([]);
