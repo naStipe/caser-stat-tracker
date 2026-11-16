@@ -289,15 +289,23 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     prices.learnList(await get('/api/game/cases'));
   }
 
-  /** Loads prices of cases seen in drops but missing from the case list (at most 3 per page). */
+  /**
+   * Loads prices of cases seen in drops but missing from the case list (at most 3 per page). Like the site's own
+   * case page: the official endpoint first, the custom-case one (cases players make) on 404.
+   */
   async function learnCases(slugs) {
     const missing = [...slugs].filter((s) => !triedSlugs.has(s)).slice(0, 3);
     for (const slug of missing) {
       triedSlugs.add(slug);
-      try {
-        prices.learnOne(await get(`/api/game/cases/${encodeURIComponent(slug)}`));
-      } catch (e) {
-        if (isHttp(e, 429, 401, 403)) throw e;
+      const enc = encodeURIComponent(slug);
+      for (const path of [`/api/game/cases/${enc}`, `/api/game/custom-cases/${enc}`]) {
+        try {
+          prices.learnOne(await get(path));
+          break;
+        } catch (e) {
+          if (isHttp(e, 429, 401, 403)) throw e;
+          if (!isHttp(e, 404)) break;
+        }
       }
     }
   }

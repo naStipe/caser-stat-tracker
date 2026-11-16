@@ -74,6 +74,11 @@
   .login { max-width: 360px; margin: 10vh auto 0; }
   .login button { width: 100%; margin-top: 16px; padding: 9px; }
   .error { color: var(--neg); margin: 10px 0 0; }
+  .case-form { display: flex; gap: 8px; margin: 0 0 12px; }
+  .case-form input { flex: 1; min-width: 0; }
+  .case-form button { flex: none; }
+  .linkish { border: 0; padding: 0; background: none; color: inherit; text-align: left; text-decoration: underline dotted var(--faint); text-underline-offset: 3px; }
+  .linkish:hover { background: none; color: var(--text); }
   .health { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; border-left: 3px solid var(--line); }
   .health.ok { border-left-color: var(--pos); }
   .health.warn { border-left-color: var(--warn); }
@@ -130,6 +135,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
+import { CASE_RANGES, caseSlugFrom, caseSpec, caseReport } from './case.js';
 import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, SHARED_WINDOWS, SHARED_DAYS, sharedShift, depositCheck, DEPOSIT_MIN_SEEN, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport, arrivalShare, ARRIVAL_MIN_WINDOWS } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
@@ -952,12 +958,137 @@ function timeTab(v, width) {
   return out;
 }
 
+// ---- case lookup: paste a case link, see what that case pays back ----
+let caseRange = CASE_RANGES[store.get('pulse.case.range')] ? store.get('pulse.case.range') : '7d';
+let caseState = null; // {key, slug, spec, report} after a lookup, or {slug, error}
+let caseLoadingKey = null;
+let caseAutoTried = false;
+// One input kept across renders, so the minute refresh does not wipe what is being typed.
+const caseInputEl = h('input', { type: 'text', placeholder: 'https://caser.gg/en/cases/…', 'aria-label': 'Case link or slug', list: 'case-slugs', autocomplete: 'off', spellcheck: 'false' });
+caseInputEl.value = store.get('pulse.case.input', '');
+
+function lookupCase(text) {
+  caseInputEl.value = String(text ?? '').trim();
+  store.set('pulse.case.input', caseInputEl.value);
+  loadCase();
+}
+function setCaseRange(k) {
+  caseRange = CASE_RANGES[k] ? k : '7d';
+  store.set('pulse.case.range', caseRange);
+  loadCase();
+}
+async function loadCase() {
+  const text = caseInputEl.value.trim();
+  const slug = caseSlugFrom(text);
+  if (!slug) {
+    caseLoadingKey = null;
+    caseState = text ? { slug: null, error: 'That is not a case link or slug. Paste a case page link, like https://caser.gg/en/cases/magnum.' } : null;
+    renderDashboard();
+    return;
+  }
+  const spec = caseSpec(caseRange, Date.now());
+  const key = `${slug}/${spec.key}`;
+  caseLoadingKey = key;
+  renderDashboard();
+  let next;
+  try {
+    const data = await rpc('monitor_case', { case_slug: slug, from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket });
+    next = { key, slug, spec, report: caseReport(data, spec) };
+  } catch (e) {
+    next = { key, slug, error: e.message || String(e) };
+  }
+  if (caseLoadingKey !== key) return; // a newer lookup is on its way
+  caseLoadingKey = null;
+  caseState = next;
+  if (tab === 'tables') renderDashboard();
+}
+
+const fmtAmount = (v) => (ok(v) ? (Math.abs(v) >= 100 ? fmtInt(v) : fmt(v, 2)) : DASH);
+
+/** Running return per 1 of one case, window by window, with each window's own return and its opens below. */
+function caseChart({ r, spec, width }) {
+  const ws = r.windows;
+  const vals = [1];
+  for (const w of ws) for (const q of [w.cumRatio, w.ratio]) if (ok(q)) vals.push(Math.min(3, q));
+  const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(0.5, ...vals) - 0.05), Math.max(1.5, ...vals) + 0.05, 4);
+  const t0 = r.chartFrom, t1 = spec.to;
+  const f = frame({ width, t0, t1, lo, hi, ticks, tickFmt: (q) => fmt(q, q % 1 ? 2 : 1), span: t1 - t0, strip: 30, H: 240, vgrid: false, label: `Return per 1 of ${r.slug} over the last ${spec.label}.` });
+  const { svg, x, y } = f;
+  const yb = Math.round(y(1)) + 0.5;
+  svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yb, y2: yb, stroke: COLORS.diag, 'stroke-width': 1.25, 'stroke-dasharray': '5 4' }));
+  const maxN = Math.max(1, ...ws.map((w) => w.n));
+  const bw = Math.max(1, ((x(t0 + spec.bucket) - x(t0)) * 0.7));
+  const marks = [];
+  for (const w of ws) {
+    const bh = Math.max(1, (w.n / maxN) * (f.strip - 8));
+    svg.append(s('rect', { x: x(w.start) + (x(w.end) - x(w.start) - bw) / 2, y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
+    if (ok(w.ratio)) svg.append(s('circle', { cx: x(w.start + spec.bucket / 2), cy: y(Math.min(hi, w.ratio)), r: 2.5, fill: w.ratio >= 1 ? COLORS.pos : COLORS.neg, 'fill-opacity': 0.55 }));
+  }
+  const pts = ws.filter((w) => ok(w.cumRatio));
+  if (pts.length > 1) svg.append(s('path', { d: pts.map((w, i) => `${i ? 'L' : 'M'}${x(w.end).toFixed(1)},${y(w.cumRatio).toFixed(1)}`).join(''), fill: 'none', stroke: COLORS.line, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+  if (pts.length) { const w = pts.at(-1); svg.append(s('circle', { cx: x(w.end), cy: y(w.cumRatio), r: 3.5, fill: COLORS.line })); }
+  for (const w of pts) marks.push({ cx: x(w.end), cy: y(w.cumRatio), w });
+  const readout = h('div', { class: 'readout' });
+  const idle = () => readout.replaceChildren(h('span', { class: 'faint', text: 'Hover or tap a window for details.' }));
+  idle();
+  hover(f, marks, ({ w }) => readout.replaceChildren(`${spanLabel(w.start, w.end)}: `,
+    h('span', { class: ['num', sign(w.ratio - 1)], text: fmt3(w.ratio) }),
+    h('span', { class: 'faint', text: ` in this window (${fmtInt(w.n)} opens, ${fmtInt(w.players)} players). Running: ` }),
+    h('span', { class: ['num', sign(w.cumRatio - 1)], text: fmt3(w.cumRatio) }),
+    h('span', { class: 'faint', text: ` over ${fmtInt(w.cumN)} opens.` })), idle);
+  const legend = h('div', { class: 'legend' },
+    h('span', null, h('i', { style: `background:${COLORS.line}` }), 'return per 1 so far'),
+    h('span', null, h('i', { class: 'dot', style: `background:${COLORS.pos};opacity:.55` }), h('i', { class: 'dot', style: `background:${COLORS.neg};opacity:.55;margin-left:-2px` }), 'each window'),
+    h('span', null, h('i', { style: `background:${COLORS.diag}` }), '1 = players get back what they pay'),
+    h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'opens'));
+  return h('div', { class: 'chart' }, legend, readout, svg);
+}
+
+function caseSection(v) {
+  const width = Math.min(root.clientWidth || 1000, 1008) - 34;
+  // Keep focus and the caret in the input through the re-render.
+  if (document.activeElement === caseInputEl) {
+    const [a, b] = [caseInputEl.selectionStart, caseInputEl.selectionEnd];
+    queueMicrotask(() => { caseInputEl.focus(); try { caseInputEl.setSelectionRange(a, b); } catch {} });
+  }
+  // The last lookup comes back on its own when the tab is opened again.
+  if (!caseState && !caseLoadingKey && !caseAutoTried && caseInputEl.value.trim()) {
+    caseAutoTried = true;
+    queueMicrotask(loadCase);
+  }
+  const slugs = h('datalist', { id: 'case-slugs' }, (v?.cases ?? []).filter((c) => c.slug).map((c) => h('option', { value: c.slug })));
+  const form = h('form', { class: 'case-form', onsubmit: (e) => { e.preventDefault(); lookupCase(caseInputEl.value); } },
+    caseInputEl, slugs, h('button', { type: 'submit', class: 'primary', text: 'Show' }));
+  const head = h('div', { class: 'sec-head' }, h('h2', { text: 'Case lookup' }),
+    toggle(Object.entries(CASE_RANGES).map(([k, r]) => [k, k === 'all' ? 'All' : k, `Last ${r.label}`]), caseRange, setCaseRange, 'Range'));
+  const st = caseState;
+  const body = [];
+  if (caseLoadingKey) body.push(h('p', { class: 'faint', text: 'Loading…' }));
+  if (st?.error) body.push(h('p', { class: 'error', role: 'alert', text: st.slug ? `Could not load ${st.slug}: ${st.error}` : st.error }));
+  const r = st?.report;
+  if (r && !r.n) {
+    body.push(h('p', { class: 'muted', text: `No opens of “${r.slug}” in the last ${st.spec.label}${r.last ? ` (last seen ${spanLabel(r.last, r.last + 30 * 60000)})` : ''}.` }));
+    if (r.matches.length) body.push(h('p', { class: 'muted' }, 'Did you mean: ', ...r.matches.flatMap((m, i) => [i ? ', ' : '', h('button', { type: 'button', class: 'linkish', text: m, onclick: () => lookupCase(m) })]), '?'));
+  } else if (r) {
+    const m = r.money;
+    body.push(h('div', { class: 'kpis' },
+      kpi('Return per 1', fmt3(m.ratio), m.ci ? `range ${fmt3(m.ci[0])}–${fmt3(m.ci[1])}` : `range needs 5 or more players`, ok(m.ratio) ? (m.ci ? clearOf1(m.ci) : sign(m.ratio - 1)) : null),
+      kpi('Site keeps', ok(r.houseEdge) ? pct(r.houseEdge) : DASH, `${fmtAmount(r.staked - r.returned)} of ${fmtAmount(r.staked)} paid`),
+      kpi('Opens', fmtInt(r.n), `${fmtInt(r.players)} players`),
+      kpi('Hit rate', pct(r.hitRate), `${fmtInt(r.hits)} drops worth the price or more`),
+      kpi('Price', fmtAmount(r.price), r.first ? `data since ${new Date(r.first).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : null)),
+      caseChart({ r, spec: st.spec, width }));
+  }
+  return h('section', null, head, form, ...body,
+    h('p', { class: 'hint', text: 'Paste a case page link (or just the part after /cases/) and press Show. Return per 1: what players got back for each 1 they paid for this case, from every open the monitor saw; above 1 means players came out ahead. The range is clustered by player, so one lucky player counts as one sample, not as many opens: with few players it is wide, and a single big drop can move the return a lot. Site keeps: the share of what was paid that players did not get back. The line is the return so far from the start of the range; dots are each window on its own. Click a case in the table below to look it up. Opens next to the moment a player was found (right after a big win) are left out, as everywhere on this page. Custom cases (made by players) were not kept before 16 November 2026.' }));
+}
+
 function tablesTab(v) {
-  const out = [];
+  const out = [caseSection(v)];
   const num = (val) => h('td', { class: 'num', text: val });
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Cases' })),
     v.cases.length ? dataTable({ id: 'cases', rows: v.cases, search: (c) => c.slug ?? '', minOf: (c) => c.n, minLabel: 'Min opens', columns: [
-      { label: 'Case', text: true, sort: (c) => c.slug ?? '', cell: (c) => h('td', { text: c.slug }) },
+      { label: 'Case', text: true, sort: (c) => c.slug ?? '', cell: (c) => h('td', null, c.slug ? h('button', { type: 'button', class: 'linkish', title: 'Look up this case', text: c.slug, onclick: () => { lookupCase(c.slug); window.scrollTo({ top: 0, behavior: 'smooth' }); } }) : DASH) },
       { label: 'Opens', sort: (c) => c.n, cell: (c) => num(fmtInt(c.n)) },
       { label: 'Players', sort: (c) => c.players, cell: (c) => num(fmtInt(c.players)) },
       { label: 'Price', sort: (c) => c.price, cell: (c) => num(fmtInt(c.price)) },

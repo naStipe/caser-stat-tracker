@@ -58,7 +58,7 @@ export class CasePrices {
     const d = unwrap(body);
     for (const c of arr(obj(d)?.cases ?? obj(d)?.items ?? d)) this.add(c);
   }
-  /** /api/game/cases/{slug} answer. */
+  /** /api/game/cases/{slug} answer ({case: {slug, price}}), or /api/game/custom-cases/{slug} ({slug, price}). */
   learnOne(body) {
     const d = unwrap(body);
     this.add(obj(obj(d)?.case) ?? d);

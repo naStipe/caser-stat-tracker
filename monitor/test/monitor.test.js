@@ -236,6 +236,32 @@ test('collector: a found player is backfilled without the feed win, then followe
   assert.equal(saved.length, 5, 'nothing is counted twice');
 });
 
+test('collector: a custom case gets its price from the custom-case endpoint, so its opens are kept', async () => {
+  const site = fakeSite();
+  site.inv[42].push(caseRow(20, T0 - 5000, 'case-e180f124', 40));
+  const asked = [];
+  const orig = site.getJson;
+  site.getJson = async (path) => {
+    asked.push(path.split('?')[0]);
+    if (path === '/api/game/custom-cases/case-e180f124') return { id: 'x', slug: 'case-e180f124', title: 'Mine', price: '25', items: [] };
+    return orig(path);
+  };
+  const { c, saved } = harness(site);
+  let budget = 40;
+  const g = site.getJson;
+  site.getJson = async (path) => {
+    if (--budget === 0) c.stop();
+    return g(path);
+  };
+  await c.start();
+  assert.ok(asked.includes('/api/game/cases/case-e180f124'), 'the official endpoint is tried first');
+  assert.ok(asked.includes('/api/game/custom-cases/case-e180f124'), 'then the custom one, on 404');
+  const row = saved.find((r) => r.id === 'case:20');
+  assert.ok(row, 'the open is kept once the price is known');
+  assert.equal(row.stake, 25);
+  assert.equal(row.slug, 'case-e180f124');
+});
+
 test('collector: 429 pauses, 401 stops', async () => {
   const site = fakeSite();
   const { c } = harness(site);
