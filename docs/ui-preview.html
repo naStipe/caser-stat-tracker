@@ -424,9 +424,25 @@ const $ = (id) => document.getElementById(id);
 let ACCOUNT = 'current';
 let UPDATE = { available: true, current: '0.2.0-preview', latest: '0.2.0-preview', newer: false, checkedAt: Date.now() - 3600e3, checking: false, error: null };
 const ownerOf = (e, i) => (i % 4 === 3 ? 'u2' : e.userId);
-const viewEvents = () => (ACCOUNT === 'all' ? EVENTS.slice() : EVENTS.filter((e, i) => ownerOf(e, i) === (ACCOUNT === 'current' ? 'u1' : ACCOUNT)));
+// The stats server's code, run in this page. Every 4th event belongs to account u2.
+const { createRemoteStats } = await import('../src/store/remote-stats.js');
+const { localStatsRequest } = await import('../src/server/local.js');
+let ownedList = null;
+let ownedFrom = null;
+const owned = () => {
+  if (ownedFrom !== EVENTS || ownedList.length !== EVENTS.length) {
+    ownedFrom = EVENTS;
+    ownedList = EVENTS.map((e, i) => ({ ...e, userId: ownerOf(e, i) }));
+  }
+  return ownedList;
+};
+const remote = createRemoteStats({
+  request: localStatsRequest(owned),
+  getKey: () => 'x'.repeat(32),
+  getAccount: () => ({ sel: ACCOUNT === 'current' ? 'u1' : ACCOUNT, legacy: null }),
+});
 const dash = mountDashboard({
-  getEvents: async () => viewEvents(),
+  remote,
   getAccounts: () => {
     const n2 = EVENTS.filter((e, i) => ownerOf(e, i) === 'u2').length;
     const list = [{ id: 'u1', name: 'preview-main', events: EVENTS.length - n2, current: true }];
@@ -447,7 +463,7 @@ const dash = mountDashboard({
 });
 const overlay = mountUpgradeOverlay({
   getSelection: () => ($('selOn').checked ? { stake: Number($('stake').value), targetPrice: Number($('target').value), chanceShown: null } : null),
-  getEvents: async () => EVENTS.slice(),
+  remote,
   stats: STATS,
   currency: () => '₽',
 });

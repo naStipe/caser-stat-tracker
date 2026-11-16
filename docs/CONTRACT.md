@@ -282,25 +282,50 @@ shown, high chances less), and a row that simply holds more low-chance bets woul
 
 ## UI API (`src/ui/index.js`)
 
+Since 0.14 the panels never see the event list. Statistics come from the stats server through `remote`
+(`src/store/remote-stats.js`): `remote.get(view, ...args)` answers at once with `{value, stale?}`, `{error}` or
+`{loading: true}`, batches what one render asks for into one request, and calls subscribers when answers arrive.
+`remote.invalidate()` marks every answer old after new events; old answers stay on screen until new ones arrive.
+
 ```js
 mountDashboard({
-  getEvents: () => Promise<Event[]>,
-  stats,                          // the stats module namespace
+  remote,                         // createRemoteStats(...)
   currency: () => string,         // label to show next to money, e.g. '₽'
   onExport: (format: 'json' | 'csv') => void,
   onImportFile: (file: File) => Promise<{ added: number }>,
   onImportHistory: () => Promise<{ added: number }>,   // pulls the user's own history from the site API
   onClear: () => Promise<void>,
-  getStatus: () => { capturing: boolean, lastEventTs: number|null, unknownResponses: number, version: string },
+  onCloudJoin: (key: string) => Promise<any>,          // use another browser's sync key
+  onCloudSync: () => Promise<any>,
+  getStatus: () => { capturing, lastEventTs, unknownResponses, version, cloud: { key, state, lastPush, lastPull, error, progress } | null, ... },
 }) -> { refresh(): void, destroy(): void }
 
 mountUpgradeOverlay({
   getSelection: () => { stake: number, targetPrice: number, chanceShown: number|null } | null,
-  getEvents: () => Promise<Event[]>,
-  stats,
+  remote,                         // asks for calibrationCurve, outlookModel and quoteBase once per data change
+  stats,                          // src/stats/client.js: quoteFromBase, upgradeOutlook (run locally on every poll)
   currency: () => string,
 }) -> { refresh(): void, destroy(): void }
 ```
+
+### Stats server views (`src/server/views.js`)
+
+POST `/functions/v1/stats` with headers `apikey` (publishable key) and `x-sync-key`, body
+`{ account: { sel, legacy }, views: [{ name, args }] }`, at most 40 views. Answer `{ version, results }`, one
+`{ ok: true, value }` or `{ ok: false, error }` per view. Numbers that JSON cannot hold (Infinity, NaN) travel as
+`'__inf__'`, `'__-inf__'`, `'__nan__'` in both directions (`src/server/codec.js`).
+
+Views over the selected account (`sel` = account id, `'all'` or null; `legacy` = owner of events without an id):
+`summarize`, `caseRoi`, `upgradeByChance(edges?)`, `upgradeByStake(edges?)`, `factor(key, opts)`, `sessions(gap?)`,
+`upgradeSessions(opts)`, `calibration`, `calibrationCurve(edges?)`, `edgeMap(edges?)`, `superDropStats`,
+`mysteryStats(edges?)`, `moneyFlow(opts)` (holdings are added by the client), `outlookModel` (flows only after
+the latest deposit), `quoteBase`, `cumulative(maxPoints = 600)` (running net, thinned keeping lows and highs),
+`meta` (`{ total, firstTs, lastTs, kinds, settled, settledNormal, settledMystery }`).
+Views over every event of the key: `accounts(known, currentId)`, `legacyOwner`, `historyBase(userId)`
+(`{ counts: imported per kind, events: withdrawals }`, for the site-history import).
+
+The server also deletes imported twins of live events (`withdrawalTwinIds`, `caseTwinIds`) whenever it loads a
+changed history.
 
 UI rules: everything inside one Shadow DOM root so site CSS cannot leak in or out.
 Flat solid backgrounds, no gradients, no glow, no grid or dot patterns. Short subtle fades only.

@@ -5,7 +5,6 @@ import { h } from './dom.js';
 import { fmtMoney, fmtNumber, fmtInt, fmtPct, fmtPEq, fmtZ, fmtDateShort, fmtTime, fmtDuration, signClass, DASH } from './format.js';
 
 const ok = (v) => typeof v === 'number' && Number.isFinite(v);
-const settledUpgrade = (e) => e && e.kind === 'upgrade' && e.status !== 'pending';
 const SESSION_PAGE = 20;
 /** Chance of a loss run at least this long; nothing to show when there were no losses. */
 const runChance = (len, p) => (len > 0 ? fmtPct(p, 0) : DASH);
@@ -58,11 +57,11 @@ function verdictBadge(v) {
 }
 
 export function viewSessions(ctx) {
-  const { state, memo, call, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx;
-  const ev = state.events;
-  if (!ev.some(settledUpgrade)) return emptyState('No upgrades yet', 'This view splits your upgrades into sessions and checks each one against the shown odds.');
+  const { state, stat, counts, loadingBox, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx;
+  if (!counts().settled) return emptyState('No upgrades yet', 'This view splits your upgrades into sessions and checks each one against the shown odds.');
   const ce = state.edges && state.edges.chance;
-  const res = memo(`upgradeSessions:${ce ? ce.join(',') : 'default'}`, () => call('upgradeSessions', ev, ce ? { chanceEdges: ce } : {}));
+  const res = stat('upgradeSessions', ce ? { chanceEdges: ce } : {});
+  if (res.loading) return [loadingBox()];
   if (res.error) return [errorBox(res.error)];
   const { summary: s = {}, sessions = [], streaks = [], gapMinutes = 60 } = res.value || {};
   const c = cur();

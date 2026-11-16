@@ -1,6 +1,6 @@
 // Upgrade sub-views Odds and Mystery, and the Money tab (see docs/CONTRACT.md, "UI v2").
 // Each view gets the dashboard's shared helpers through ctx and returns an array of nodes.
-// Every stats call goes through ctx.memo + ctx.call, so a missing or failing function shows an error box.
+// Every statistic comes from ctx.stat (the stats server): {value}, {error} or {loading}.
 // Plain answer first; statistics go into ctx.tip / ctx.more.
 
 import { h } from './dom.js';
@@ -10,7 +10,6 @@ import { fmtMoney, fmtNumber, fmtInt, fmtPct, fmtCI, fmtPEq, fmtZ, fmtDate, fmtM
 const ok = (v) => typeof v === 'number' && Number.isFinite(v);
 const numOrNull = (v) => (v === null || v === undefined || v === '' ? null : ok(Number(v)) ? Number(v) : null);
 const num = (v) => (ok(v) ? v : Number(v) || 0);
-const settledUpgrade = (e) => e && e.kind === 'upgrade' && e.status !== 'pending';
 
 /** RTP (returned / cost) from roi. */
 const rtpOf = (roi) => (ok(roi) ? 1 + roi : null);
@@ -29,14 +28,14 @@ function joinLabels(rows) {
 // ---------------- Odds ----------------
 
 export function viewOdds(ctx) {
-  const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, sigBadge, sectionHead, more, edgeEditor } = ctx;
-  const ev = state.events;
-  if (!ev.some((e) => settledUpgrade(e) && !e.mystery)) {
+  const { state, stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, table, th, sigBadge, sectionHead, more, edgeEditor } = ctx;
+  if (!counts().settledNormal) {
     return emptyState('No normal upgrades yet', 'This view compares the chance the site shows with how often you really win.');
   }
   const out = [];
-  const curve = memo('calibrationCurve', () => call('calibrationCurve', ev));
-  if (curve.error) out.push(h('section', null, errorBox(curve.error)));
+  const curve = stat('calibrationCurve');
+  if (curve.loading) out.push(h('section', null, loadingBox()));
+  else if (curve.error) out.push(h('section', null, errorBox(curve.error)));
   else {
     const rows = (curve.value || []).filter((r) => r && r.n > 0);
     const total = rows.reduce((a, r) => a + r.n, 0);
@@ -91,8 +90,7 @@ export function viewOdds(ctx) {
 
   // By stake
   const se = state.edges.stake;
-  const seKey = se ? se.join(',') : 'default';
-  const byStake = memo(`byStake:${seKey}`, () => (se ? call('upgradeByStake', ev, se) : call('upgradeByStake', ev)));
+  const byStake = se ? stat('upgradeByStake', se) : stat('upgradeByStake');
   const c = cur();
   const stakeRows = byStake.error ? [] : (byStake.value || []).filter((r) => r && r.n > 0);
   out.push(
@@ -173,9 +171,10 @@ function sideBox(title, m) {
 }
 
 function superDropSection(ctx) {
-  const { state, memo, call, errorBox, sectionHead, more } = ctx;
-  const res = memo('superDropStats', () => call('superDropStats', state.events));
+  const { stat, loadingBox, errorBox, sectionHead, more } = ctx;
+  const res = stat('superDropStats');
   const head = sectionHead('Super-drop card', 'A card the site sometimes shows on an upgrade. When it appears, the win can be multiplied.');
+  if (res.loading) return h('section', null, head, loadingBox());
   if (res.error) return h('section', null, head, errorBox(res.error));
   const sd = res.value || {};
   if (!sd.n) return h('section', null, head, h('p', { class: 'muted', text: 'No normal upgrades yet.' }));
@@ -209,12 +208,12 @@ function superDropSection(ctx) {
 // ---------------- Mystery ----------------
 
 export function viewMystery(ctx) {
-  const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, moneyCell, kpi, hero, sectionHead, more, callout } = ctx;
-  const ev = state.events;
-  if (!ev.some((e) => settledUpgrade(e) && e.mystery)) {
+  const { stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, table, th, moneyCell, kpi, hero, sectionHead, more, callout } = ctx;
+  if (!counts().settledMystery) {
     return emptyState('No mystery upgrades yet', 'Mystery upgrades hide the chance and always give you an item. This view shows what they really pay back.');
   }
-  const res = memo('mysteryStats', () => call('mysteryStats', ev));
+  const res = stat('mysteryStats');
+  if (res.loading) return [loadingBox()];
   if (res.error) return [errorBox(res.error)];
   const m = res.value || {};
   const c = cur();
@@ -306,19 +305,23 @@ function dayLabel(day) {
 }
 
 export function viewMoney(ctx) {
-  const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render, kpi, hero, sectionHead } = ctx;
-  const ev = state.events;
+  const { state, stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render, kpi, hero, sectionHead } = ctx;
   const hv = state.holdings || {};
   const balance = numOrNull(hv.balance);
   const inventoryValue = numOrNull(hv.inventoryValue);
-  const hasFlow = ev.some((e) => e && (e.kind === 'deposit' || e.kind === 'withdrawal'));
+  const kinds = counts().kinds || {};
+  const hasFlow = (kinds.deposit ?? 0) + (kinds.withdrawal ?? 0) > 0;
   if (!hasFlow) {
     const held = balance === null && inventoryValue === null ? '' : ` You hold ${fmtMoney((balance || 0) + (inventoryValue || 0), cur())} right now.`;
     return emptyState('No deposits or withdrawals yet', `Import your history to load your payments and withdrawn items.${held}`, goDataButton());
   }
-  const res = memo(`moneyFlow:${balance}:${inventoryValue}`, () => call('moneyFlow', ev, { balance, inventoryValue }));
+  // Holdings change with every bet, so they are added here: the server answer stays cached.
+  const res = stat('moneyFlow');
+  if (res.loading) return [loadingBox()];
   if (res.error) return [errorBox(res.error)];
-  const mf = res.value || {};
+  const raw = res.value || {};
+  const holdings = balance === null && inventoryValue === null ? null : (balance || 0) + (inventoryValue || 0);
+  const mf = { ...raw, holdings, net: num(raw.withdrawals?.value) + (holdings ?? 0) - num(raw.deposits?.sum) };
   const dep = mf.deposits || {};
   const wd = mf.withdrawals || {};
   const c = cur();

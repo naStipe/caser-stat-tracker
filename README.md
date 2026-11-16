@@ -45,8 +45,12 @@ statistics and method notes sit in "?" tooltips and "more" expanders:
   confirm on the site. Only the 50 items the site offers are ranked. Float and stickers change a real item's price,
   so check the listing.
 
-All data stays in your browser (IndexedDB on the site's origin, plus Tampermonkey's own script storage). The only outside request is to CSFloat's
-public sales history, and it sends only item names (no cookies, nothing about you). Prices are cached for 6 hours.
+Your events are stored on the tracker's server (Supabase), and the statistics are computed there, so the
+script stays light however long your history gets. The history is filed under a random sync key that the
+script makes on first run (Settings shows it; keep a copy, without it the history cannot be reached). The
+server gets the events the script records (cases, upgrades, deposits, withdrawals, item names and prices,
+your site account id and nickname), never your site login, cookies or token. The other outside request is
+to CSFloat's public sales history, which gets only item names. Prices are cached for 6 hours.
 The script only reads the site's API responses; it never changes requests or places bets.
 
 ## Install
@@ -59,11 +63,23 @@ The script only reads the site's API responses; it never changes requests or pla
    withdrawals and deposits. The site rate-limits these requests, so a large history takes several minutes;
    keep the tab open. Running it again later only fetches what is new.
 
-caser.gg and caser.one share one history (same account). Each domain keeps its own IndexedDB copy, and
-the script also keeps every event in Tampermonkey's script storage, which both domains can read. Opening
-either domain pulls in what the other recorded and pushes its own events out, so the first visit to a
-domain with old data copies that data over. Open tabs on both domains also pick up each other's new events.
-"Clear all data" clears both. Export JSON / Import file still works as a manual fallback.
+caser.gg and caser.one share one history: the sync key sits in Tampermonkey's script storage, which both
+domains read. To see the same history in another browser, copy the key from Settings and paste it there
+under "Use this key". New events are sent right away; events the server has not confirmed yet (offline,
+server down) wait in the browser's IndexedDB and are sent on the next chance. "Clear all" deletes the history
+on the server for every browser with the key. Export JSON / Import file still work as a backup.
+
+Versions before 0.14 kept the whole history in the browser. On its first run, 0.14 uploads what the server
+lacks (once per domain, resumable) and then deletes the browser's copy and the old copies in script storage.
+
+### Stats server
+
+`supabase/functions/stats` is a Supabase Edge Function that runs the statistics. Its code is
+`src/server/views.js`, which calls the same `src/stats` modules the tests cover; `npm run build` bundles it
+into `supabase/functions/stats/lib.js`. Deploy with
+`npx supabase functions deploy stats --no-verify-jwt --project-ref hafnhxumrqyaljmciqqq` (the script sends the
+publishable key, which is not a JWT). Results are cached per sync key until its events change, and per build,
+so a deploy never serves answers from older code.
 
 ### Updates
 
@@ -84,12 +100,12 @@ every account. Events recorded before 0.9.0 without an account id count for the 
 ### Owner lock
 
 By default the tracker is in guest view: it shows only the signed-in account, exports only that account, and hides
-"Clear all" and cloud sync (the sync key opens every account). Enter the owner password in Settings → Owner lock (or the
+"Clear all" and the sync key (the key opens every account). Enter the owner password in Settings → Owner lock (or the
 "Unlock" button under the title) to see every account. It locks again on page reload or when another account signs
 in, unless "Stay unlocked while … is signed in" is ticked; "Lock now" undoes that for the signed-in account. The
 password is built in and stored only as a salted PBKDF2 hash (`OWNER_LOCK` in `src/store/lock.js`). The lock only
-hides data in the tracker's panels: the events are not encrypted, and anyone with the browser's developer tools can
-still read them.
+hides data in the tracker's panels: anyone with the browser's developer tools can still read the sync key and, with
+it, every account's events.
 
 ## Pulse monitor
 
@@ -109,7 +125,7 @@ npm run build     # writes dist/caser-tracker.user.js
 Previews (serve the project root, for example with the `preview` entry in `.claude/launch.json`):
 
 - `docs/ui-preview.html`: UI with stub stats.
-- `docs/integration.html`: real UI + real stats on generated data.
+- `docs/integration.html`: real UI + the stats server's code on generated data (run in the page, see `src/server/local.js`).
 - `docs/smoke.html`: the built userscript against a fake site API.
 - `docs/smoke-accounts.html`: the built userscript tags live events with the signed-in account, also after a login switch.
 - `docs/exchange-smoke.html`: the exchange panel against a fake replacement modal and fake CSFloat prices.

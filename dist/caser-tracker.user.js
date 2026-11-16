@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.13.3
-// @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
+// @version      0.14.0
+// @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Your events are stored on the tracker's server under a random sync key, which also computes the statistics; no site login or token is sent. Only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
 // @match        https://caser.one/*
@@ -332,12 +332,6 @@
       return false;
     });
   }
-  function caseTwinIds(events) {
-    const imported = events.filter((e) => e && e.kind === "case" && e.source === "import" && e.item);
-    if (!imported.length) return /* @__PURE__ */ new Set();
-    const kept = new Set(dropLiveTwins(imported, events));
-    return new Set(imported.filter((e) => !kept.has(e)).map((e) => e.id));
-  }
   function parseCaseOpen(ex, ctx2, site2) {
     if (ex.status >= 400) return [];
     const body = unwrap(ex.resBody);
@@ -535,8 +529,9 @@
     const userId = ctx2.userId ?? await fetchMe(get, ctx2);
     if (!userId) throw new Error("Sign in first: the tracker does not know your user id yet.");
     const uid = encodeURIComponent(userId);
-    const stored = getStored ? await getStored() : [];
-    const countOf = (...kinds) => stored.filter((e) => kinds.includes(e.kind) && e.source === "import").length;
+    const base = getStored ? await getStored() : [];
+    const stored = Array.isArray(base) ? base : Array.isArray(base?.events) ? base.events : [];
+    const countOf = (...kinds) => Array.isArray(base) ? stored.filter((e) => kinds.includes(e.kind) && e.source === "import").length : kinds.reduce((n, k) => n + (Number(base?.counts?.[k]) || 0), 0);
     let upgrades = 0;
     await paginate(get, `/api/game/upgrade/public-history/${uid}`, async (body, page) => {
       onProgress?.(`Upgrades: page ${page}`);
@@ -1176,131 +1171,26 @@
     return valid;
   }
 
-  // src/store/shared.js
-  var DAY_PREFIX = "ev:d:";
-  var REV_KEY = "ev:rev";
-  var CLEARED_KEY = "ev:clearedAt";
-  var KEEP_DAYS = 14;
-  var DAY_MS = 864e5;
-  function dayKey(ts) {
-    const d = new Date(Number.isFinite(ts) ? ts : 0);
-    return DAY_PREFIX + (Number.isNaN(d.getTime()) ? "1970-01-01" : d.toISOString().slice(0, 10));
-  }
-  function createSharedStore(gm, { now = Date.now, keepDays = KEEP_DAYS } = {}) {
-    const readDay = (key) => {
-      const v = gm.get(key, null);
-      return Array.isArray(v) ? v : [];
-    };
-    const oldestKey = () => dayKey(now() - (keepDays - 1) * DAY_MS);
-    const allDayKeys = () => gm.list().filter((k) => k.startsWith(DAY_PREFIX));
-    const dayKeys = () => {
-      const min = oldestKey();
-      return allDayKeys().filter((k) => k >= min);
-    };
-    function prune() {
-      const min = oldestKey();
-      for (const k of allDayKeys()) if (k < min) gm.del(k);
-    }
-    function bumpRev(days) {
-      gm.set(REV_KEY, { at: Date.now(), days, nonce: Math.random().toString(36).slice(2) });
-    }
-    return {
-      /** Every shared event, oldest first. */
-      readAll() {
-        const out = [];
-        for (const k of dayKeys()) out.push(...readDay(k));
-        return out.sort((a, b) => a.ts - b.ts);
-      },
-      /** Events of the given day keys (as sent in a rev change). */
-      readDays(keys) {
-        const out = [];
-        const min = oldestKey();
-        for (const k of keys ?? []) if (typeof k === "string" && k.startsWith(DAY_PREFIX) && k >= min) out.push(...readDay(k));
-        return out;
-      },
-      /**
-       * Merge events into the shared copy with the same rules as the local store.
-       * Only days that actually change are written. Returns the changed day keys.
-       */
-      merge(events) {
-        prune();
-        const min = oldestKey();
-        const byDay = /* @__PURE__ */ new Map();
-        for (const ev of events) {
-          if (!ev || typeof ev.id !== "string") continue;
-          const k = dayKey(ev.ts);
-          if (k < min) continue;
-          if (!byDay.has(k)) byDay.set(k, []);
-          byDay.get(k).push(ev);
-        }
-        const changed = [];
-        for (const [k, incoming] of byDay) {
-          const list = readDay(k);
-          const index = new Map(list.map((e, i) => [e.id, i]));
-          let dirty = false;
-          for (const ev of incoming) {
-            const i = index.get(ev.id);
-            if (i === void 0) {
-              index.set(ev.id, list.length);
-              list.push(ev);
-              dirty = true;
-            } else if (shouldReplace(list[i], ev)) {
-              list[i] = mergeEvent(list[i], ev);
-              dirty = true;
-            }
-          }
-          if (dirty) {
-            gm.set(k, list);
-            changed.push(k);
-          }
-        }
-        if (changed.length) bumpRev(changed);
-        return changed;
-      },
-      /** Remove events by id from every day. */
-      remove(ids) {
-        const drop = new Set(ids);
-        if (!drop.size) return;
-        const changed = [];
-        for (const k of dayKeys()) {
-          const list = readDay(k);
-          const kept = list.filter((e) => !drop.has(e.id));
-          if (kept.length === list.length) continue;
-          if (kept.length) gm.set(k, kept);
-          else gm.del(k);
-          changed.push(k);
-        }
-        if (changed.length) bumpRev(changed);
-      },
-      /** Delete every shared event and tell the other domains to drop theirs. Returns the clear time. */
-      clear() {
-        for (const k of allDayKeys()) gm.del(k);
-        const at = Date.now();
-        gm.set(CLEARED_KEY, at);
-        bumpRev([]);
-        return at;
-      },
-      clearedAt() {
-        const v = gm.get(CLEARED_KEY, null);
-        return Number.isFinite(v) ? v : null;
-      },
-      /** Calls back with the changed events when another tab (any domain) writes. */
-      onRemoteChange(cb) {
-        gm.listen?.(REV_KEY, (value, remote) => {
-          if (remote) cb(value);
-        });
-      }
-    };
-  }
+  // src/store/gm.js
+  var OLD_EVENT_KEY = /^ev:/;
   function gmStorage() {
     if (typeof GM_getValue !== "function" || typeof GM_setValue !== "function" || typeof GM_listValues !== "function") return null;
     return {
       get: (k, d) => GM_getValue(k, d),
       set: (k, v) => GM_setValue(k, v),
       del: (k) => typeof GM_deleteValue === "function" ? GM_deleteValue(k) : GM_setValue(k, null),
-      list: () => GM_listValues(),
-      listen: typeof GM_addValueChangeListener === "function" ? (k, cb) => GM_addValueChangeListener(k, (_name, _old, value, remote) => cb(value, remote)) : void 0
+      list: () => GM_listValues()
     };
+  }
+  function dropOldEventCopies(gm) {
+    if (!gm) return 0;
+    let n = 0;
+    for (const k of gm.list()) {
+      if (!OLD_EVENT_KEY.test(k)) continue;
+      gm.del(k);
+      n++;
+    }
+    return n;
   }
 
   // src/store/cloud-config.js
@@ -1421,9 +1311,21 @@
         if (!ids.length) return 0;
         return Number(await call("POST", "/rest/v1/rpc/sync_delete", { ids })) || 0;
       },
-      /** Deletes every event under this key. Returns the clear time (ms). */
-      async clear() {
-        return Date.parse(await call("POST", "/rest/v1/rpc/sync_clear", {}));
+      /**
+       * Deletes every event under this key, 5000 rows per request (one big delete runs past the
+       * database's time limit). Returns the clear time (ms); events sent after it are kept.
+       */
+      async clear(onProgress) {
+        let started = null;
+        let deleted = 0;
+        for (let i = 0; i < 1e3; i++) {
+          const r = await call("POST", "/rest/v1/rpc/sync_clear_batch", { started });
+          started = r.at;
+          deleted += Number(r.deleted) || 0;
+          onProgress?.(deleted);
+          if (r.done) break;
+        }
+        return Date.parse(started);
       },
       /**
        * Facts about the whole history under this key: when "clear all" last ran (ms or null) and
@@ -1451,50 +1353,171 @@
     };
   }
 
-  // src/store/accounts.js
-  function accountOf(e, legacy) {
-    return e?.userId != null && e.userId !== "" ? String(e.userId) : legacy ?? null;
+  // src/server/codec.js
+  var INF = "__inf__";
+  var NINF = "__-inf__";
+  var NAN = "__nan__";
+  function encode(value) {
+    return JSON.parse(
+      JSON.stringify(value, (_k, v) => {
+        if (typeof v === "number" && !Number.isFinite(v)) return Number.isNaN(v) ? NAN : v > 0 ? INF : NINF;
+        if (v instanceof Map) return Object.fromEntries(v);
+        if (v instanceof Set) return [...v];
+        return v;
+      })
+    );
   }
-  function pickLegacyOwner(events) {
-    const counts = /* @__PURE__ */ new Map();
-    for (const e of events) {
-      if (e?.userId == null || e.userId === "") continue;
-      const id = String(e.userId);
-      counts.set(id, (counts.get(id) ?? 0) + 1);
+  function decode(value) {
+    if (value === INF) return Infinity;
+    if (value === NINF) return -Infinity;
+    if (value === NAN) return NaN;
+    if (Array.isArray(value)) return value.map(decode);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = decode(v);
+      return out;
     }
-    let best = null;
-    let bestN = 0;
-    for (const [id, n] of counts) {
-      if (n > bestN) {
-        best = id;
-        bestN = n;
+    return value;
+  }
+
+  // src/store/remote-stats.js
+  var BATCH_DELAY_MS = 20;
+  var MAX_VIEWS = 40;
+  function createRemoteStats({ request, getKey, getAccount, url = CLOUD_URL, apiKey = CLOUD_KEY }) {
+    const cache = /* @__PURE__ */ new Map();
+    const queue = /* @__PURE__ */ new Map();
+    const inFlight = /* @__PURE__ */ new Map();
+    const subs = /* @__PURE__ */ new Set();
+    let gen = 1;
+    let timer = null;
+    let version = null;
+    let lastError = null;
+    const accountNow = () => {
+      const a = typeof getAccount === "function" && getAccount() || {};
+      return { sel: a.sel ?? null, legacy: a.legacy ?? null };
+    };
+    const keyOf = (acc, name, args) => JSON.stringify([acc.sel, acc.legacy, name, encode(args)]);
+    function notify() {
+      for (const fn of subs) {
+        try {
+          fn();
+        } catch (err) {
+          console.warn("[caser-tracker] stats subscriber failed", err);
+        }
       }
     }
-    return best;
+    async function send(acc, views) {
+      const key = getKey();
+      if (!key) throw new Error("No sync key yet");
+      const res = await request({
+        method: "POST",
+        url: `${url}/functions/v1/stats`,
+        headers: { apikey: apiKey, "x-sync-key": key, "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ account: acc, views: views.map((v) => ({ name: v.name, args: encode(v.args) })) }),
+        timeout: 6e4
+      });
+      if (res.status < 200 || res.status >= 300 || !Array.isArray(res.json?.results)) {
+        const msg = res.json && (res.json.error || res.json.message);
+        throw new Error(`Stats server answered ${res.status}${msg ? `: ${msg}` : ""}`);
+      }
+      version = res.json.version ?? version;
+      lastError = null;
+      return res.json;
+    }
+    let busy = false;
+    async function flush() {
+      timer = null;
+      if (busy) return;
+      const batch = [...queue].slice(0, MAX_VIEWS);
+      if (!batch.length) return;
+      for (const [k] of batch) queue.delete(k);
+      busy = true;
+      const sentGen = gen;
+      for (const [k] of batch) inFlight.set(k, sentGen);
+      const byAcc = /* @__PURE__ */ new Map();
+      for (const [k, v] of batch) {
+        const ak = JSON.stringify(v.acc);
+        if (!byAcc.has(ak)) byAcc.set(ak, []);
+        byAcc.get(ak).push([k, v]);
+      }
+      for (const items of byAcc.values()) {
+        try {
+          const json = await send(items[0][1].acc, items.map(([, v]) => v));
+          json.results.forEach((r, i) => {
+            const [k] = items[i];
+            const entry = r && r.ok ? { value: decode(r.value) } : { error: new Error(r?.error || "No answer") };
+            cache.set(k, { ...entry, gen: sentGen });
+          });
+        } catch (err) {
+          lastError = err;
+          for (const [k] of items) {
+            const old = cache.get(k);
+            if (old && "value" in old) cache.set(k, { ...old, gen: sentGen, failed: true });
+            else cache.set(k, { error: err, gen: sentGen });
+          }
+        } finally {
+          for (const [k] of items) if (inFlight.get(k) === sentGen) inFlight.delete(k);
+        }
+      }
+      busy = false;
+      notify();
+      if (queue.size && !timer) timer = setTimeout(flush, 0);
+    }
+    function want(k, name, args, acc) {
+      if (queue.has(k) || inFlight.get(k) === gen) return;
+      queue.set(k, { name, args, acc });
+      if (!timer) timer = setTimeout(flush, BATCH_DELAY_MS);
+    }
+    return {
+      /**
+       * @returns {{value: any, stale?: boolean} | {error: Error} | {loading: true}}
+       */
+      get(name, ...args) {
+        const acc = accountNow();
+        const k = keyOf(acc, name, args);
+        const entry = cache.get(k);
+        if (!entry || entry.gen < gen) want(k, name, args, acc);
+        if (!entry) return { loading: true };
+        if ("value" in entry) return { value: entry.value, stale: entry.gen < gen };
+        return { error: entry.error };
+      },
+      /**
+       * One fresh answer, straight from the server (not batched, not cached). Throws on failure.
+       * For code that needs the current value before it goes on, like the site-history import.
+       */
+      async fetch(name, ...args) {
+        const json = await send(accountNow(), [{ name, args }]);
+        const r = json.results[0];
+        if (!r || !r.ok) throw new Error(r?.error || "No answer");
+        return decode(r.value);
+      },
+      /** Every cached answer is old from now on: the next get() of each asks the server again. */
+      invalidate() {
+        gen++;
+      },
+      /** Calls fn whenever answers arrive. Returns a function that stops it. */
+      subscribe(fn) {
+        subs.add(fn);
+        return () => subs.delete(fn);
+      },
+      /** The last network or server error, null after a good answer. */
+      lastError: () => lastError,
+      version: () => version,
+      /** Drop everything (another sync key, or the history was cleared). */
+      reset() {
+        cache.clear();
+        queue.clear();
+        gen++;
+        version = null;
+      }
+    };
   }
-  function filterByAccount(events, id, legacy) {
-    if (id == null || id === "all") return events;
-    return events.filter((e) => accountOf(e, legacy) === id);
-  }
+
+  // src/store/accounts.js
   function resolveSelection(selection, currentId, legacy) {
     if (selection === "all") return "all";
     if (selection && selection !== "current") return String(selection);
     return currentId ?? legacy ?? null;
-  }
-  function listAccounts(events, known, legacy, currentId) {
-    const counts = /* @__PURE__ */ new Map();
-    for (const e of events) {
-      const id = accountOf(e, legacy);
-      if (id != null) counts.set(id, (counts.get(id) ?? 0) + 1);
-    }
-    if (currentId != null && !counts.has(currentId)) counts.set(currentId, 0);
-    const list = [...counts].map(([id, n]) => ({
-      id,
-      name: accountName(id, known),
-      events: n,
-      current: id === currentId
-    }));
-    return list.sort((a, b) => b.current - a.current || b.events - a.events || a.id.localeCompare(b.id));
   }
   function accountName(id, known) {
     const name = known?.[id]?.name;
@@ -1568,38 +1591,15 @@
     return !(userId != null && Array.isArray(trusted) && trusted.includes(userId));
   }
 
-  // src/stats/index.js
-  var stats_exports = {};
-  __export(stats_exports, {
-    OUTLOOK_CHANCE_EDGES: () => OUTLOOK_CHANCE_EDGES,
-    OUTLOOK_WINDOWS: () => OUTLOOK_WINDOWS,
-    calibration: () => calibration,
-    calibrationCurve: () => calibrationCurve,
+  // src/stats/client.js
+  var client_exports = {};
+  __export(client_exports, {
     caseOdds: () => caseOdds,
-    caseRoi: () => caseRoi,
-    chiSquareSf: () => chiSquareSf,
-    edgeMap: () => edgeMap,
-    fSf: () => fSf,
-    factor: () => factor,
-    holm: () => holm,
-    longestLossRun: () => longestLossRun,
-    lossRunProbability: () => lossRunProbability,
-    moneyFlow: () => moneyFlow,
-    mysteryStats: () => mysteryStats,
-    normalCdf: () => normalCdf,
-    outlookModel: () => outlookModel,
+    quoteFromBase: () => quoteFromBase,
     rankCandidates: () => rankCandidates,
     replaceVerdict: () => replaceVerdict,
     sellValue: () => sellValue,
-    sessions: () => sessions,
-    summarize: () => summarize,
-    superDropStats: () => superDropStats,
-    upgradeByChance: () => upgradeByChance,
-    upgradeByStake: () => upgradeByStake,
-    upgradeOutlook: () => upgradeOutlook,
-    upgradeQuote: () => upgradeQuote,
-    upgradeSessions: () => upgradeSessions,
-    wilson: () => wilson
+    upgradeOutlook: () => upgradeOutlook
   });
 
   // src/stats/math.js
@@ -1659,63 +1659,6 @@
     if (!Number.isFinite(x)) return 0;
     return x < a + 1 ? 1 - gammaSeries(a, x) : gammaContinuedFraction(a, x);
   }
-  function chiSquareSf(x, df) {
-    if (!(df > 0) || Number.isNaN(x)) return NaN;
-    return gammaQ(df / 2, x / 2);
-  }
-  function betaContinuedFraction(a, b, x) {
-    const qab = a + b;
-    const qap = a + 1;
-    const qam = a - 1;
-    let c = 1;
-    let d = 1 - qab * x / qap;
-    if (Math.abs(d) < TINY) d = TINY;
-    d = 1 / d;
-    let h2 = d;
-    for (let m = 1; m < MAX_ITER; m++) {
-      const m2 = 2 * m;
-      let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-      d = 1 + aa * d;
-      if (Math.abs(d) < TINY) d = TINY;
-      c = 1 + aa / c;
-      if (Math.abs(c) < TINY) c = TINY;
-      d = 1 / d;
-      h2 *= d * c;
-      aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-      d = 1 + aa * d;
-      if (Math.abs(d) < TINY) d = TINY;
-      c = 1 + aa / c;
-      if (Math.abs(c) < TINY) c = TINY;
-      d = 1 / d;
-      const delta = d * c;
-      h2 *= delta;
-      if (Math.abs(delta - 1) < EPS) break;
-    }
-    return h2;
-  }
-  function betaI(x, a, b) {
-    if (!(x > 0)) return 0;
-    if (x >= 1) return 1;
-    const front = Math.exp(lnGamma(a + b) - lnGamma(a) - lnGamma(b) + a * Math.log(x) + b * Math.log(1 - x));
-    if (x < (a + 1) / (a + b + 2)) return front * betaContinuedFraction(a, b, x) / a;
-    return 1 - front * betaContinuedFraction(b, a, 1 - x) / b;
-  }
-  function fSf(f, d1, d2) {
-    if (!(d1 > 0) || !(d2 > 0) || Number.isNaN(f)) return NaN;
-    if (f <= 0) return 1;
-    if (!Number.isFinite(f)) return 0;
-    return betaI(d2 / (d2 + d1 * f), d2 / 2, d1 / 2);
-  }
-  function normalCdf(x) {
-    if (Number.isNaN(x)) return NaN;
-    if (!Number.isFinite(x)) return x > 0 ? 1 : 0;
-    const tail = 0.5 * gammaQ(0.5, x * x / 2);
-    return x < 0 ? tail : 1 - tail;
-  }
-  function normalTwoSidedP(z) {
-    if (Number.isNaN(z)) return NaN;
-    return gammaQ(0.5, z * z / 2);
-  }
   function wilson(k, n, z = 1.96) {
     if (!(n > 0)) return [0, 1];
     const p = Math.min(Math.max(k / n, 0), 1);
@@ -1724,21 +1667,6 @@
     const center = (p + z2 / (2 * n)) / denom;
     const half = z * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denom;
     return [Math.max(0, center - half), Math.min(1, center + half)];
-  }
-  function holm(pValues, alpha = 0.05) {
-    const out = pValues.map(() => false);
-    const order = pValues.map((p, i) => ({ p, i })).filter((x) => Number.isFinite(x.p)).sort((a, b) => a.p - b.p);
-    const m = order.length;
-    for (let rank = 0; rank < m; rank++) {
-      if (order[rank].p > alpha / (m - rank)) break;
-      out[order[rank].i] = true;
-    }
-    return out;
-  }
-  function poissonBinomialZ(wins, sumP, sumVar) {
-    if (!(sumVar > 1e-12)) return { z: null, p: null };
-    const z = (wins - sumP) / Math.sqrt(sumVar);
-    return { z, p: normalTwoSidedP(z) };
   }
   function binomialPmf(n, p) {
     const pmf = new Array(n + 1).fill(0);
@@ -1767,67 +1695,21 @@
     }
     return pmf.length - 1;
   }
-  function mean(xs) {
-    return xs.length ? xs.reduce((s2, x) => s2 + x, 0) / xs.length : null;
-  }
-  function sampleSd(xs) {
-    if (xs.length < 2) return null;
-    const m = mean(xs);
-    return Math.sqrt(xs.reduce((s2, x) => s2 + (x - m) ** 2, 0) / (xs.length - 1));
-  }
-  function median2(xs) {
-    if (!xs.length) return 0;
-    const s2 = [...xs].sort((a, b) => a - b);
-    const mid = s2.length >> 1;
-    return s2.length % 2 ? s2[mid] : (s2[mid - 1] + s2[mid]) / 2;
-  }
-  function oneWayAnova(groups) {
-    const gs = groups.filter((g) => g.length > 0);
-    const k = gs.length;
-    const total = gs.reduce((s2, g) => s2 + g.length, 0);
-    if (k < 2 || total - k < 1) return { statistic: null, df: 0, dfWithin: 0, p: null };
-    const grand = mean(gs.flat());
-    let ssBetween = 0;
-    let ssWithin = 0;
-    for (const g of gs) {
-      const m = mean(g);
-      ssBetween += g.length * (m - grand) ** 2;
-      ssWithin += g.reduce((s2, x) => s2 + (x - m) ** 2, 0);
-    }
-    const df = k - 1;
-    const dfWithin = total - k;
-    if (!(ssWithin > 0)) return { statistic: null, df, dfWithin, p: null };
-    const statistic = ssBetween / df / (ssWithin / dfWithin);
-    return { statistic, df, dfWithin, p: fSf(statistic, df, dfWithin) };
-  }
 
   // src/stats/core.js
-  var ALPHA = 0.05;
-  var MIN_N = 10;
   var DEFAULT_CHANCE_EDGES = [0, 2, 5, 10, 20, 30, 50, 75, 100];
   var DEFAULT_STAKE_EDGES = [0, 100, 500, 1e3, 5e3, 2e4, Infinity];
-  var DEFAULT_CURVE_EDGES = [0, 10, 15, 20, 30, 50, 75, 100];
-  var Z95 = 1.96;
   function asList(events) {
     return Array.isArray(events) ? events.filter((e) => e && typeof e === "object") : [];
-  }
-  function caseEvents(events) {
-    return asList(events).filter((e) => e.kind === "case");
   }
   function upgradeEvents(events) {
     return asList(events).filter((e) => e.kind === "upgrade" && e.status !== "pending");
   }
-  function validEvents(events) {
-    return asList(events).filter((e) => e.kind === "case" || e.kind === "upgrade" && e.status !== "pending");
-  }
   function sortByTime(events) {
     return [...events].sort((a, b) => num(a.ts) - num(b.ts));
   }
-  var costOf = (e) => e.kind === "case" ? num(e.casePrice) : num(e.stake);
-  var returnedOf = (e) => e.kind === "case" ? num(e.item && e.item.price) : num(e.returned);
   var isWin = (e) => e.status === "won" || e.status == null && e.won === true;
   var chanceOf = (e) => Math.min(Math.max(num(e.chanceShown) / 100, 0), 1);
-  var targetPriceOf = (e) => num(e.target && e.target.price);
   var isMystery = (e) => e.mystery === true;
   var superShown = (e) => !!(e.superDrop && e.superDrop.shown);
   var hasChance = (e) => typeof e.chanceShown === "number" && Number.isFinite(e.chanceShown);
@@ -1837,85 +1719,6 @@
   function oddsEvents(events, opts) {
     return upgradeEvents(events).filter((e) => isOdds(e, opts));
   }
-  function baseMetrics(events) {
-    let cost = 0;
-    let returned = 0;
-    const ratios = [];
-    for (const e of events) {
-      const c = costOf(e);
-      const r = returnedOf(e);
-      cost += c;
-      returned += r;
-      if (c > 0) ratios.push(r / c);
-    }
-    return {
-      n: events.length,
-      cost,
-      returned,
-      net: returned - cost,
-      roi: cost > 0 ? (returned - cost) / cost : null,
-      roiCI: cost > 0 ? ratioInterval(ratios) : null
-    };
-  }
-  function ratioInterval(ratios) {
-    if (ratios.length < 2) return null;
-    const half = Z95 * sampleSd(ratios) / Math.sqrt(ratios.length);
-    const m = mean(ratios);
-    return [m - half - 1, m + half - 1];
-  }
-  function winMetrics(ups) {
-    const n = ups.length;
-    let wins = 0;
-    let sumP = 0;
-    let sumVar = 0;
-    for (const e of ups) {
-      const p2 = chanceOf(e);
-      if (isWin(e)) wins++;
-      sumP += p2;
-      sumVar += p2 * (1 - p2);
-    }
-    const { z, p } = poissonBinomialZ(wins, sumP, sumVar);
-    return {
-      wins,
-      winRate: n ? wins / n : null,
-      winRateCI: n ? wilson(wins, n) : null,
-      expectedRate: n ? sumP / n : null,
-      z,
-      p,
-      significant: false
-    };
-  }
-  function winFields(ups, opts) {
-    const odds = ups.filter((e) => isOdds(e, opts));
-    return { ...winMetrics(odds), oddsN: odds.length };
-  }
-  function adjustedWinFields(odds, expectedOf) {
-    let wins = 0;
-    let sumP = 0;
-    let sumVar = 0;
-    for (const e of odds) {
-      const p2 = Math.min(Math.max(expectedOf(e), 0), 1);
-      if (isWin(e)) wins++;
-      sumP += p2;
-      sumVar += p2 * (1 - p2);
-    }
-    const { z, p } = poissonBinomialZ(wins, sumP, sumVar);
-    return { expectedRateAdj: odds.length ? sumP / odds.length : null, zAdj: z, pAdj: p, significantAdj: false };
-  }
-  function upgradeMetrics(ups, opts) {
-    return { ...baseMetrics(ups), ...winFields(ups, opts) };
-  }
-  function markSignificant(rows, alpha = ALPHA, pKey = "p", flagKey = "significant") {
-    const eligible = rows.filter((r) => (r.oddsN ?? r.n) >= MIN_N && Number.isFinite(r[pKey]));
-    const flags = holm(eligible.map((r) => r[pKey]), alpha);
-    rows.forEach((r) => {
-      if (flagKey in r) r[flagKey] = false;
-    });
-    eligible.forEach((r, i) => {
-      r[flagKey] = flags[i];
-    });
-    return rows;
-  }
   function bucketIndex(x, edges) {
     const last = edges.length - 1;
     if (!(x >= edges[0]) || x > edges[last]) return -1;
@@ -1924,130 +1727,10 @@
     }
     return last - 1;
   }
-  function edgeText(v) {
-    return Number.isFinite(v) ? String(v) : "\u221E";
-  }
-  function makeBuckets(edges, suffix = "") {
-    const out = [];
-    for (let i = 0; i + 1 < edges.length; i++) {
-      const lo = edges[i];
-      const hi = edges[i + 1];
-      const label = Number.isFinite(hi) ? `${edgeText(lo)}-${edgeText(hi)}${suffix}` : `${edgeText(lo)}+${suffix}`;
-      out.push({ label, lo, hi });
-    }
-    return out;
-  }
-  function groupByBucket(items, edges, valueOf) {
-    const groups = makeBuckets(edges).map(() => []);
-    for (const item of items) {
-      const i = bucketIndex(valueOf(item), edges);
-      if (i >= 0) groups[i].push(item);
-    }
-    return groups;
-  }
-
-  // src/stats/tables.js
-  function summarize(events) {
-    const all = sortByTime(validEvents(events));
-    return {
-      cases: baseMetrics(caseEvents(events)),
-      upgrades: upgradeMetrics(upgradeEvents(events)),
-      total: baseMetrics(all),
-      firstTs: all.length ? num(all[0].ts) : null,
-      lastTs: all.length ? num(all[all.length - 1].ts) : null
-    };
-  }
-  function bestDrop(evs) {
-    let best = null;
-    for (const e of evs) {
-      if (e.item && (best === null || num(e.item.price) > num(best.price))) best = e.item;
-    }
-    return best;
-  }
-  function caseRoi(events) {
-    const groups = /* @__PURE__ */ new Map();
-    for (const e of sortByTime(caseEvents(events))) {
-      if (!groups.has(e.caseSlug)) groups.set(e.caseSlug, []);
-      groups.get(e.caseSlug).push(e);
-    }
-    const rows = [];
-    for (const [caseSlug, evs] of groups) {
-      const latest = evs[evs.length - 1];
-      const prices2 = evs.map((e) => num(e.item && e.item.price));
-      rows.push({
-        ...baseMetrics(evs),
-        caseSlug,
-        caseName: latest.caseName,
-        casePrice: num(latest.casePrice),
-        best: bestDrop(evs),
-        median: median2(prices2),
-        hitRate: evs.filter((e) => num(e.item && e.item.price) >= num(e.casePrice)).length / evs.length
-      });
-    }
-    return rows.sort((a, b) => b.n - a.n);
-  }
-  function bucketTable(events, edges, valueOf, suffix, opts) {
-    const ups = oddsEvents(events, opts);
-    const groups = groupByBucket(ups, edges, valueOf);
-    const rows = makeBuckets(edges, suffix).map((b, i) => ({ label: b.label, lo: b.lo, hi: b.hi, ...upgradeMetrics(groups[i], opts) }));
-    return markSignificant(rows);
-  }
-  function upgradeByChance(events, edges = DEFAULT_CHANCE_EDGES, opts = {}) {
-    return bucketTable(events, edges, (e) => num(e.chanceShown), "%", opts);
-  }
-  function upgradeByStake(events, edges = DEFAULT_STAKE_EDGES, opts = {}) {
-    return bucketTable(events, edges, (e) => num(e.stake), "", opts);
-  }
 
   // src/stats/calibration.js
   var MIN_N_FOR_EDGE = 30;
   var LONG_RUN_TRIES = 100;
-  function calibration(events, opts = {}) {
-    const ups = oddsEvents(events, opts);
-    const w = winMetrics(ups);
-    const base = baseMetrics(ups);
-    let verdict = "consistent";
-    if (w.p !== null && w.p < ALPHA) verdict = w.z < 0 ? "below" : "above";
-    return {
-      n: ups.length,
-      wins: w.wins,
-      expectedWins: ups.reduce((s2, e) => s2 + chanceOf(e), 0),
-      winRate: w.winRate,
-      expectedRate: w.expectedRate,
-      z: w.z,
-      p: w.p,
-      verdict,
-      impliedRtp: base.cost > 0 ? base.returned / base.cost : null
-    };
-  }
-  function shownRtpOf(ups) {
-    const vals = ups.filter((e) => targetPriceOf(e) > 0 && num(e.stake) > 0).map((e) => chanceOf(e) * targetPriceOf(e) / num(e.stake));
-    return mean(vals);
-  }
-  function edgeMap(events, edges = DEFAULT_CHANCE_EDGES, opts = {}) {
-    const ups = oddsEvents(events, opts);
-    const rows = [];
-    const groups = groupByBucket(ups, edges, (e) => num(e.chanceShown));
-    for (const [i, b] of makeBuckets(edges, "%").entries()) {
-      const inBucket = groups[i];
-      for (const mode of ["normal"]) {
-        const evs = inBucket;
-        if (!evs.length) continue;
-        const m = baseMetrics(evs);
-        rows.push({
-          label: b.label,
-          lo: b.lo,
-          hi: b.hi,
-          n: m.n,
-          shownRtp: shownRtpOf(evs),
-          realRtp: m.cost > 0 ? m.returned / m.cost : null,
-          realRtpCI: m.roiCI ? [m.roiCI[0] + 1, m.roiCI[1] + 1] : null,
-          mode
-        });
-      }
-    }
-    return rows;
-  }
   function longRun(stake, targetPrice, chance) {
     const empty = { tries: LONG_RUN_TRIES, mean: null, p05: null, p95: null, probProfit: null };
     if (!(stake > 0) || !(targetPrice > 0)) return empty;
@@ -2067,20 +1750,17 @@
       probProfit: Math.min(probProfit, 1)
     };
   }
-  function upgradeQuote(sel, events, opts = {}) {
+  function quoteFromBase(sel, base) {
     const stake = num(sel && sel.stake);
     const targetPrice = num(sel && sel.targetPrice);
     const given = sel && sel.chanceShown != null ? num(sel.chanceShown) : null;
     const chanceShown = given !== null ? given : shownChance(stake, targetPrice);
     const ev = chanceShown / 100 * targetPrice - stake;
-    const ups = oddsEvents(events, opts);
     const chanceBucket = bucketIndex(chanceShown, DEFAULT_CHANCE_EDGES);
-    const sameChance = chanceBucket < 0 ? [] : ups.filter((e) => bucketIndex(num(e.chanceShown), DEFAULT_CHANCE_EDGES) === chanceBucket);
     const stakeBucket = bucketIndex(stake, DEFAULT_STAKE_EDGES);
-    const similar = stakeBucket < 0 ? [] : sameChance.filter((e) => bucketIndex(num(e.stake), DEFAULT_STAKE_EDGES) === stakeBucket);
-    const edgeBase = baseMetrics(sameChance);
-    const wins = similar.filter(isWin).length;
-    const realEdge = sameChance.length >= MIN_N_FOR_EDGE && edgeBase.cost > 0 ? edgeBase.returned / edgeBase.cost - 1 : null;
+    const edgeBase = chanceBucket >= 0 && base?.chance?.[chanceBucket] || { n: 0, cost: 0, returned: 0 };
+    const cell = chanceBucket >= 0 && stakeBucket >= 0 && base?.cells?.[chanceBucket]?.[stakeBucket] || { n: 0, wins: 0 };
+    const realEdge = edgeBase.n >= MIN_N_FOR_EDGE && edgeBase.cost > 0 ? edgeBase.returned / edgeBase.cost - 1 : null;
     const longRunChance = realEdge !== null && targetPrice > 0 ? (1 + realEdge) * (stake / targetPrice) * 100 : chanceShown;
     return {
       chanceShown,
@@ -2090,550 +1770,13 @@
       evPct: stake > 0 ? ev / stake : null,
       realEdge,
       similar: {
-        n: similar.length,
-        wins,
-        winRate: similar.length ? wins / similar.length : null,
-        winRateCI: similar.length ? wilson(wins, similar.length) : null
+        n: cell.n,
+        wins: cell.wins,
+        winRate: cell.n ? cell.wins / cell.n : null,
+        winRateCI: cell.n ? wilson(cell.wins, cell.n) : null
       },
       longRun: { ...longRun(stake, targetPrice, longRunChance), basis: realEdge !== null ? "history" : "shown" }
     };
-  }
-  function calibrationCurve(events, edges = DEFAULT_CURVE_EDGES, opts = {}) {
-    const groups = groupByBucket(oddsEvents(events, opts), edges, (e) => num(e.chanceShown));
-    const rows = makeBuckets(edges, "%").map((b, i) => {
-      const evs = groups[i];
-      const m = baseMetrics(evs);
-      const w = winMetrics(evs);
-      return {
-        label: b.label,
-        lo: b.lo,
-        hi: b.hi,
-        n: evs.length,
-        wins: w.wins,
-        expectedRate: w.expectedRate,
-        winRate: w.winRate,
-        winRateCI: w.winRateCI,
-        z: w.z,
-        p: w.p,
-        significant: false,
-        realRtp: m.cost > 0 ? m.returned / m.cost : null
-      };
-    });
-    return markSignificant(rows);
-  }
-  var MIN_CURVE_N = 30;
-  function curveLookup(curve, edges = DEFAULT_CURVE_EDGES) {
-    return (e) => {
-      const i = bucketIndex(num(e.chanceShown), edges);
-      const row = i >= 0 ? curve[i] : null;
-      return row && row.n >= MIN_CURVE_N && row.winRate !== null ? row.winRate : chanceOf(e);
-    };
-  }
-
-  // src/stats/sessions.js
-  function sessionize(sorted, gapMinutes = 30) {
-    const gapMs = gapMinutes * 6e4;
-    const out = [];
-    let prevTs = null;
-    for (const e of sorted) {
-      const ts = num(e.ts);
-      if (prevTs === null || ts - prevTs > gapMs) out.push([]);
-      out[out.length - 1].push(e);
-      prevTs = ts;
-    }
-    return out;
-  }
-  function sessions(events, gapMinutes = 30) {
-    return sessionize(sortByTime(validEvents(events)), gapMinutes).map((evs) => {
-      let cost = 0;
-      let returned = 0;
-      const kinds = { case: 0, upgrade: 0 };
-      for (const e of evs) {
-        cost += costOf(e);
-        returned += returnedOf(e);
-        kinds[e.kind]++;
-      }
-      return { start: num(evs[0].ts), end: num(evs[evs.length - 1].ts), n: evs.length, cost, returned, net: returned - cost, kinds };
-    });
-  }
-
-  // src/stats/factor.js
-  var HOUR_MS = 36e5;
-  var MIN_MS = 6e4;
-  var pad2 = (n) => String(n).padStart(2, "0");
-  var range = (n) => Array.from({ length: n }, (_, i) => i);
-  var cat = (value, label = String(value)) => ({ value, label });
-  var hourOf = (e) => new Date(num(e.ts)).getHours();
-  var WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  var MULTIPLIER_EDGES = [0, 2, 5, 10, Infinity];
-  var MULTIPLIER_LABELS = ["x<2", "x2-5", "x5-10", "x10+"];
-  function bucketFactor(edgesOf, labelsOf, valueOf, scope = "both") {
-    return {
-      scope,
-      cats: (opts) => labelsOf(edgesOf(opts)).map((l) => cat(l)),
-      assign: (e, ctx2, opts) => {
-        const v = valueOf(e);
-        if (v === null || v === void 0 || Number.isNaN(v)) return void 0;
-        const edges = edgesOf(opts);
-        const i = bucketIndex(v, edges);
-        return i < 0 ? void 0 : labelsOf(edges)[i];
-      }
-    };
-  }
-  var FACTORS = {
-    hour: { scope: "both", cats: () => range(24).map((h2) => cat(h2, `${pad2(h2)}:00`)), assign: hourOf },
-    weekday: {
-      scope: "both",
-      cats: () => WEEKDAYS.map((d, i) => cat(i, d)),
-      assign: (e) => (new Date(num(e.ts)).getDay() + 6) % 7
-    },
-    daypart: {
-      scope: "both",
-      cats: () => [cat("night", "Night 00-06"), cat("morning", "Morning 06-12"), cat("afternoon", "Afternoon 12-18"), cat("evening", "Evening 18-24")],
-      assign: (e) => {
-        const h2 = hourOf(e);
-        return h2 < 6 ? "night" : h2 < 12 ? "morning" : h2 < 18 ? "afternoon" : "evening";
-      }
-    },
-    sessionPosition: {
-      scope: "both",
-      needs: "session",
-      cats: () => [cat("1st-5th"), cat("6th-20th"), cat("21st+")],
-      assign: (e, ctx2) => {
-        const p = ctx2.session.get(e).position;
-        return p <= 5 ? "1st-5th" : p <= 20 ? "6th-20th" : "21st+";
-      }
-    },
-    sessionMinute: {
-      scope: "both",
-      needs: "session",
-      cats: () => [cat("0-15 min"), cat("15-60 min"), cat("60+ min")],
-      assign: (e, ctx2) => {
-        const m = ctx2.session.get(e).minutes;
-        return m < 15 ? "0-15 min" : m < 60 ? "15-60 min" : "60+ min";
-      }
-    },
-    afterLossStreak: {
-      scope: "upgrade",
-      needs: "streak",
-      cats: () => [cat(0), cat(1), cat(2), cat("3-4"), cat("5+")],
-      assign: (e, ctx2) => {
-        const s2 = ctx2.streak.get(e).streak;
-        return s2 <= 2 ? s2 : s2 <= 4 ? "3-4" : "5+";
-      }
-    },
-    afterWin: {
-      scope: "upgrade",
-      needs: "streak",
-      cats: () => [cat("won", "Previous won"), cat("lost", "Previous lost"), cat("none", "First upgrade")],
-      assign: (e, ctx2) => ctx2.streak.get(e).prev
-    },
-    mode: {
-      scope: "upgrade",
-      pool: "anyUpgrade",
-      cats: () => [cat("normal"), cat("mystery")],
-      assign: (e) => e.mystery ? "mystery" : "normal"
-    },
-    gameMode: { scope: "both", cats: () => null, assign: (e) => String(e.gameMode ?? "unknown") },
-    site: { scope: "both", cats: () => null, assign: (e) => String(e.site ?? "unknown") },
-    free: {
-      scope: "case",
-      cats: () => [cat("paid"), cat("free")],
-      assign: (e) => e.free ? "free" : "paid"
-    },
-    itemCount: {
-      scope: "upgrade",
-      cats: () => [1, 2, 3, 4, 5, 6].map((n) => cat(n, n === 6 ? "6+" : String(n))),
-      assign: (e) => Math.min(6, Math.max(1, Array.isArray(e.betItems) ? e.betItems.length : 1))
-    },
-    addedBalance: {
-      scope: "upgrade",
-      cats: () => [cat("none"), cat("some")],
-      assign: (e) => num(e.addedBalance) > 0 ? "some" : "none"
-    },
-    balanceBand: bucketFactor(
-      (opts) => opts.edges ?? DEFAULT_STAKE_EDGES,
-      (edges) => makeBuckets(edges).map((b) => b.label),
-      (e) => e.balanceBefore === null || e.balanceBefore === void 0 ? null : num(e.balanceBefore)
-    ),
-    sinceDeposit: {
-      scope: "both",
-      needs: "deposit",
-      cats: () => ["0-5m", "5-15m", "15-60m", "1-6h", "6h+", "no deposit yet"].map((l) => cat(l)),
-      assign: (e, ctx2) => {
-        const t = ctx2.sinceDeposit.get(e);
-        if (t === null) return "no deposit yet";
-        return t < 5 * MIN_MS ? "0-5m" : t < 15 * MIN_MS ? "5-15m" : t < HOUR_MS ? "15-60m" : t < 6 * HOUR_MS ? "1-6h" : "6h+";
-      }
-    },
-    afterDepositOrder: {
-      scope: "upgrade",
-      needs: "deposit",
-      cats: () => ["1st", "2nd-5th", "6th-20th", "21st+"].map((l) => cat(l)),
-      assign: (e, ctx2) => {
-        const k = ctx2.depositOrder.get(e);
-        if (!k) return void 0;
-        return k === 1 ? "1st" : k <= 5 ? "2nd-5th" : k <= 20 ? "6th-20th" : "21st+";
-      }
-    },
-    sinceWithdrawal: {
-      scope: "both",
-      needs: "withdrawal",
-      cats: () => ["<1h", "1-24h", "24h+ / none"].map((l) => cat(l)),
-      assign: (e, ctx2) => {
-        const t = ctx2.sinceWithdrawal.get(e);
-        return t !== null && t < HOUR_MS ? "<1h" : t !== null && t < 24 * HOUR_MS ? "1-24h" : "24h+ / none";
-      }
-    },
-    superDrop: {
-      scope: "upgrade",
-      pool: "super",
-      cats: () => [cat("shown"), cat("not shown")],
-      assign: (e) => superShown(e) ? "shown" : "not shown"
-    },
-    multiplier: bucketFactor(
-      () => MULTIPLIER_EDGES,
-      () => MULTIPLIER_LABELS,
-      (e) => targetPriceOf(e) > 0 && num(e.stake) > 0 ? targetPriceOf(e) / num(e.stake) : null,
-      "upgrade"
-    )
-  };
-  function ageSince(sorted, times) {
-    const out = /* @__PURE__ */ new Map();
-    let i = 0;
-    for (const e of sorted) {
-      const ts = num(e.ts);
-      while (i < times.length && times[i] <= ts) i++;
-      out.set(e, i > 0 ? ts - times[i - 1] : null);
-    }
-    return out;
-  }
-  var timesOf = (events, pred) => events.filter(pred).map((e) => num(e.ts)).sort((a, b) => a - b);
-  function buildContext(sorted, needs, gapMinutes, events) {
-    const ctx2 = {};
-    if (needs === "session") {
-      ctx2.session = /* @__PURE__ */ new Map();
-      for (const s2 of sessionize(sorted, gapMinutes)) {
-        const t0 = num(s2[0].ts);
-        s2.forEach((e, i) => ctx2.session.set(e, { position: i + 1, minutes: (num(e.ts) - t0) / 6e4 }));
-      }
-    }
-    if (needs === "streak") {
-      ctx2.streak = /* @__PURE__ */ new Map();
-      let streak = 0;
-      let prev = "none";
-      for (const e of sortByTime(upgradeEvents(events))) {
-        ctx2.streak.set(e, { streak, prev });
-        if (isWin(e)) {
-          streak = 0;
-          prev = "won";
-        } else {
-          streak++;
-          prev = "lost";
-        }
-      }
-    }
-    if (needs === "deposit") {
-      const deposits = timesOf(events, (e) => e && e.kind === "deposit" && e.status === "completed");
-      ctx2.sinceDeposit = ageSince(sorted, deposits);
-      ctx2.depositOrder = /* @__PURE__ */ new Map();
-      let i = 0;
-      let count = 0;
-      let seen = false;
-      for (const e of sortByTime(upgradeEvents(events))) {
-        const ts = num(e.ts);
-        while (i < deposits.length && deposits[i] <= ts) {
-          i++;
-          count = 0;
-          seen = true;
-        }
-        count++;
-        ctx2.depositOrder.set(e, seen ? count : 0);
-      }
-    }
-    if (needs === "withdrawal") {
-      ctx2.sinceWithdrawal = ageSince(sorted, timesOf(events, (e) => e && e.kind === "withdrawal"));
-    }
-    return ctx2;
-  }
-  var rowOptsOf = (def, opts) => def.pool === "super" ? { includeSuperDrop: true } : opts;
-  function selectEvents(events, def, opts) {
-    const scope = def.scope;
-    if (scope !== "both" && opts.kind && opts.kind !== scope) return { mode: scope, evs: [] };
-    const mode = scope === "both" ? opts.kind ?? "both" : scope;
-    const cases = mode === "upgrade" ? [] : caseEvents(events);
-    let ups = [];
-    if (mode !== "case") {
-      ups = upgradeEvents(events);
-      if (def.pool === "anyUpgrade") ups = ups.filter((e) => opts.includeSuperDrop || !superShown(e));
-      else ups = ups.filter((e) => isOdds(e, rowOptsOf(def, opts)));
-    }
-    return { mode, evs: [...cases, ...ups] };
-  }
-  function rowMetrics(evs, mode, rowOpts, expectedOf) {
-    if (mode === "case") return baseMetrics(evs);
-    const ups = mode === "upgrade" ? evs : evs.filter((e) => e.kind === "upgrade");
-    const adj = adjustedWinFields(ups.filter((e) => isOdds(e, rowOpts)), expectedOf);
-    if (mode === "upgrade") return { ...upgradeMetrics(evs, rowOpts), ...adj };
-    const up = upgradeMetrics(ups, rowOpts);
-    return {
-      ...baseMetrics(evs),
-      wins: up.wins,
-      winRate: up.winRate,
-      winRateCI: up.winRateCI,
-      expectedRate: up.expectedRate,
-      z: up.z,
-      p: up.p,
-      significant: false,
-      oddsN: up.oddsN,
-      upgradeN: ups.length,
-      ...adj
-    };
-  }
-  function dynamicCats(groups) {
-    return [...groups.keys()].sort((a, b) => groups.get(b).length - groups.get(a).length || String(a).localeCompare(String(b))).map((v) => cat(v));
-  }
-  var noTest = (method) => ({ method, statistic: null, df: 0, p: null, significant: false });
-  function chiSquare(rows, expectedOf) {
-    let statistic = 0;
-    let used = 0;
-    for (const r of rows) {
-      const n = r.oddsN;
-      if (!n) continue;
-      const expWins = expectedOf(r);
-      const expLosses = n - expWins;
-      if (!(expWins >= 1) || !(expLosses >= 1)) continue;
-      used++;
-      statistic += (r.wins - expWins) ** 2 / expWins + (n - r.wins - expLosses) ** 2 / expLosses;
-    }
-    if (used === 0) return { statistic: null, df: 0, p: null };
-    const df = used - 1;
-    return { statistic, df, p: df >= 1 ? chiSquareSf(statistic, df) : null };
-  }
-  function chiSquareTest(rows) {
-    const shown = chiSquare(rows, (r) => r.expectedRate * r.oddsN);
-    const adj = chiSquare(rows, (r) => r.expectedRateAdj * r.oddsN);
-    return {
-      method: "chi-square",
-      statistic: shown.statistic,
-      df: shown.df,
-      p: shown.p,
-      significant: shown.p !== null && shown.p < ALPHA,
-      statisticAdj: adj.statistic,
-      dfAdj: adj.df,
-      pAdj: adj.p,
-      significantAdj: adj.p !== null && adj.p < ALPHA
-    };
-  }
-  function anovaTest(groupEvents) {
-    const ratios = groupEvents.map((evs) => evs.filter((e) => costOf(e) > 0).map((e) => returnedOf(e) / costOf(e)));
-    const r = oneWayAnova(ratios);
-    return { ...noTest("anova"), ...r, significant: r.p !== null && r.p < ALPHA };
-  }
-  function factor(events, key, opts = {}) {
-    const def = Object.hasOwn(FACTORS, key) ? FACTORS[key] : null;
-    if (!def) throw new Error(`Unknown factor: ${key}`);
-    const all = Array.isArray(events) ? events.filter((e) => e && typeof e === "object") : [];
-    const { mode, evs } = selectEvents(all, def, opts);
-    const sorted = sortByTime(evs);
-    const ctx2 = buildContext(sorted, def.needs, opts.gapMinutes ?? 30, all);
-    const groups = /* @__PURE__ */ new Map();
-    for (const e of sorted) {
-      const v = def.assign(e, ctx2, opts);
-      if (v === void 0) continue;
-      if (!groups.has(v)) groups.set(v, []);
-      groups.get(v).push(e);
-    }
-    const rowOpts = rowOptsOf(def, opts);
-    const curve = calibrationCurve(all, void 0, { includeSuperDrop: !!opts.includeSuperDrop });
-    const expectedOf = curveLookup(curve);
-    const cats = def.cats(opts) ?? dynamicCats(groups);
-    const rows = cats.map((c) => ({ value: c.value, label: c.label, ...rowMetrics(groups.get(c.value) ?? [], mode, rowOpts, expectedOf) }));
-    const tested = mode !== "case" && rows.some((r) => r.oddsN > 0);
-    if (tested) {
-      markSignificant(rows);
-      markSignificant(rows, ALPHA, "pAdj", "significantAdj");
-    }
-    const test = tested ? chiSquareTest(rows) : anovaTest(cats.map((c) => groups.get(c.value) ?? []));
-    return { key, rows, test };
-  }
-
-  // src/stats/upgradesessions.js
-  var UPGRADE_SESSION_GAP_MIN = 60;
-  var STREAK_LENGTHS = [5, 10, 15, 20, 30];
-  var isActivity = (e) => e && typeof e === "object" && (e.kind === "upgrade" || e.kind === "case" || e.kind === "deposit");
-  var isSettledUpgrade = (e) => e.kind === "upgrade" && e.status !== "pending";
-  function longestLossRun(ups) {
-    let best = 0;
-    let run = 0;
-    for (const e of ups) {
-      run = isWin(e) ? 0 : run + 1;
-      if (run > best) best = run;
-    }
-    return best;
-  }
-  function lossRunProbability(ps, len) {
-    if (!(len > 0)) return 1;
-    if (len > ps.length) return 0;
-    let f = new Float64Array(len);
-    f[0] = 1;
-    let hit = 0;
-    for (const p0 of ps) {
-      const p = Math.min(Math.max(num(p0), 0), 1);
-      const q = 1 - p;
-      const g = new Float64Array(len);
-      let alive = 0;
-      for (let r = 0; r < len; r++) alive += f[r];
-      g[0] = alive * p;
-      for (let r = 0; r + 1 < len; r++) g[r + 1] = f[r] * q;
-      hit += f[len - 1] * q;
-      f = g;
-    }
-    return Math.min(Math.max(hit, 0), 1);
-  }
-  function bucketRows(odds, edges) {
-    const buckets = makeBuckets(edges, "%");
-    const groups = buckets.map(() => []);
-    for (const e of odds) {
-      const i = bucketIndex(num(e.chanceShown), edges);
-      if (i >= 0) groups[i].push(e);
-    }
-    return buckets.map((b, i) => {
-      const g = groups[i];
-      if (!g.length) return null;
-      const w = winMetrics(g);
-      const longest = longestLossRun(g);
-      return {
-        label: b.label,
-        lo: b.lo,
-        hi: b.hi,
-        n: g.length,
-        wins: w.wins,
-        winRate: w.winRate,
-        expectedRate: w.expectedRate,
-        expectedWins: g.reduce((s2, e) => s2 + chanceOf(e), 0),
-        longestLosses: longest,
-        longestP: lossRunProbability(g.map(chanceOf), longest)
-      };
-    }).filter(Boolean);
-  }
-  function streakTable(odds, edges) {
-    const buckets = makeBuckets(edges, "%");
-    const groups = buckets.map(() => []);
-    for (const e of odds) {
-      const i = bucketIndex(num(e.chanceShown), edges);
-      if (i >= 0) groups[i].push(e);
-    }
-    return buckets.map((b, i) => {
-      const g = groups[i];
-      if (!g.length) return null;
-      const stretches = [];
-      let run = 0;
-      for (const e of g) {
-        if (isWin(e)) {
-          stretches.push(run);
-          run = 0;
-        } else run++;
-      }
-      if (run > 0) stretches.push(run);
-      const meanP = g.reduce((s2, e) => s2 + chanceOf(e), 0) / g.length;
-      const share = {};
-      const expected = {};
-      for (const k of STREAK_LENGTHS) {
-        share[k] = stretches.length ? stretches.filter((x) => x >= k).length / stretches.length : null;
-        expected[k] = Math.pow(1 - meanP, k);
-      }
-      const longest = stretches.length ? Math.max(...stretches) : 0;
-      return {
-        label: b.label,
-        lo: b.lo,
-        hi: b.hi,
-        n: g.length,
-        stretches: stretches.length,
-        meanChance: meanP,
-        share,
-        expected,
-        longestLosses: longest,
-        longestP: lossRunProbability(g.map(chanceOf), longest)
-      };
-    }).filter(Boolean);
-  }
-  function upgradeSessions(events, opts = {}) {
-    const gapMinutes = num(opts.gapMinutes) > 0 ? num(opts.gapMinutes) : UPGRADE_SESSION_GAP_MIN;
-    const edges = Array.isArray(opts.chanceEdges) && opts.chanceEdges.length >= 2 ? opts.chanceEdges : DEFAULT_CHANCE_EDGES;
-    const list = Array.isArray(events) ? events.filter(isActivity) : [];
-    const sorted = sortByTime(list);
-    const allOdds = [];
-    const rows = [];
-    for (const evs of sessionize(sorted, gapMinutes)) {
-      const ups = evs.filter(isSettledUpgrade);
-      if (!ups.length) continue;
-      const odds = ups.filter((e) => isOdds(e));
-      allOdds.push(...odds);
-      const base = baseMetrics(ups);
-      const win = winMetrics(odds);
-      const deposits = evs.filter((e) => e.kind === "deposit" && e.status === "completed");
-      const longest = longestLossRun(odds);
-      rows.push({
-        start: num(evs[0].ts),
-        end: num(evs[evs.length - 1].ts),
-        upgrades: ups.length,
-        cases: evs.filter((e) => e.kind === "case").length,
-        deposits: deposits.length,
-        deposited: deposits.reduce((s2, e) => s2 + num(e.amount), 0),
-        cost: base.cost,
-        returned: base.returned,
-        net: base.net,
-        rtp: base.cost > 0 ? base.returned / base.cost : null,
-        oddsN: odds.length,
-        n: odds.length,
-        wins: win.wins,
-        winRate: win.winRate,
-        winRateCI: win.winRateCI,
-        expectedRate: win.expectedRate,
-        expectedWins: odds.reduce((s2, e) => s2 + chanceOf(e), 0),
-        z: win.z,
-        p: win.p,
-        significant: false,
-        longestLosses: longest,
-        longestP: lossRunProbability(odds.map(chanceOf), longest),
-        byChance: bucketRows(odds, edges)
-      });
-    }
-    const eligible = rows.filter((r) => r.oddsN >= MIN_N && Number.isFinite(r.p));
-    const flags = holm(eligible.map((r) => r.p), ALPHA);
-    eligible.forEach((r, i) => {
-      r.significant = flags[i];
-    });
-    const below = eligible.filter((r) => r.p < ALPHA && r.z < 0).length;
-    const above = eligible.filter((r) => r.p < ALPHA && r.z > 0).length;
-    const zs = eligible.map((r) => r.z).filter(Number.isFinite);
-    const chi = zs.reduce((s2, z) => s2 + z * z, 0);
-    const all = winMetrics(allOdds);
-    const summary = {
-      sessions: rows.length,
-      tested: eligible.length,
-      below,
-      above,
-      expectedEachSide: eligible.length * (ALPHA / 2),
-      significantBelow: eligible.filter((r) => r.significant && r.z < 0).length,
-      significantAbove: eligible.filter((r) => r.significant && r.z > 0).length,
-      unluckyShare: zs.length ? zs.filter((z) => z < 0).length / zs.length : null,
-      // Sum of z² over sessions ~ chi-square(k) if every session is luck around the shown odds.
-      // A small p means sessions swing more than luck allows (some rigged against you, some for).
-      spreadChi: zs.length ? chi : null,
-      spreadDf: zs.length,
-      spreadP: zs.length ? chiSquareSf(chi, zs.length) : null,
-      n: allOdds.length,
-      wins: all.wins,
-      winRate: all.winRate,
-      expectedRate: all.expectedRate,
-      expectedWins: allOdds.reduce((s2, e) => s2 + chanceOf(e), 0),
-      z: all.z,
-      p: all.p
-    };
-    rows.sort((a, b) => b.start - a.start);
-    return { gapMinutes, summary, sessions: rows, streaks: streakTable(sortByTime(allOdds), edges) };
   }
 
   // src/stats/outlook.js
@@ -2760,140 +1903,6 @@
         const q = posterior(c);
         return { key: w.key, label: w.label, n: c.n, ratio: c.n ? q.a / q.b : null, realChance: Math.min(1, p * (q.a / q.b)) };
       })
-    };
-  }
-
-  // src/stats/superdrop.js
-  function part(evs) {
-    const w = winMetrics(evs);
-    const m = baseMetrics(evs);
-    return {
-      n: evs.length,
-      wins: w.wins,
-      winRate: w.winRate,
-      expectedRate: w.expectedRate,
-      z: w.z,
-      p: w.p,
-      rtp: m.cost > 0 ? m.returned / m.cost : null
-    };
-  }
-  function superDropStats(events) {
-    const ups = upgradeEvents(events).filter((e) => isOdds(e, { includeSuperDrop: true }));
-    const shown = ups.filter(superShown);
-    const notShown = ups.filter((e) => !superShown(e));
-    const mults = shown.filter((e) => e.superDrop.won === true && targetPriceOf(e) > 0).map((e) => returnedOf(e) / targetPriceOf(e));
-    return {
-      n: ups.length,
-      shownN: shown.length,
-      shownRate: ups.length ? shown.length / ups.length : null,
-      shown: part(shown),
-      notShown: part(notShown),
-      hits: {
-        n: mults.length,
-        avgMultiplier: mean(mults),
-        minMultiplier: mults.length ? Math.min(...mults) : null,
-        maxMultiplier: mults.length ? Math.max(...mults) : null
-      }
-    };
-  }
-
-  // src/stats/mystery.js
-  var DEFAULT_MYSTERY_STAKE_EDGES = [0, 100, 500, 1e3, 3e3, Infinity];
-  var MULTIPLIER_BINS = [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, Infinity];
-  function multiplierOf(e) {
-    if (e.mysteryMultiplier !== null && e.mysteryMultiplier !== void 0 && Number.isFinite(num(e.mysteryMultiplier))) {
-      return num(e.mysteryMultiplier);
-    }
-    return num(e.stake) > 0 ? returnedOf(e) / num(e.stake) : null;
-  }
-  var multipliersOf = (evs) => evs.map(multiplierOf).filter((m) => m !== null);
-  function hitFields(mults) {
-    const hits = mults.filter((m) => m >= 1).length;
-    return {
-      hitRate: mults.length ? hits / mults.length : null,
-      hitRateCI: mults.length ? wilson(hits, mults.length) : null,
-      meanMultiplier: mean(mults),
-      medianMultiplier: mults.length ? median2(mults) : null
-    };
-  }
-  function mysteryStats(events, stakeEdges = DEFAULT_MYSTERY_STAKE_EDGES) {
-    const mys = upgradeEvents(events).filter(isMystery);
-    const mults = multipliersOf(mys);
-    const binned = groupByBucket(mults, MULTIPLIER_BINS, (m) => m);
-    const histogram = makeBuckets(MULTIPLIER_BINS).map((b, i) => ({
-      label: `x${b.label}`,
-      lo: b.lo,
-      hi: b.hi,
-      n: binned[i].length
-    }));
-    const groups = groupByBucket(mys, stakeEdges, (e) => num(e.stake));
-    const byStake = makeBuckets(stakeEdges).map((b, i) => {
-      const h2 = hitFields(multipliersOf(groups[i]));
-      return { label: b.label, lo: b.lo, hi: b.hi, ...baseMetrics(groups[i]), hitRate: h2.hitRate, meanMultiplier: h2.meanMultiplier };
-    });
-    const a = oneWayAnova(groups.map(multipliersOf));
-    return {
-      ...baseMetrics(mys),
-      ...hitFields(mults),
-      histogram,
-      byStake,
-      test: { method: "anova", statistic: a.statistic, df: a.df, dfWithin: a.dfWithin, p: a.p }
-    };
-  }
-
-  // src/stats/money.js
-  var DAY_MS2 = 864e5;
-  var pad22 = (n) => String(n).padStart(2, "0");
-  var dayKey2 = (ts) => {
-    const d = new Date(ts);
-    return `${d.getFullYear()}-${pad22(d.getMonth() + 1)}-${pad22(d.getDate())}`;
-  };
-  function moneyFlow(events, { balance = null, inventoryValue = null } = {}) {
-    const list = Array.isArray(events) ? events.filter((e) => e && typeof e === "object") : [];
-    const deposits = list.filter((e) => e.kind === "deposit");
-    const done = deposits.filter((e) => e.status === "completed");
-    const failed = deposits.filter((e) => e.status !== "completed");
-    const withdrawals = list.filter((e) => e.kind === "withdrawal");
-    const valueOf = (w) => num(w.value ?? (w.item && w.item.price));
-    const sum = done.reduce((s2, e) => s2 + num(e.amount), 0);
-    const doneTs = done.map((e) => num(e.ts));
-    const firstTs = doneTs.length ? Math.min(...doneTs) : null;
-    const lastTs = doneTs.length ? Math.max(...doneTs) : null;
-    const withdrawn = withdrawals.reduce((s2, w) => s2 + valueOf(w), 0);
-    const known = balance !== null && balance !== void 0 || inventoryValue !== null && inventoryValue !== void 0;
-    const holdings2 = known ? num(balance) + num(inventoryValue) : null;
-    const moves = [
-      ...done.map((e) => ({ ts: num(e.ts), kind: "deposit", amount: num(e.amount) })),
-      ...withdrawals.map((w) => ({ ts: num(w.ts), kind: "withdrawal", amount: valueOf(w) }))
-    ].sort((a, b) => a.ts - b.ts);
-    let cumulativeNet = 0;
-    const series = moves.map((m) => {
-      cumulativeNet += m.kind === "deposit" ? -m.amount : m.amount;
-      return { ...m, cumulativeNet };
-    });
-    const days = /* @__PURE__ */ new Map();
-    for (const m of moves) {
-      const key = dayKey2(m.ts);
-      const row = days.get(key) ?? { day: key, deposited: 0, withdrawn: 0 };
-      if (m.kind === "deposit") row.deposited += m.amount;
-      else row.withdrawn += m.amount;
-      days.set(key, row);
-    }
-    return {
-      deposits: {
-        n: done.length,
-        sum,
-        failedN: failed.length,
-        failedSum: failed.reduce((s2, e) => s2 + num(e.amount), 0),
-        firstTs,
-        lastTs,
-        perDay: done.length ? sum / Math.max(1, (lastTs - firstTs) / DAY_MS2) : null
-      },
-      withdrawals: { n: withdrawals.length, value: withdrawn, exactTimeN: withdrawals.filter((w) => w.exactTime === true).length },
-      holdings: holdings2,
-      net: withdrawn + (holdings2 ?? 0) - sum,
-      series,
-      daily: [...days.values()].sort((a, b) => a.day < b.day ? -1 : 1)
     };
   }
 
@@ -3747,7 +2756,8 @@ option { background: var(--surface); color: var(--text); }
     if (a === 0) return "0";
     return fmtNumber(v, a >= 100 ? 0 : a >= 10 ? 1 : 2);
   }
-  function lineChart({ points, width, height = 170, currency = "" }) {
+  function lineChart({ points, width, height = 170, currency = "", count = null }) {
+    const nEvents = Number.isFinite(count) ? count : points.length;
     const W = Math.max(200, Math.floor(width));
     const H = height;
     const padL = 44;
@@ -3775,7 +2785,7 @@ option { background: var(--surface); color: var(--text); }
       readout.replaceChildren(
         "Now ",
         h("span", { class: ["num", signClass(last.v)], text: fmtMoney(last.v, currency, { sign: true }) }),
-        h("span", { class: "faint", text: `  after ${fmtNumber(points.length, 0)} events` })
+        h("span", { class: "faint", text: `  after ${fmtNumber(nEvents, 0)} events` })
       );
     };
     const svg = s("svg", {
@@ -3783,7 +2793,7 @@ option { background: var(--surface); color: var(--text); }
       height: H,
       viewBox: `0 0 ${W} ${H}`,
       role: "img",
-      "aria-label": `Cumulative net over ${points.length} events, now ${fmtMoney(last.v, currency, { sign: true })}`
+      "aria-label": `Cumulative net over ${nEvents} events, now ${fmtMoney(last.v, currency, { sign: true })}`
     });
     for (const t of ticks) {
       const yy = Math.round(y(t)) + 0.5;
@@ -3866,9 +2876,9 @@ option { background: var(--surface); color: var(--text); }
     }
     const edgeLo = lo;
     const edgeHi = hi;
-    const pad3 = (hi - lo) * 0.04;
-    lo -= pad3;
-    hi += pad3;
+    const pad2 = (hi - lo) * 0.04;
+    lo -= pad2;
+    hi += pad2;
     const x = (v) => x0 + (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo) * (x1 - x0);
     const svg = s("svg", {
       width: W,
@@ -4149,7 +3159,7 @@ option { background: var(--surface); color: var(--text); }
     if (pts.length < 2) return null;
     const W = width;
     const H = height;
-    const pad3 = 2;
+    const pad2 = 2;
     const clip = (v) => Math.max(ref * 0.5, Math.min(ref * 1.5, v));
     const vs = pts.map((p) => clip(p.price));
     if (okNum(typical)) vs.push(typical);
@@ -4157,8 +3167,8 @@ option { background: var(--surface); color: var(--text); }
     const hi = Math.max(...vs);
     const t0 = pts[0].ts;
     const t1 = pts[pts.length - 1].ts;
-    const x = (t) => pad3 + (t1 === t0 ? (W - 2 * pad3) / 2 : (t - t0) / (t1 - t0) * (W - 2 * pad3));
-    const y = (v) => pad3 + (H - 2 * pad3) - (clip(v) - lo) / (hi - lo || 1) * (H - 2 * pad3);
+    const x = (t) => pad2 + (t1 === t0 ? (W - 2 * pad2) / 2 : (t - t0) / (t1 - t0) * (W - 2 * pad2));
+    const y = (v) => pad2 + (H - 2 * pad2) - (clip(v) - lo) / (hi - lo || 1) * (H - 2 * pad2);
     const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, "aria-hidden": "true", class: "spark" });
     if (okNum(typical)) {
       const yy = Math.round(y(typical)) + 0.5;
@@ -4302,7 +3312,6 @@ option { background: var(--surface); color: var(--text); }
   var ok3 = (v) => typeof v === "number" && Number.isFinite(v);
   var numOrNull3 = (v) => v === null || v === void 0 || v === "" ? null : ok3(Number(v)) ? Number(v) : null;
   var num2 = (v) => ok3(v) ? v : Number(v) || 0;
-  var settledUpgrade = (e) => e && e.kind === "upgrade" && e.status !== "pending";
   var rtpOf = (roi) => ok3(roi) ? 1 + roi : null;
   var rtpCI = (ci) => Array.isArray(ci) && ok3(ci[0]) && ok3(ci[1]) ? [ci[0] + 1, ci[1] + 1] : null;
   var RTP_TIP = "Return to player: what came back per unit staked. Below 100% loses money on average.";
@@ -4313,14 +3322,14 @@ option { background: var(--surface); color: var(--text); }
     return rows.map((r) => r.label ?? `${r.lo}${DASH}${r.hi}%`).join(", ");
   }
   function viewOdds(ctx2) {
-    const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, sigBadge, sectionHead, more, edgeEditor } = ctx2;
-    const ev = state.events;
-    if (!ev.some((e) => settledUpgrade(e) && !e.mystery)) {
+    const { state, stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, table, th, sigBadge, sectionHead, more, edgeEditor } = ctx2;
+    if (!counts().settledNormal) {
       return emptyState("No normal upgrades yet", "This view compares the chance the site shows with how often you really win.");
     }
     const out = [];
-    const curve = memo("calibrationCurve", () => call("calibrationCurve", ev));
-    if (curve.error) out.push(h("section", null, errorBox(curve.error)));
+    const curve = stat("calibrationCurve");
+    if (curve.loading) out.push(h("section", null, loadingBox()));
+    else if (curve.error) out.push(h("section", null, errorBox(curve.error)));
     else {
       const rows = (curve.value || []).filter((r) => r && r.n > 0);
       const total = rows.reduce((a, r) => a + r.n, 0);
@@ -4373,8 +3382,7 @@ option { background: var(--surface); color: var(--text); }
       }
     }
     const se = state.edges.stake;
-    const seKey = se ? se.join(",") : "default";
-    const byStake = memo(`byStake:${seKey}`, () => se ? call("upgradeByStake", ev, se) : call("upgradeByStake", ev));
+    const byStake = se ? stat("upgradeByStake", se) : stat("upgradeByStake");
     const c = cur();
     const stakeRows = byStake.error ? [] : (byStake.value || []).filter((r) => r && r.n > 0);
     out.push(
@@ -4447,9 +3455,10 @@ option { background: var(--surface); color: var(--text); }
     );
   }
   function superDropSection(ctx2) {
-    const { state, memo, call, errorBox, sectionHead, more } = ctx2;
-    const res = memo("superDropStats", () => call("superDropStats", state.events));
+    const { stat, loadingBox, errorBox, sectionHead, more } = ctx2;
+    const res = stat("superDropStats");
     const head = sectionHead("Super-drop card", "A card the site sometimes shows on an upgrade. When it appears, the win can be multiplied.");
+    if (res.loading) return h("section", null, head, loadingBox());
     if (res.error) return h("section", null, head, errorBox(res.error));
     const sd = res.value || {};
     if (!sd.n) return h("section", null, head, h("p", { class: "muted", text: "No normal upgrades yet." }));
@@ -4472,12 +3481,12 @@ option { background: var(--surface); color: var(--text); }
     );
   }
   function viewMystery(ctx2) {
-    const { state, memo, call, cur, contentWidth, errorBox, emptyState, table, th, moneyCell, kpi, hero, sectionHead, more, callout } = ctx2;
-    const ev = state.events;
-    if (!ev.some((e) => settledUpgrade(e) && e.mystery)) {
+    const { stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, table, th, moneyCell, kpi, hero, sectionHead, more, callout } = ctx2;
+    if (!counts().settledMystery) {
       return emptyState("No mystery upgrades yet", "Mystery upgrades hide the chance and always give you an item. This view shows what they really pay back.");
     }
-    const res = memo("mysteryStats", () => call("mysteryStats", ev));
+    const res = stat("mysteryStats");
+    if (res.loading) return [loadingBox()];
     if (res.error) return [errorBox(res.error)];
     const m = res.value || {};
     const c = cur();
@@ -4559,19 +3568,22 @@ option { background: var(--surface); color: var(--text); }
     return fmtDate(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime());
   }
   function viewMoney(ctx2) {
-    const { state, memo, call, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render, kpi, hero, sectionHead } = ctx2;
-    const ev = state.events;
+    const { state, stat, counts, loadingBox, cur, contentWidth, errorBox, emptyState, goDataButton, table, th, moneyCell, render, kpi, hero, sectionHead } = ctx2;
     const hv = state.holdings || {};
     const balance = numOrNull3(hv.balance);
     const inventoryValue = numOrNull3(hv.inventoryValue);
-    const hasFlow = ev.some((e) => e && (e.kind === "deposit" || e.kind === "withdrawal"));
+    const kinds = counts().kinds || {};
+    const hasFlow = (kinds.deposit ?? 0) + (kinds.withdrawal ?? 0) > 0;
     if (!hasFlow) {
       const held = balance === null && inventoryValue === null ? "" : ` You hold ${fmtMoney((balance || 0) + (inventoryValue || 0), cur())} right now.`;
       return emptyState("No deposits or withdrawals yet", `Import your history to load your payments and withdrawn items.${held}`, goDataButton());
     }
-    const res = memo(`moneyFlow:${balance}:${inventoryValue}`, () => call("moneyFlow", ev, { balance, inventoryValue }));
+    const res = stat("moneyFlow");
+    if (res.loading) return [loadingBox()];
     if (res.error) return [errorBox(res.error)];
-    const mf = res.value || {};
+    const raw = res.value || {};
+    const holdings2 = balance === null && inventoryValue === null ? null : (balance || 0) + (inventoryValue || 0);
+    const mf = { ...raw, holdings: holdings2, net: num2(raw.withdrawals?.value) + (holdings2 ?? 0) - num2(raw.deposits?.sum) };
     const dep = mf.deposits || {};
     const wd = mf.withdrawals || {};
     const c = cur();
@@ -4662,7 +3674,6 @@ option { background: var(--surface); color: var(--text); }
 
   // src/ui/view-sessions.js
   var ok4 = (v) => typeof v === "number" && Number.isFinite(v);
-  var settledUpgrade2 = (e) => e && e.kind === "upgrade" && e.status !== "pending";
   var SESSION_PAGE = 20;
   var runChance = (len, p) => len > 0 ? fmtPct(p, 0) : DASH;
   function verdictOf(x) {
@@ -4702,13 +3713,13 @@ option { background: var(--surface); color: var(--text); }
     return h("span", { class: ["badge", v.tone], text: v.label, "data-tip": [v.text, v.rarity].filter(Boolean).join(" ") });
   }
   function viewSessions(ctx2) {
-    const { state, memo, call, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx2;
-    const ev = state.events;
-    if (!ev.some(settledUpgrade2)) return emptyState("No upgrades yet", "This view splits your upgrades into sessions and checks each one against the shown odds.");
+    const { state, stat, counts, loadingBox, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx2;
+    if (!counts().settled) return emptyState("No upgrades yet", "This view splits your upgrades into sessions and checks each one against the shown odds.");
     const ce = state.edges && state.edges.chance;
-    const res = memo(`upgradeSessions:${ce ? ce.join(",") : "default"}`, () => call("upgradeSessions", ev, ce ? { chanceEdges: ce } : {}));
+    const res = stat("upgradeSessions", ce ? { chanceEdges: ce } : {});
+    if (res.loading) return [loadingBox()];
     if (res.error) return [errorBox(res.error)];
-    const { summary: s2 = {}, sessions: sessions2 = [], streaks = [], gapMinutes = 60 } = res.value || {};
+    const { summary: s2 = {}, sessions = [], streaks = [], gapMinutes = 60 } = res.value || {};
     const c = cur();
     if (!state.sessionOpen) state.sessionOpen = /* @__PURE__ */ new Set();
     if (!state.sessionLimit) state.sessionLimit = SESSION_PAGE;
@@ -4729,7 +3740,7 @@ option { background: var(--surface); color: var(--text); }
         )
       )
     );
-    const shown = sessions2.slice(0, state.sessionLimit);
+    const shown = sessions.slice(0, state.sessionLimit);
     out.push(
       h(
         "section",
@@ -4739,15 +3750,15 @@ option { background: var(--surface); color: var(--text); }
           "Newest first. Normal: about as many wins as expected. Below / above average: off by an ordinary amount of luck (rarer than 1 in 4). Unlucky / Lucky: rarer than 1 in 40, but a few are expected over many sessions. Beyond bad / good luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level."
         ),
         h("div", { class: "list" }, shown.map(sessionRow)),
-        sessions2.length > shown.length ? h(
+        sessions.length > shown.length ? h(
           "div",
           { class: "list-foot" },
-          h("span", { class: "muted", text: `${fmtInt(shown.length)} of ${fmtInt(sessions2.length)}` }),
+          h("span", { class: "muted", text: `${fmtInt(shown.length)} of ${fmtInt(sessions.length)}` }),
           h("button", {
             class: "btn",
             type: "button",
             "data-fk": "sessions-more",
-            text: `Show ${fmtInt(Math.min(SESSION_PAGE, sessions2.length - shown.length))} more`,
+            text: `Show ${fmtInt(Math.min(SESSION_PAGE, sessions.length - shown.length))} more`,
             on: {
               click: () => {
                 state.sessionLimit += SESSION_PAGE;
@@ -4898,7 +3909,7 @@ option { background: var(--surface); color: var(--text); }
     ["mystery", "Mystery"]
   ];
   var LEGACY_TABS = { odds: "odds", sessions: "sessions", mystery: "mystery" };
-  var FACTORS2 = [
+  var FACTORS = [
     { key: "hour", label: "Hour of day", kinds: ["upgrade", "case"] },
     { key: "weekday", label: "Day of week", kinds: ["upgrade", "case"] },
     { key: "daypart", label: "Part of day", kinds: ["upgrade", "case"] },
@@ -4938,7 +3949,6 @@ option { background: var(--surface); color: var(--text); }
   var CASE_PAGE = 25;
   var ok5 = (v) => typeof v === "number" && Number.isFinite(v);
   var num3 = (v) => ok5(v) ? v : Number(v) || 0;
-  var settledUpgrade3 = (e) => e && e.kind === "upgrade" && e.status !== "pending";
   function edgesToText(arr3) {
     return arr3.map((v) => v === Infinity ? "inf" : String(v)).join(", ");
   }
@@ -4960,21 +3970,6 @@ option { background: var(--surface); color: var(--text); }
     if (edges.length < 2) return { error: "Enter at least two edges, separated by commas." };
     return { edges };
   }
-  function flow(e) {
-    if (!e) return null;
-    if (e.kind === "case") return { cost: num3(e.casePrice), ret: num3(e.item && e.item.price) };
-    if (e.kind === "upgrade" && e.status !== "pending") return { cost: num3(e.stake), ret: num3(e.returned) };
-    return null;
-  }
-  function cumulative(events) {
-    const sorted = events.filter((e) => flow(e)).sort((a, b) => num3(a.ts) - num3(b.ts));
-    let net = 0;
-    return sorted.map((e) => {
-      const f = flow(e);
-      net += f.ret - f.cost;
-      return { ts: num3(e.ts), v: net };
-    });
-  }
   var ICON = { viewBox: "0 0 16 16", "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": 1.6, "stroke-linecap": "round" };
   function iconClose() {
     return s("svg", ICON, s("path", { d: "M4 4l8 8M12 4l-8 8" }));
@@ -4990,7 +3985,6 @@ option { background: var(--surface); color: var(--text); }
   }
   function mountDashboard(opts = {}) {
     const o = opts;
-    const stats = o.stats || {};
     const cur = () => {
       try {
         return String((o.currency && o.currency()) ?? "");
@@ -5013,7 +4007,6 @@ option { background: var(--surface); color: var(--text); }
       tab: TABS.some(([id]) => id === savedTab) ? savedTab : "overview",
       lastTab: "overview",
       upSub: UP_SUBS.some(([id]) => id === savedSub) ? savedSub : "odds",
-      events: [],
       loaded: false,
       loading: false,
       again: false,
@@ -5053,10 +4046,9 @@ option { background: var(--surface); color: var(--text); }
       if (!state.cache.has(key)) state.cache.set(key, safe(fn));
       return state.cache.get(key);
     };
-    const call = (name, ...args) => {
-      if (typeof stats[name] !== "function") throw new Error(`stats.${name} is missing`);
-      return stats[name](...args);
-    };
+    const stat = (name, ...args) => o.remote ? o.remote.get(name, ...args) : { error: new Error("The stats server is not connected.") };
+    const counts = () => stat("meta").value || null;
+    const loadingBox = () => h("p", { class: "muted loading", role: "status", text: "Loading\u2026" });
     const launcher = h(
       "button",
       {
@@ -5207,6 +4199,8 @@ option { background: var(--surface); color: var(--text); }
     const onResize = debounce(() => state.open && render(), 150);
     window.addEventListener("resize", onResize);
     const reattach = setInterval(() => attach(host), 2e3);
+    const unsubscribe = o.remote ? o.remote.subscribe(() => state.open && render()) : () => {
+    };
     function open() {
       state.open = true;
       state.tabChanged = true;
@@ -5251,13 +4245,7 @@ option { background: var(--surface); color: var(--text); }
         return;
       }
       state.loading = true;
-      try {
-        const ev = await o.getEvents();
-        state.events = Array.isArray(ev) ? ev : [];
-        state.loadError = null;
-      } catch (e) {
-        state.loadError = e;
-      }
+      o.remote?.invalidate();
       if (typeof o.getAccounts === "function") state.accounts = safe(() => o.getAccounts()).value || null;
       if (typeof o.getHoldings === "function") {
         try {
@@ -5289,16 +4277,10 @@ option { background: var(--surface); color: var(--text); }
       const fk = state.pendingFocus || (active && body.contains(active) ? active.dataset.fk : null);
       const caret = active && active.tagName === "INPUT" ? [active.selectionStart, active.selectionEnd] : null;
       const scroll = body.scrollTop;
-      const n = state.events.length;
-      let first = null;
-      let last = null;
-      for (const e of state.events) {
-        const ts = num3(e.ts);
-        if (!ts) continue;
-        if (first === null || ts < first) first = ts;
-        if (last === null || ts > last) last = ts;
-      }
-      subEl.textContent = !state.loaded ? "Loading\u2026" : n ? `${fmtInt(n)} events \xB7 ${fmtDate(first)} ${DASH} ${fmtDate(last)}` : "No events recorded yet";
+      const metaRes = stat("meta");
+      const m = metaRes.value || null;
+      state.loadError = metaRes.error || o.remote?.lastError() || null;
+      subEl.textContent = !m ? metaRes.error ? "Stats server unreachable" : "Loading\u2026" : m.total ? `${fmtInt(m.total)} events \xB7 ${fmtDate(m.firstTs)} ${DASH} ${fmtDate(m.lastTs)}` : "No events recorded yet";
       renderAccounts();
       const stHead = safe(() => o.getStatus ? o.getStatus() : {}).value || {};
       verEl.textContent = stHead.version ? `v${stHead.version}` : "";
@@ -5318,7 +4300,7 @@ option { background: var(--surface); color: var(--text); }
       if (onData) body.setAttribute("aria-label", "Settings and data");
       else body.removeAttribute("aria-label");
       let content;
-      if (!state.loaded) content = [h("p", { class: "muted", text: "Loading your events\u2026" })];
+      if (!m && state.tab !== "data") content = metaRes.error ? [errorBox(metaRes.error, "Could not reach the stats server")] : [loadingBox()];
       else {
         const views = {
           overview: viewOverview,
@@ -5334,7 +4316,7 @@ option { background: var(--surface); color: var(--text); }
           console.warn("[caser-tracker] render failed", e);
           content = [errorBox(e)];
         }
-        if (state.loadError && state.tab !== "data") content.unshift(errorBox(state.loadError, "Could not read stored events"));
+        if (state.loadError && state.tab !== "data") content.unshift(errorBox(state.loadError, "Could not reach the stats server"));
       }
       const view = h("div", { class: ["view", state.tabChanged && "enter"] }, content);
       body.replaceChildren(view);
@@ -5586,7 +4568,9 @@ option { background: var(--surface); color: var(--text); }
     const ctx2 = {
       state,
       memo,
-      call,
+      stat,
+      counts,
+      loadingBox,
       cur,
       contentWidth,
       render,
@@ -5609,12 +4593,12 @@ option { background: var(--surface); color: var(--text); }
       edgeEditor
     };
     function viewOverview() {
-      const ev = state.events;
-      if (!ev.length) {
+      if (!counts().total) {
         return emptyState("No events yet", "Open a case or make an upgrade on the site and it shows up here. You can also import your past history.", goDataButton());
       }
       const c = cur();
-      const sum = memo("summary", () => call("summarize", ev));
+      const sum = stat("summarize");
+      if (sum.loading) return [loadingBox()];
       if (sum.error) return [errorBox(sum.error)];
       const { total = {}, cases = {}, upgrades = {} } = sum.value || {};
       const out = [];
@@ -5639,29 +4623,31 @@ option { background: var(--surface); color: var(--text); }
           )
         )
       );
-      const series = memo("series", () => cumulative(ev)).value || [];
+      const seriesRes = stat("cumulative");
+      const series = seriesRes.value || [];
       out.push(
         h(
           "section",
           null,
           sectionHead("Net over time", "Running total of every case open and upgrade, oldest on the left. Hover the chart to read a point."),
-          series.length >= 2 ? lineChart({ points: series, width: contentWidth(), currency: c }) : h("p", { class: "muted", text: "The chart needs at least two events." })
+          seriesRes.loading ? loadingBox() : seriesRes.error ? errorBox(seriesRes.error) : series.length >= 2 ? lineChart({ points: series, width: contentWidth(), currency: c, count: (counts().kinds?.case ?? 0) + (counts().settled ?? 0) }) : h("p", { class: "muted", text: "The chart needs at least two events." })
         )
       );
-      out.push(h("section", null, sectionHead("Upgrade odds check"), calibrationBlock(ev)));
-      const ses = memo("sessions", () => call("sessions", ev));
+      out.push(h("section", null, sectionHead("Upgrade odds check"), calibrationBlock()));
+      const ses = stat("sessions");
       out.push(
         h(
           "section",
           null,
           sectionHead("Recent sessions", "A session is a stretch of play without a long break."),
-          ses.error ? errorBox(ses.error) : sessionsList(ses.value || [], c)
+          ses.loading ? loadingBox() : ses.error ? errorBox(ses.error) : sessionsList(ses.value || [], c)
         )
       );
       return out;
     }
-    function calibrationBlock(ev) {
-      const cal = memo("calibration", () => call("calibration", ev));
+    function calibrationBlock() {
+      const cal = stat("calibration");
+      if (cal.loading) return loadingBox();
       if (cal.error) return errorBox(cal.error);
       const r = cal.value;
       if (!r || !r.n) return callout("neutral", "No upgrades yet", "This check compares how often you win upgrades with the chance the site showed.");
@@ -5711,11 +4697,11 @@ option { background: var(--surface); color: var(--text); }
       );
     }
     function viewCases() {
-      const ev = state.events;
-      if (!ev.some((e) => e.kind === "case")) {
+      if (!counts().kinds?.case) {
         return emptyState("No case opens yet", "Open a case on the site, or import your drop history.", goDataButton());
       }
-      const res = memo("caseRoi", () => call("caseRoi", ev));
+      const res = stat("caseRoi");
+      if (res.loading) return [loadingBox()];
       if (res.error) return [errorBox(res.error)];
       const all = [...res.value || []];
       const c = cur();
@@ -5840,12 +4826,12 @@ option { background: var(--surface); color: var(--text); }
       return d;
     }
     function viewUpgrades() {
-      const ev = state.events;
-      if (!ev.some(settledUpgrade3)) {
+      const m = counts();
+      if (!m.settled) {
         return emptyState("No upgrades yet", "Make an upgrade on the site, or import your upgrade history.", goDataButton());
       }
-      const hasNormal = ev.some((e) => settledUpgrade3(e) && !e.mystery);
-      const hasMystery = ev.some((e) => settledUpgrade3(e) && e.mystery);
+      const hasNormal = m.settledNormal > 0;
+      const hasMystery = m.settledMystery > 0;
       if (state.upSub === "mystery" && !hasMystery) state.upSub = "odds";
       if (state.upSub !== "mystery" && !hasNormal && hasMystery) state.upSub = "mystery";
       const nav = h(
@@ -5870,16 +4856,16 @@ option { background: var(--surface); color: var(--text); }
       return [nav, ...content];
     }
     function viewFactors() {
-      const ev = state.events;
-      const hasUp = ev.some(settledUpgrade3);
-      const hasCase = ev.some((e) => e.kind === "case");
+      const m = counts();
+      const hasUp = m.settled > 0;
+      const hasCase = (m.kinds?.case ?? 0) > 0;
       if (!hasUp && !hasCase) {
         return emptyState("Nothing to compare yet", "Factors compare your results by time, session and bet type. Record some events first.", goDataButton());
       }
       if (state.factorKind === "upgrade" && !hasUp) state.factorKind = "case";
       if (state.factorKind === "case" && !hasCase) state.factorKind = "upgrade";
       const kind = state.factorKind;
-      const choices = FACTORS2.filter((f) => f.kinds.includes(kind));
+      const choices = FACTORS.filter((f) => f.kinds.includes(kind));
       if (!choices.some((f) => f.key === state.factorKey)) state.factorKey = choices[0].key;
       const fdef = choices.find((f) => f.key === state.factorKey);
       const kindSeg = seg(
@@ -5916,7 +4902,8 @@ option { background: var(--surface); color: var(--text); }
         h("p", { class: "hint", style: { margin: "0 0 12px" }, text: "Does anything (time of day, streaks, bet size\u2026) change your results? Pick a factor." }),
         h("div", { class: "controls" }, kindSeg, select)
       ];
-      const res = memo(`factor:${kind}:${fdef.key}`, () => call("factor", ev, fdef.key, { kind }));
+      const res = stat("factor", fdef.key, { kind });
+      if (res.loading) return [...out, loadingBox()];
       if (res.error) return [...out, errorBox(res.error)];
       const r = res.value || {};
       const rows = (r.rows || []).filter((x) => x && x.n > 0);
@@ -6028,7 +5015,7 @@ option { background: var(--surface); color: var(--text); }
       return callout(
         "warn",
         "Possible real effect",
-        fdef.key === "superDrop" ? "Upgrades with the super-drop card shown win at a different rate. This is a site feature you cannot choose, not a pattern you can time." : `The rows differ more than luck usually explains. With ${FACTORS2.length} factors to look at, one can pass by chance, so check again after more data.`,
+        fdef.key === "superDrop" ? "Upgrades with the super-drop card shown win at a different rate. This is a site feature you cannot choose, not a pattern you can time." : `The rows differ more than luck usually explains. With ${FACTORS.length} factors to look at, one can pass by chance, so check again after more data.`,
         details
       );
     }
@@ -6071,44 +5058,21 @@ option { background: var(--surface); color: var(--text); }
       return h("div", { class: "card" }, h("div", { class: "ct", text: title }), desc ? h("p", { class: "cd", text: desc }) : null, children);
     }
     function cloudCard(cl, btn) {
-      const on = !!cl.key;
-      if (!on) {
-        const keyInput = h("input", {
-          type: "text",
-          class: "key-input",
-          placeholder: "Paste the sync key from your other browser",
-          autocomplete: "off",
-          spellcheck: "false",
-          "aria-label": "Sync key",
-          "data-fk": "cloud-key-input",
-          value: state.cloudKeyDraft || "",
-          on: { input: (e) => state.cloudKeyDraft = e.target.value }
-        });
-        return card(
-          "Sync between browsers",
-          "Keep one history in every browser you use. Start in one browser, then paste the key in the others.",
-          h(
-            "div",
-            { class: "btns" },
-            btn("cloud-start", "Start cloud sync", "primary", () => run("cloud-start", () => o.onCloudStart(), () => "Cloud sync is on. Copy the key into your other browsers."))
-          ),
-          h(
-            "div",
-            { class: "btns key-row" },
-            keyInput,
-            btn(
-              "cloud-join",
-              "Use key",
-              "",
-              () => run("cloud-join", () => o.onCloudJoin(state.cloudKeyDraft), (r) => {
-                state.cloudKeyDraft = "";
-                return `Cloud sync is on. ${fmtInt(num3(r && r.added))} events came from your other browsers.`;
-              })
-            )
-          )
-        );
+      const keyInput = h("input", {
+        type: "text",
+        class: "key-input",
+        placeholder: "Paste the sync key from your other browser",
+        autocomplete: "off",
+        spellcheck: "false",
+        "aria-label": "Sync key from another browser",
+        "data-fk": "cloud-key-input",
+        value: state.cloudKeyDraft || "",
+        on: { input: (e) => state.cloudKeyDraft = e.target.value }
+      });
+      if (!cl.key) {
+        return card("Your history on the server", "Preparing your sync key\u2026");
       }
-      const stateText = cl.state === "syncing" ? `Syncing\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok5(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : "Waiting";
+      const stateText = cl.state === "syncing" ? `Working\u2026 ${cl.progress || ""}` : cl.state === "error" ? `Failed: ${cl.error}` : ok5(cl.lastPush) || ok5(cl.lastPull) ? `Up to date, checked ${fmtAgo(Math.max(num3(cl.lastPush), num3(cl.lastPull)))}` : "Waiting";
       const shown = state.cloudKeyShown ? h("input", {
         type: "text",
         readonly: true,
@@ -6120,14 +5084,14 @@ option { background: var(--surface); color: var(--text); }
         on: { focus: (e) => e.target.select(), click: (e) => e.target.select() }
       }) : `${cl.key.slice(0, 4)}${"\u2022".repeat(12)}`;
       return card(
-        "Sync between browsers",
-        null,
+        "Your history on the server",
+        "Your events are stored on the tracker's server under this key, and the statistics are computed there. Keep a copy of the key: without it the history cannot be reached.",
         h(
           "dl",
           { class: "status" },
-          h("dt", { text: "Cloud" }),
+          h("dt", { text: "Server" }),
           h("dd", { class: cl.state === "error" ? "neg" : null }, h("span", { class: ["dot", cl.state === "error" ? "off" : "on"], "aria-hidden": "true" }), stateText),
-          h("dt", null, "Sync key", tip("Anyone with this key can read and change your history, so keep it private. Checks for new events every minute while the tab is open.")),
+          h("dt", null, "Sync key", tip("Anyone with this key can read and change your history, so keep it private. Paste it into your other browsers to see the same history there.")),
           h("dd", { class: "num key-text" }, shown)
         ),
         h(
@@ -6140,7 +5104,7 @@ option { background: var(--surface); color: var(--text); }
               state.pendingFocus = "cloud-copy";
               render();
             };
-            const copied = () => done("Key copied. Paste it under Settings \u2192 Sync between browsers in your other browser.", "pos");
+            const copied = () => done("Key copied. Keep it somewhere safe, and paste it below in your other browsers.", "pos");
             const failed = () => {
               state.cloudKeyShown = true;
               done("Could not copy. The key is shown above: click it, then press Ctrl+C.", "neg");
@@ -6159,11 +5123,24 @@ option { background: var(--surface); color: var(--text); }
             state.pendingFocus = "cloud-show";
             render();
           }),
-          btn("cloud-sync", "Sync now", "", () => run("cloud-sync", () => o.onCloudSync(), (r) => `Cloud sync done: ${fmtInt(num3(r && r.added))} new events.`), {
-            busyLabel: "Syncing\u2026",
+          btn("cloud-sync", "Check now", "", () => run("cloud-sync", () => o.onCloudSync(), () => "Everything recorded here is on the server."), {
+            busyLabel: "Checking\u2026",
             disabled: cl.state === "syncing"
-          }),
-          btn("cloud-stop", "Stop", "ghost", () => run("cloud-stop", () => o.onCloudStop(), () => "Cloud sync is off in this browser. The cloud copy is kept."))
+          })
+        ),
+        h(
+          "div",
+          { class: "btns key-row" },
+          keyInput,
+          btn(
+            "cloud-join",
+            "Use this key",
+            "",
+            () => run("cloud-join", () => o.onCloudJoin(state.cloudKeyDraft), () => {
+              state.cloudKeyDraft = "";
+              return "This browser now shows the history of that key.";
+            })
+          )
         )
       );
     }
@@ -6222,16 +5199,16 @@ option { background: var(--surface); color: var(--text); }
     const lockRun = () => typeof state.lastRun === "string" && state.lastRun.startsWith("lock-");
     const msgLine = () => h("p", { class: ["msg", state.msg && state.msg.tone], role: "status", "aria-live": "polite", text: state.msg ? state.msg.text : "" });
     function viewData() {
-      const ev = state.events;
       const c = cur();
       const st = safe(() => o.getStatus ? o.getStatus() : {}).value || {};
-      const count = (k) => ev.filter((e) => e.kind === k).length;
+      const m = counts() || { total: 0, kinds: {} };
+      const count = (k) => m.kinds?.[k] ?? 0;
       const nCase = count("case");
       const nUp = count("upgrade");
       const nDep = count("deposit");
       const nWd = count("withdrawal");
       const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
-      const totalEvents = state.accounts && ok5(state.accounts.total) ? state.accounts.total : ev.length;
+      const totalEvents = state.accounts && ok5(state.accounts.total) ? state.accounts.total : m.total;
       const busy = !!state.busy;
       const btn = (name, label, cls, onClick, extra = {}) => h("button", {
         type: "button",
@@ -6243,7 +5220,7 @@ option { background: var(--surface); color: var(--text); }
         on: { click: onClick }
       });
       const out = [h("h2", { class: "view-title", text: "Settings and data" })];
-      if (state.loadError) out.push(h("section", null, errorBox(state.loadError, "Could not read stored events")));
+      if (state.loadError) out.push(h("section", null, errorBox(state.loadError, "Could not reach the stats server")));
       const lk = st.lock && st.lock.set && typeof o.onUnlock === "function" ? st.lock : null;
       const isGuest2 = !!(lk && lk.guest);
       if (lk && lk.guest) out.push(h("section", null, lockCard(lk, btn), lockRun() ? msgLine() : null));
@@ -6264,7 +5241,7 @@ option { background: var(--surface); color: var(--text); }
               h("dd", {
                 class: "num",
                 "data-tip": `${fmtInt(nCase)} case opens, ${fmtInt(nUp)} upgrades, ${fmtInt(nDep)} deposits, ${fmtInt(nWd)} withdrawals`,
-                text: fmtInt(ev.length)
+                text: fmtInt(m.total)
               }),
               h("dt", { text: "Last event" }),
               h("dd", { class: "num", text: ok5(st.lastEventTs) ? fmtAgo(st.lastEventTs) : "none yet", "data-tip": ok5(st.lastEventTs) ? fmtDateTime(st.lastEventTs) : null }),
@@ -6281,8 +5258,6 @@ option { background: var(--surface); color: var(--text); }
               h(
                 "dl",
                 { class: "status" },
-                h("dt", null, "Storage", tip("Whether the browser promised not to clear the stored history on its own.")),
-                h("dd", { text: st.storagePersisted === true ? "Kept by the browser" : st.storagePersisted === false ? "May be cleared when space runs low" : DASH }),
                 h("dt", null, "Unknown responses", tip("Site responses the parser did not recognise. Above 0 can mean the site changed.")),
                 h("dd", { class: ["num", num3(st.unknownResponses) > 0 && "neg"], text: fmtInt(num3(st.unknownResponses)) }),
                 h("dt", { text: "Version" }),
@@ -6296,7 +5271,7 @@ option { background: var(--surface); color: var(--text); }
       const sync2 = [
         card(
           "Your history",
-          "Stored in this browser. Syncs with the site on its own when you open it, at most every 15 minutes. The first sync takes a few minutes.",
+          "Read from the site on its own when you open it, at most every 15 minutes, and stored on the tracker server. The first sync takes a few minutes.",
           h(
             "div",
             { class: "btns" },
@@ -6308,7 +5283,7 @@ option { background: var(--surface); color: var(--text); }
           )
         )
       ];
-      if (st.cloud && typeof o.onCloudStart === "function") sync2.push(cloudCard(st.cloud, btn));
+      if (st.cloud && typeof o.onCloudJoin === "function") sync2.push(cloudCard(st.cloud, btn));
       out.push(h("section", null, sectionHead("History and sync"), sync2));
       const prefs = [];
       const settings = safe(() => o.getSettings ? o.getSettings() : null).value;
@@ -6382,7 +5357,7 @@ option { background: var(--surface); color: var(--text); }
       if (!isGuest2) {
         const del = card(
           "Delete data",
-          "Removes every recorded event from this browser.",
+          "Removes every recorded event from the server, for every browser that uses this sync key.",
           btn(
             "clear",
             "Clear all",
@@ -6402,7 +5377,7 @@ option { background: var(--surface); color: var(--text); }
               { class: "confirm", role: "alertdialog", "aria-labelledby": "cst-confirm-text" },
               h("p", {
                 id: "cst-confirm-text",
-                text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ""} from this browser? This cannot be undone. Export first if you want a backup.`
+                text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ""} from the server? Every browser with this sync key loses them. This cannot be undone. Export first if you want a backup.`
               }),
               h(
                 "div",
@@ -6433,6 +5408,7 @@ option { background: var(--surface); color: var(--text); }
         refresh.cancel();
         onResize.cancel();
         clearInterval(reattach);
+        unsubscribe();
         window.removeEventListener("keydown", onWindowKey);
         window.removeEventListener("resize", onResize);
         host.remove();
@@ -6648,37 +5624,30 @@ option { background: var(--surface); color: var(--text); }
       clampAndPlace();
     }, 120);
     window.addEventListener("resize", onResize);
-    let events = [];
     let curveRows = null;
     let olModel = null;
+    let qBase = null;
     let version = 0;
-    let loading = false;
-    let again = false;
-    async function loadEvents() {
-      if (loading) {
-        again = true;
-        return;
-      }
-      loading = true;
-      try {
-        const ev = await o.getEvents();
-        events = Array.isArray(ev) ? ev : [];
-      } catch (e) {
-        console.warn("[caser-tracker] overlay could not read events", e);
-      }
-      const curve = safe(() => typeof stats.calibrationCurve === "function" ? stats.calibrationCurve(events) : null);
-      curveRows = Array.isArray(curve.value) ? curve.value : null;
-      const m = safe(() => typeof stats.outlookModel === "function" ? stats.outlookModel(events) : null);
-      olModel = m.value || null;
+    function pull() {
+      if (!o.remote) return;
+      const curve = o.remote.get("calibrationCurve");
+      const model = o.remote.get("outlookModel");
+      const base = o.remote.get("quoteBase");
+      if ("value" in curve) curveRows = Array.isArray(curve.value) ? curve.value : null;
+      if ("value" in model) olModel = model.value || null;
+      if ("value" in base) qBase = base.value || null;
       quoteCache = null;
-      loading = false;
       version += 1;
-      if (again) {
-        again = false;
-        loadEvents();
-      }
     }
-    const refresh = debounce(loadEvents, 300);
+    const unsubscribe = o.remote ? o.remote.subscribe(() => {
+      pull();
+      tick();
+    }) : () => {
+    };
+    const refresh = debounce(() => {
+      o.remote?.invalidate();
+      pull();
+    }, 300);
     let lastKey = null;
     let lastVersion = -1;
     let quoteCache = null;
@@ -6715,8 +5684,8 @@ option { background: var(--surface); color: var(--text); }
       if (ok6(sel.chanceShown)) input.chanceShown = sel.chanceShown;
       const qKey = `${stake}|${targetPrice}|${input.chanceShown}|${version}`;
       const res = quoteCache && quoteCache.key === qKey ? quoteCache.res : safe(() => {
-        if (typeof stats.upgradeQuote !== "function") throw new Error("stats.upgradeQuote is missing");
-        return stats.upgradeQuote(input, events);
+        if (typeof stats.quoteFromBase !== "function") throw new Error("stats.quoteFromBase is missing");
+        return stats.quoteFromBase(input, qBase);
       });
       quoteCache = { key: qKey, res };
       if (res.error || !res.value) {
@@ -6782,7 +5751,7 @@ option { background: var(--surface); color: var(--text); }
         ),
         h("div", { class: "line" }, h("span", { text: "Chance to end in profit" }), h("span", { class: "num", text: fmtPct(lr.probProfit, 0) }))
       );
-      const ol = safe(() => typeof stats.upgradeOutlook === "function" ? stats.upgradeOutlook(input, events, { now: Date.now(), model: olModel || void 0 }) : null);
+      const ol = safe(() => typeof stats.upgradeOutlook === "function" && olModel ? stats.upgradeOutlook(input, [], { now: Date.now(), model: olModel }) : null);
       let balance = null;
       try {
         const hv = o.getHoldings ? o.getHoldings() : null;
@@ -6797,11 +5766,13 @@ option { background: var(--surface); color: var(--text); }
       );
     }
     const timer = setInterval(tick, POLL_MS);
-    loadEvents().then(tick);
+    pull();
+    tick();
     return {
       refresh,
       destroy() {
         clearInterval(timer);
+        unsubscribe();
         refresh.cancel();
         onResize.cancel();
         window.removeEventListener("resize", onResize);
@@ -7374,38 +6345,24 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.13.3" : "dev";
+  var VERSION = true ? "0.14.0" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
   var ctx = new Context();
   var store2 = new Store(indexedDB);
   var sharedGm = gmStorage();
-  var shared = sharedGm && createSharedStore(sharedGm);
   var browserPrefs = sharedGm ? { get: (k) => sharedGm.get(k, null), set: (k, v) => sharedGm.set(k, v) } : { get: (k) => store.get(k, null), set: (k, v) => store.set(k, v) };
   var lastAuth = null;
   var lastEventTs = null;
   var unknownResponses = 0;
   var dashboard = null;
   var overlay = null;
-  var memEvents = null;
-  var memIndex = null;
-  var memLoad = null;
-  function getEvents() {
-    if (memEvents) return Promise.resolve(memEvents.slice());
-    if (!memLoad) {
-      memLoad = store2.allEvents().then((list) => {
-        memEvents = list;
-        memIndex = new Map(list.map((e, i) => [e.id, i]));
-        memLoad = null;
-        return list;
-      }, (err) => {
-        memLoad = null;
-        throw err;
-      });
-    }
-    return memLoad.then((list) => list.slice());
-  }
+  var remote = createRemoteStats({
+    request: (req2) => gmRequest(req2),
+    getKey: () => cloudKey(),
+    getAccount: () => ({ sel: selectedAccount(), legacy: legacyOwner() })
+  });
   var accountSel = "current";
   var userAuth = null;
   var userCheck = null;
@@ -7462,14 +6419,16 @@ Click for the sales chart.` : r.name;
   }
   function legacyOwner() {
     const v = browserPrefs.get("acct:legacy");
-    if (typeof v === "string" && v) return v;
-    return memEvents ? pickLegacyOwner(memEvents) : null;
+    return typeof v === "string" && v ? v : null;
   }
-  function fixLegacyOwner() {
-    const v = browserPrefs.get("acct:legacy");
-    if (typeof v === "string" && v) return;
-    const pick = memEvents ? pickLegacyOwner(memEvents) : null;
-    if (pick) browserPrefs.set("acct:legacy", pick);
+  async function fixLegacyOwner() {
+    if (legacyOwner() || !cloudKey()) return;
+    const pick = await remote.fetch("legacyOwner");
+    if (typeof pick === "string" && pick && !legacyOwner()) {
+      browserPrefs.set("acct:legacy", pick);
+      remote.reset();
+      dashboard?.refresh();
+    }
   }
   var NO_ACCOUNT = "\0none";
   var unlocked = false;
@@ -7523,24 +6482,15 @@ Click for the sales chart.` : r.name;
     if (guest()) return ctx.userId ?? NO_ACCOUNT;
     return resolveSelection(accountSel, ctx.userId, legacyOwner());
   }
-  async function getViewEvents() {
-    await ensureUser();
-    const all = await getEvents();
-    return filterByAccount(all, selectedAccount(), legacyOwner());
-  }
   function accountsState() {
-    const all = memEvents ?? [];
+    const res = remote.get("accounts", knownAccounts(), ctx.userId);
+    const all = Array.isArray(res.value) ? res.value : [];
+    const total = (list) => list.reduce((n, a) => n + (Number(a.events) || 0), 0);
     if (guest()) {
-      const own = filterByAccount(all, selectedAccount(), legacyOwner());
-      const list = listAccounts(own, knownAccounts(), legacyOwner(), ctx.userId).filter((a) => a.current);
-      return { list, selected: selectedAccount(), total: own.length, guest: true };
+      const list = all.filter((a) => a.current);
+      return { list, selected: selectedAccount(), total: total(list), guest: true };
     }
-    return {
-      list: listAccounts(all, knownAccounts(), legacyOwner(), ctx.userId),
-      selected: selectedAccount(),
-      total: all.length,
-      guest: false
-    };
+    return { list: all, selected: selectedAccount(), total: total(all), guest: false };
   }
   function selectAccount(sel) {
     if (guest()) return;
@@ -7562,85 +6512,62 @@ Click for the sales chart.` : r.name;
     if (sel != null && sel !== ctx.userId) return { balance: null, inventoryValue: null };
     return { balance: ctx.balance, inventoryValue: ctx.inventoryValue };
   }
-  function applyToMemory(events) {
-    if (!memEvents) return;
-    let unsorted = false;
-    for (const ev of events) {
-      const i = memIndex.get(ev.id);
-      if (i === void 0) {
-        const last = memEvents[memEvents.length - 1];
-        if (last && ev.ts < last.ts) unsorted = true;
-        memIndex.set(ev.id, memEvents.length);
-        memEvents.push(ev);
-      } else if (shouldReplace(memEvents[i], ev)) {
-        const merged = mergeEvent(memEvents[i], ev);
-        if (merged.ts !== memEvents[i].ts) unsorted = true;
-        memEvents[i] = merged;
-      }
-    }
-    if (unsorted) {
-      memEvents.sort((a, b) => a.ts - b.ts);
-      memIndex = new Map(memEvents.map((e, i) => [e.id, i]));
-    }
-  }
-  async function removeTwins() {
-    const events = await getEvents();
-    const twins = [...withdrawalTwinIds(events), ...caseTwinIds(events)];
-    if (!twins.length) return 0;
-    await deleteEvents(twins);
-    return twins.length;
-  }
-  async function deleteEvents(ids, { cloud: toCloud = true } = {}) {
-    if (!ids.length) return;
-    const drop = new Set(ids);
-    await store2.deleteEvents(ids);
+  var OUTBOX_DELAY_MS = 1500;
+  var OUTBOX_RETRY_MS = 60 * 1e3;
+  var outboxTimer = null;
+  var outboxRun = null;
+  async function saveEvents(events) {
+    if (!events.length) return 0;
+    const queued = await store2.putEvents(events);
     try {
-      shared?.remove(ids);
+      return await flushOutbox(events.map((e) => e.id));
     } catch (err) {
-      console.warn("[caser-tracker] could not update shared storage", err);
+      console.warn("[caser-tracker] could not send events, they stay queued", err);
+      scheduleOutbox(OUTBOX_RETRY_MS);
+      return queued;
     }
-    if (memEvents) {
-      memEvents = memEvents.filter((e) => !drop.has(e.id));
-      memIndex = new Map(memEvents.map((e, i) => [e.id, i]));
-    }
-    if (toCloud && cloudKey()) cloud.remove(ids).catch((err) => console.warn("[caser-tracker] could not delete in cloud", err));
   }
-  function dropMemory() {
-    memEvents = null;
-    memIndex = null;
+  function scheduleOutbox(ms = OUTBOX_DELAY_MS) {
+    if (outboxTimer) return;
+    outboxTimer = setTimeout(() => {
+      outboxTimer = null;
+      flushOutbox().catch(() => scheduleOutbox(OUTBOX_RETRY_MS));
+    }, ms);
   }
-  async function saveEvents(events, { share = true, cloud: toCloud = true } = {}) {
-    const added = await store2.putEvents(events);
-    applyToMemory(events);
-    if (memLoad) memLoad.then(() => applyToMemory(events), () => {
+  async function flushOutbox(ids = null) {
+    while (outboxRun) await outboxRun.catch(() => {
     });
-    if (share) queueShared(events);
-    if (toCloud) queueCloud(events);
-    return added;
-  }
-  var sharedQueue = [];
-  var sharedTimer = null;
-  function queueShared(events) {
-    if (!shared || !events.length) return;
-    sharedQueue.push(...events);
-    if (!sharedTimer) sharedTimer = setTimeout(flushShared, 1500);
-  }
-  function flushShared() {
-    sharedTimer = null;
-    const batch = sharedQueue;
-    sharedQueue = [];
+    outboxRun = (async () => {
+      if (!cloudKey()) ensureCloudKey();
+      const all = await store2.allEvents();
+      const want = ids ? new Set(ids) : null;
+      const batch = want ? all.filter((e) => want.has(e.id)) : all;
+      if (!batch.length) return 0;
+      const sent = new Map(batch.map((e) => [e.id, JSON.stringify(e)]));
+      const changed = await cloud.push(batch);
+      const now = await store2.allEvents();
+      const done = now.filter((e) => sent.get(e.id) === JSON.stringify(e)).map((e) => e.id);
+      await store2.deleteEvents(done);
+      cloudStatus = { ...cloudStatus, state: cloudStatus.state === "error" ? "idle" : cloudStatus.state, error: null, lastPush: Date.now() };
+      remote.invalidate();
+      refreshAfterLive();
+      return changed;
+    })();
     try {
-      shared.merge(batch);
+      return await outboxRun;
     } catch (err) {
-      console.warn("[caser-tracker] could not write shared storage", err);
+      cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err) };
+      throw err;
+    } finally {
+      outboxRun = null;
     }
   }
   async function clearLocal() {
     const ids = new Set(Object.keys(knownAccounts()));
-    for (const e of memEvents ?? await getEvents()) if (e.userId != null) ids.add(String(e.userId));
+    for (const e of await store2.allEvents()) if (e.userId != null) ids.add(String(e.userId));
     if (ctx.userId != null) ids.add(ctx.userId);
     await store2.clearEvents();
-    dropMemory();
+    remote.reset();
     const keys = ["lastSync", "lastSyncBy", ...HISTORY_STREAMS.map((s2) => `sync:${s2}`)];
     for (const id of ids) for (const s2 of HISTORY_STREAMS) keys.push(progressKey(s2, id));
     for (const k of keys) await store2.setMeta(k, null);
@@ -7679,146 +6606,86 @@ Click for the sales chart.` : r.name;
       if (v?.complete) markComplete(streamFlag(name, ctx.userId));
     }
   };
-  async function syncShared() {
-    if (!shared) return;
-    const clearedAt = shared.clearedAt();
-    if (clearedAt && clearedAt > (await store2.getMeta("sharedClearSeen") ?? 0)) {
-      await clearLocal();
-      await store2.setMeta("sharedClearSeen", clearedAt);
-    }
-    const remote = shared.readAll();
-    if (remote.length) await saveEvents(remote, { share: false, cloud: false });
-    await removeTwins();
-    shared.merge(await getEvents());
-    shared.onRemoteChange(async (rev) => {
-      try {
-        const cleared = shared.clearedAt();
-        if (cleared && cleared > (await store2.getMeta("sharedClearSeen") ?? 0)) {
-          await clearLocal();
-          await store2.setMeta("sharedClearSeen", cleared);
-          dashboard?.refresh();
-          return;
-        }
-        const events = shared.readDays(rev?.days);
-        if (events.length && await saveEvents(events, { share: false, cloud: false })) {
-          await removeTwins();
-          refreshAfterLive();
-        }
-      } catch (err) {
-        console.warn("[caser-tracker] could not read shared storage", err);
-      }
-    });
-  }
-  var CLOUD_PULL_EVERY_MS = 60 * 1e3;
+  var CLOUD_CHECK_EVERY_MS = 60 * 1e3;
   var cloud = createCloud({ request: gmRequest, getKey: () => cloudKey() });
-  var cloudStatus = { state: "idle", lastPull: null, error: null, progress: null };
-  var cloudQueue = /* @__PURE__ */ new Set();
-  var cloudTimer = null;
+  var cloudStatus = { state: "idle", lastPull: null, lastPush: null, error: null, progress: null };
   var cloudRun = null;
   function cloudKey() {
     const k = browserPrefs.get("cloud:key");
     return isSyncKey(k) ? k : null;
   }
-  function queueCloud(events) {
-    if (!cloudKey() || !events.length) return;
-    for (const e of events) cloudQueue.add(e.id);
-    if (!cloudTimer) {
-      cloudTimer = setTimeout(() => {
-        cloudTimer = null;
-        flushCloud().catch(() => {
-        });
-      }, 3e3);
-    }
-  }
-  async function flushCloud() {
-    if (!cloudQueue.size || !cloudKey()) return;
-    const ids = [...cloudQueue];
-    cloudQueue.clear();
-    const byId = new Map((await getEvents()).map((e) => [e.id, e]));
-    const events = ids.map((id) => byId.get(id)).filter(Boolean);
-    try {
-      await cloud.push(events);
-      if (cloudStatus.state === "error") cloudStatus = { ...cloudStatus, state: "idle", error: null };
-    } catch (err) {
-      for (const id of ids) cloudQueue.add(id);
-      cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err) };
-      throw err;
-    }
+  function ensureCloudKey() {
+    if (cloudKey()) return cloudKey();
+    const key = newSyncKey();
+    browserPrefs.set("cloud:key", key);
+    browserPrefs.set("cloud:clearSeen", Date.now());
+    return key;
   }
   var UPLOAD_BATCH = 500;
-  async function firstUpload(key) {
-    let plan = await store2.getMeta("cloudPushPlan");
-    if (!plan || plan.key !== key || !Array.isArray(plan.ids)) {
-      cloudStatus = { ...cloudStatus, progress: "Comparing with the cloud" };
-      dashboard?.refresh();
-      const ranks = await cloud.ranks((n) => {
-        cloudStatus = { ...cloudStatus, progress: `Comparing with the cloud (${n})` };
+  async function uploadLocalHistory(key) {
+    if (await store2.getMeta("outboxSince") === key) return;
+    const local = await store2.allEvents();
+    if (local.length) {
+      let plan = await store2.getMeta("cloudPushPlan");
+      if (!plan || plan.key !== key || !Array.isArray(plan.ids)) {
+        cloudStatus = { ...cloudStatus, progress: "Comparing with the server" };
         refreshSoon();
-      });
-      plan = { key, ids: planUpload(await getEvents(), ranks) };
-      await store2.setMeta("cloudPushPlan", plan);
-      await store2.setMeta("cloudPushDone", 0);
+        const ranks = await cloud.ranks((n) => {
+          cloudStatus = { ...cloudStatus, progress: `Comparing with the server (${n})` };
+          refreshSoon();
+        });
+        plan = { key, ids: planUpload(local, ranks) };
+        await store2.setMeta("cloudPushPlan", plan);
+        await store2.setMeta("cloudPushDone", 0);
+      }
+      let done = Number(await store2.getMeta("cloudPushDone")) || 0;
+      const byId = new Map(local.map((e) => [e.id, e]));
+      while (done < plan.ids.length) {
+        const batch = plan.ids.slice(done, done + UPLOAD_BATCH).map((id) => byId.get(id)).filter(Boolean);
+        if (batch.length) await cloud.push(batch);
+        done = Math.min(done + UPLOAD_BATCH, plan.ids.length);
+        await store2.setMeta("cloudPushDone", done);
+        cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${plan.ids.length} (one time)` };
+        refreshSoon();
+      }
+      await store2.deleteEvents(local.map((e) => e.id));
     }
-    let done = Number(await store2.getMeta("cloudPushDone")) || 0;
-    const byId = new Map((await getEvents()).map((e) => [e.id, e]));
-    while (done < plan.ids.length) {
-      const batch = plan.ids.slice(done, done + UPLOAD_BATCH).map((id) => byId.get(id)).filter(Boolean);
-      if (batch.length) await cloud.push(batch);
-      done = Math.min(done + UPLOAD_BATCH, plan.ids.length);
-      await store2.setMeta("cloudPushDone", done);
-      cloudStatus = { ...cloudStatus, progress: `Uploading ${done} / ${plan.ids.length} (one time)` };
-      refreshSoon();
-    }
-    await store2.setMeta("cloudPushedKey", key);
+    await store2.setMeta("outboxSince", key);
     await store2.setMeta("cloudPushPlan", null);
     await store2.setMeta("cloudPushDone", null);
+    await store2.setMeta("cloudCursor", null);
+    remote.invalidate();
   }
   function cloudSync() {
-    const key = cloudKey();
-    if (!key) return Promise.resolve(null);
+    const key = ensureCloudKey();
     if (cloudRun) return cloudRun;
     cloudRun = (async () => {
       cloudStatus = { ...cloudStatus, state: "syncing", progress: "Checking" };
       dashboard?.refresh();
       try {
+        await uploadLocalHistory(key);
         const account = await cloud.account();
         const seen = Number(browserPrefs.get("cloud:clearSeen")) || 0;
         if (account.clearedAt && account.clearedAt > seen) {
           browserPrefs.set("cloud:clearSeen", account.clearedAt);
           await clearLocal();
-          if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
         }
-        let cursor = await store2.getMeta("cloudCursor");
-        if (!cursor || cursor.key !== key) cursor = null;
-        cloudStatus = { ...cloudStatus, progress: cursor ? "Downloading changes" : "Downloading history" };
-        dashboard?.refresh();
-        const res = await cloud.pull(cursor);
-        if (res.deletedIds.length) await deleteEvents(res.deletedIds, { cloud: false });
-        let added = 0;
-        for (let i = 0; i < res.events.length; i += 2e3) added += await saveEvents(res.events.slice(i, i + 2e3), { cloud: false });
-        if (res.cursor) await store2.setMeta("cloudCursor", { key, ...res.cursor });
-        if (res.events.length) {
-          const byId = new Map((await getEvents()).map((e) => [e.id, e]));
-          const better = res.events.map((e) => byId.get(e.id)).filter((m, i) => m && eventRank(m) > eventRank(res.events[i]));
-          queueCloud(better);
-        }
-        if (added) await removeTwins();
-        if (await store2.getMeta("cloudPushedKey") !== key) await firstUpload(key);
-        await flushCloud();
+        await flushOutbox();
         for (const s2 of account.complete) if (isStreamFlag(s2, HISTORY_STREAMS)) markBrowserComplete(s2);
         for (const s2 of browserComplete()) {
           if (account.complete.includes(s2)) continue;
           try {
             await cloud.markComplete(s2);
           } catch (err) {
-            console.warn("[caser-tracker] could not update cloud", err);
+            console.warn("[caser-tracker] could not update the server", err);
           }
         }
-        fixLegacyOwner();
         const renamed = await syncNames(account.names);
-        cloudStatus = { state: "idle", lastPull: Date.now(), error: null, progress: null };
-        if (added || renamed) refreshSoon();
-        return { added };
+        await fixLegacyOwner().catch((err) => console.warn("[caser-tracker] could not read the legacy owner", err));
+        cloudStatus = { ...cloudStatus, state: "idle", lastPull: Date.now(), error: null, progress: null };
+        remote.invalidate();
+        if (renamed) refreshSoon();
+        return { added: 0 };
       } catch (err) {
         cloudStatus = { ...cloudStatus, state: "error", error: err.message || String(err), progress: null };
         throw err;
@@ -7829,21 +6696,26 @@ Click for the sales chart.` : r.name;
     })();
     return cloudRun;
   }
-  function setCloudKey(key) {
-    if (key != null && !isSyncKey(key)) throw new Error("That is not a sync key. A key is 32 or more letters, digits, - or _.");
+  async function setCloudKey(key) {
+    if (!isSyncKey(key)) throw new Error("That is not a sync key. A key is 32 or more letters, digits, - or _.");
+    await flushOutbox().catch(() => {
+    });
     browserPrefs.set("cloud:key", key);
-    browserPrefs.set("cloud:clearSeen", key ? Date.now() : null);
-    cloudQueue.clear();
-    cloudStatus = { state: "idle", lastPull: null, error: null, progress: null };
-    return key ? cloudSync() : null;
+    browserPrefs.set("cloud:clearSeen", Date.now());
+    browserPrefs.set("acct:legacy", null);
+    cloudStatus = { state: "idle", lastPull: null, lastPush: null, error: null, progress: null };
+    remote.reset();
+    dashboard?.refresh();
+    overlay?.refresh();
+    return cloudSync();
   }
   var cloudTicker = null;
   function startCloudTicker() {
     if (cloudTicker) return;
     cloudTicker = setInterval(() => {
-      if (document.visibilityState !== "visible" || !cloudKey()) return;
-      cloudSync().catch((err) => console.warn("[caser-tracker] cloud sync failed", err));
-    }, CLOUD_PULL_EVERY_MS);
+      if (document.visibilityState !== "visible") return;
+      cloudSync().catch((err) => console.warn("[caser-tracker] server sync failed", err));
+    }, CLOUD_CHECK_EVERY_MS);
   }
   var liveTimer = null;
   function refreshAfterLive() {
@@ -7990,9 +6862,8 @@ Click for the sales chart.` : r.name;
       if (events.length) {
         const uid = await ensureUser();
         if (uid != null) for (const e of events) e.userId = uid;
-        await saveEvents(events);
         lastEventTs = Date.now();
-        refreshAfterLive();
+        await saveEvents(events);
       } else if (ex.status < 400) {
         unknownResponses++;
         await store2.addRaw({ path: ex.path, status: ex.status, reqBody: ex.reqBody, resBody: ex.resBody });
@@ -8026,8 +6897,8 @@ Click for the sales chart.` : r.name;
     if (on && !overlay) {
       overlay = mountUpgradeOverlay({
         getSelection: () => readUpgradeSelection(document),
-        getEvents: getViewEvents,
-        stats: stats_exports,
+        remote,
+        stats: client_exports,
         currency: currencyLabel,
         getHoldings: holdings,
         onTurnOff: () => {
@@ -8042,51 +6913,51 @@ Click for the sales chart.` : r.name;
   }
   function mount() {
     dashboard = mountDashboard({
-      getEvents: getViewEvents,
+      remote,
       getAccounts: accountsState,
       selectAccount,
-      stats: stats_exports,
+      stats: client_exports,
       currency: currencyLabel,
       onExport: async (format) => {
-        const events = guest() ? await getViewEvents() : await getEvents();
+        await flushOutbox().catch(() => {
+        });
+        const { events: fromServer } = await cloud.pull(null);
+        const byId = new Map(fromServer.map((e) => [e.id, e]));
+        for (const e of await store2.allEvents()) byId.set(e.id, e);
+        let events = [...byId.values()].sort((a, b) => a.ts - b.ts);
+        if (guest()) events = events.filter((e) => (e.userId != null ? String(e.userId) : legacyOwner()) === selectedAccount());
         const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
         if (format === "csv") download(`caser-tracker-${stamp}.csv`, toCsv(events), "text/csv");
         else download(`caser-tracker-${stamp}.json`, toJson(events), "application/json");
       },
       onImportFile: async (file) => {
         const added = await saveEvents(fromJson(await file.text()));
-        if (added) await removeTwins();
         dashboard.refresh();
         return { added };
       },
       onImportHistory: () => sync(),
       onClear: async () => {
         requireOwner();
-        sharedQueue = [];
         await clearLocal();
-        if (shared) await store2.setMeta("sharedClearSeen", shared.clear());
-        if (cloudKey()) browserPrefs.set("cloud:clearSeen", await cloud.clear());
+        browserPrefs.set("cloud:clearSeen", await cloud.clear());
         accountSel = "current";
         dashboard.refresh();
       },
       getStatus: () => ({
         capturing: true,
-        lastEventTs,
+        lastEventTs: lastEventTs ?? remote.get("meta").value?.lastTs ?? null,
         unknownResponses,
         version: VERSION,
         lastSync: lastSyncFor(ctx.userId ?? selectedAccount()),
         syncing: syncProgress,
-        storagePersisted,
         // The sync key opens every account's history, so a guest does not get it.
-        cloud: guest() ? null : { key: cloudKey(), ...cloudStatus },
+        cloud: guest() ? null : { key: cloudKey(), ...cloudStatus, version: remote.version() },
         update: updateState(),
         lock: lockState()
       }),
       onCheckUpdate: () => checkUpdate(),
       onOpenUpdate: () => openUpdate(),
-      onCloudStart: () => (requireOwner(), setCloudKey(newSyncKey())),
       onCloudJoin: (key) => (requireOwner(), setCloudKey(String(key ?? "").trim())),
-      onCloudStop: () => (requireOwner(), setCloudKey(null)),
       onCloudSync: () => (requireOwner(), cloudSync()),
       onUnlock: (password, remember) => unlockWith(password, remember),
       onLock: () => lockNow(),
@@ -8105,14 +6976,14 @@ Click for the sales chart.` : r.name;
     mountCasePanel({
       getSlug: () => caseSlugFromPath(location.pathname),
       getInfo: getCaseInfo,
-      stats: stats_exports,
+      stats: client_exports,
       currency: currencyLabel
     });
     mountExchangePanel({
       isOpen: () => !!document.querySelector('[data-testid="replace-item-modal"]'),
       getState: replacementState,
       prices,
-      stats: stats_exports,
+      stats: client_exports,
       currency: currencyLabel,
       // Selects the item in the site's own list (same as clicking its card). Never confirms the replacement.
       selectCandidate: (id) => {
@@ -8136,7 +7007,6 @@ Click for the sales chart.` : r.name;
   }
   var syncProgress = null;
   var syncPromise = null;
-  var storagePersisted = null;
   var refreshTimer = null;
   function refreshSoon() {
     if (refreshTimer) return;
@@ -8150,7 +7020,7 @@ Click for the sales chart.` : r.name;
     syncPromise = (async () => {
       try {
         if (cloudRun) {
-          syncProgress = "Waiting for cloud download";
+          syncProgress = "Waiting for the upload";
           dashboard?.refresh();
           await cloudRun.catch(() => {
           });
@@ -8165,10 +7035,13 @@ Click for the sales chart.` : r.name;
             if (added) refreshSoon();
             return added;
           },
-          // Only the signed-in account's events: they decide where an unfinished walk resumes.
-          // Live events stored before the account was known (no userId) are included so the import
-          // can give them their owner.
-          getStored: async () => (await getEvents()).filter((e) => e.userId == null || String(e.userId) === ctx.userId),
+          // Counts of the signed-in account's imported events (they decide where an unfinished walk
+          // resumes) and its withdrawals, from the server.
+          getStored: async () => {
+            await flushOutbox().catch(() => {
+            });
+            return remote.fetch("historyBase", ctx.userId);
+          },
           onProgress: (msg) => {
             syncProgress = msg;
             refreshSoon();
@@ -8193,20 +7066,13 @@ Click for the sales chart.` : r.name;
       lastSyncLegacy = await store2.getMeta("lastSync") ?? null;
       const by = await store2.getMeta("lastSyncBy");
       lastSyncBy = by && typeof by === "object" ? by : {};
-      await syncShared().catch((err) => console.warn("[caser-tracker] could not sync shared storage", err));
+      const dropped = dropOldEventCopies(sharedGm);
+      if (dropped) console.info(`[caser-tracker] removed ${dropped} old event copies from script storage`);
       await publishLocalComplete().catch(() => {
       });
-      cloudSync().catch((err) => console.warn("[caser-tracker] cloud sync failed", err));
+      cloudSync().catch((err) => console.warn("[caser-tracker] server sync failed", err));
       startCloudTicker();
-      await removeTwins().catch((err) => console.warn("[caser-tracker] could not remove duplicates", err));
-      const events = await getEvents();
-      if (events.length && !lastEventTs) lastEventTs = events[events.length - 1].ts;
-      if (!cloudKey()) fixLegacyOwner();
       dashboard?.refresh();
-    } catch {
-    }
-    try {
-      storagePersisted = await navigator.storage?.persist?.() ?? null;
     } catch {
     }
     setTimeout(maybeAutoSync, 5e3);
@@ -8221,5 +7087,5 @@ Click for the sales chart.` : r.name;
   }
   if (document.body) mount();
   else document.addEventListener("DOMContentLoaded", mount, { once: true });
-  pageWindow.__caserTracker = { version: VERSION, store: store2, ctx, stats: stats_exports };
+  pageWindow.__caserTracker = { version: VERSION, store: store2, ctx, remote };
 })();

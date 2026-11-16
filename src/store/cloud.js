@@ -153,9 +153,21 @@ export function createCloud({ request, getKey, url = CLOUD_URL, apiKey = CLOUD_K
       return Number(await call('POST', '/rest/v1/rpc/sync_delete', { ids })) || 0;
     },
 
-    /** Deletes every event under this key. Returns the clear time (ms). */
-    async clear() {
-      return Date.parse(await call('POST', '/rest/v1/rpc/sync_clear', {}));
+    /**
+     * Deletes every event under this key, 5000 rows per request (one big delete runs past the
+     * database's time limit). Returns the clear time (ms); events sent after it are kept.
+     */
+    async clear(onProgress) {
+      let started = null;
+      let deleted = 0;
+      for (let i = 0; i < 1000; i++) {
+        const r = await call('POST', '/rest/v1/rpc/sync_clear_batch', { started });
+        started = r.at;
+        deleted += Number(r.deleted) || 0;
+        onProgress?.(deleted);
+        if (r.done) break;
+      }
+      return Date.parse(started);
     },
 
     /**

@@ -120,3 +120,21 @@ test('account names from the cloud keep only usable entries', () => {
   assert.deepEqual(cleanNames(null), {});
   assert.deepEqual(cleanNames(['x']), {});
 });
+
+test('clear deletes in batches until the server says done, and keeps the first clear time', async () => {
+  const calls = [];
+  let left = 12000;
+  const request = async (req) => {
+    const body = JSON.parse(req.body);
+    calls.push(body.started);
+    const n = Math.min(5000, left);
+    left -= n;
+    return { status: 200, json: { at: body.started ?? '2026-11-16T12:00:00Z', deleted: n, done: n < 5000 } };
+  };
+  const progress = [];
+  const c = createCloud({ request, getKey: () => 'k'.repeat(32), url: 'https://x' });
+  const at = await c.clear((n) => progress.push(n));
+  assert.equal(at, Date.parse('2026-11-16T12:00:00Z'));
+  assert.deepEqual(calls, [null, '2026-11-16T12:00:00Z', '2026-11-16T12:00:00Z']);
+  assert.deepEqual(progress, [5000, 10000, 12000]);
+});

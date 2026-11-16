@@ -23,7 +23,9 @@ const MAX_RETRIES = 6;
  * @param {string} o.site
  * @param {() => string|null} o.getAuth  latest Authorization header seen from the site
  * @param {(events: any[]) => Promise<number>} o.save
- * @param {() => Promise<any[]>} [o.getStored]  events already stored, to skip drops captured live
+ * @param {() => Promise<any[] | {counts: Record<string, number>, events: any[]}>} [o.getStored]
+ *   events already stored (to skip drops captured live and known withdrawals), or, from the stats
+ *   server, imported counts per kind plus the few stored events the import matches against
  * @param {(msg: string) => void} [o.onProgress]
  * @param {{load: (name: string) => Promise<any>, save: (name: string, v: any) => Promise<void>}} [o.progressStore]
  *   remembers per stream whether a full walk finished, so an interrupted first sync resumes
@@ -36,8 +38,10 @@ export async function importHistory({ fetch, ctx, site, getAuth, save, getStored
   const uid = encodeURIComponent(userId);
   // Drops captured live have no inventory id, so they are matched by case, skin and time instead.
   // The counts tell an unfinished walk where older history starts (see paginate).
-  const stored = getStored ? await getStored() : [];
-  const countOf = (...kinds) => stored.filter((e) => kinds.includes(e.kind) && e.source === 'import').length;
+  const base = getStored ? await getStored() : [];
+  const stored = Array.isArray(base) ? base : Array.isArray(base?.events) ? base.events : [];
+  const countOf = (...kinds) =>
+    Array.isArray(base) ? stored.filter((e) => kinds.includes(e.kind) && e.source === 'import').length : kinds.reduce((n, k) => n + (Number(base?.counts?.[k]) || 0), 0);
 
   let upgrades = 0;
   await paginate(get, `/api/game/upgrade/public-history/${uid}`, async (body, page) => {

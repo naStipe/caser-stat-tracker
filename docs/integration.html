@@ -13,14 +13,17 @@
 import * as stats from '../src/stats/index.js';
 import { mountDashboard, mountUpgradeOverlay } from '../src/ui/index.js';
 import { generateEvents } from '../test/fixtures.js';
+import { createRemoteStats } from '../src/store/remote-stats.js';
+import { localStatsRequest } from '../src/server/local.js';
 
 const errors = [];
 window.addEventListener('error', (e) => errors.push(String(e.message)));
 window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason)));
 const events = generateEvents({ seed: 3, cases: 400, upgrades: 500 });
+// The stats server's code, run in this page over the generated events.
+const remote = createRemoteStats({ request: localStatsRequest(() => events), getKey: () => 'x'.repeat(32), getAccount: () => ({ sel: 'all', legacy: null }) });
 const dash = mountDashboard({
-  getEvents: async () => events.slice(),
-  stats,
+  remote,
   currency: () => '₽',
   onExport: () => {},
   onImportFile: async () => ({ added: 0 }),
@@ -28,8 +31,8 @@ const dash = mountDashboard({
   onClear: async () => {},
   getStatus: () => ({ capturing: true, lastEventTs: Date.now(), unknownResponses: 0, version: 'integration' }),
 });
-const overlay = mountUpgradeOverlay({ getSelection: () => ({ stake: 100, targetPrice: 1000, chanceShown: null }), getEvents: async () => events.slice(), stats, currency: () => '₽' });
-window.__int = { dash, overlay, stats, events, errors };
+const overlay = mountUpgradeOverlay({ getSelection: () => ({ stake: 100, targetPrice: 1000, chanceShown: null }), remote, stats, currency: () => '₽' });
+window.__int = { dash, overlay, stats, remote, events, errors };
 </script>
 </body>
 </html>

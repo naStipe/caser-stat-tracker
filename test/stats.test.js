@@ -489,3 +489,23 @@ test('Holm correction withholds significance from two borderline rows', () => {
   assert.ok(rows.every((r) => r.p < 0.05)); // each would pass an uncorrected test
   assert.ok(rows.every((r) => r.significant === false)); // smallest p 0.028 > 0.05 / 2
 });
+
+test('quoteFromBase(quoteBase(events)) equals upgradeQuote on random history', () => {
+  const hist = [];
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  for (let i = 0; i < 400; i++) {
+    const stake = 20 + rnd() * 3000;
+    const ch = 1 + rnd() * 90;
+    const won = rnd() * 100 < ch;
+    const tp = stake / (ch / 103);
+    hist.push({ id: `q${i}`, kind: 'upgrade', ts: i * 1000, stake, chanceShown: ch, target: { price: tp }, status: won ? 'won' : 'lost', won, returned: won ? tp : 0, mystery: false });
+  }
+  const base = stats.quoteBase(hist);
+  // Survives a JSON round trip, as it does over the network.
+  const wire = JSON.parse(JSON.stringify(base));
+  for (const sel of [{ stake: 100, targetPrice: 200 }, { stake: 1000, targetPrice: 5000 }, { stake: 50, targetPrice: 60, chanceShown: 80 }, { stake: 0, targetPrice: 0 }]) {
+    assert.deepEqual(stats.quoteFromBase(sel, wire), upgradeQuote(sel, hist));
+  }
+  assert.deepEqual(stats.quoteFromBase({ stake: 100, targetPrice: 200 }, null), upgradeQuote({ stake: 100, targetPrice: 200 }, []));
+});

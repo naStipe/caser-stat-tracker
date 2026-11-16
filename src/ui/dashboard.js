@@ -2,7 +2,8 @@
 // Five tabs, plus a settings view behind the gear button in the header.
 // Each view leads with the plain answer. Statistics (z, p, intervals, method notes) live in
 // tooltips (any element with data-tip) or in "more" expanders, so the first read stays simple.
-// Talks to stats only through opts.stats (see docs/CONTRACT.md, "UI API").
+// Statistics come from the stats server through opts.remote (store/remote-stats.js): every answer is
+// {value}, {error} or {loading}, and the panel re-renders when answers arrive.
 
 import { h, s, createHost, attach, store, debounce, safe } from './dom.js';
 import { BASE_CSS, DASHBOARD_CSS } from './styles.js';
@@ -87,7 +88,6 @@ const CASE_PAGE = 25;
 
 const ok = (v) => typeof v === 'number' && Number.isFinite(v);
 const num = (v) => (ok(v) ? v : Number(v) || 0);
-const settledUpgrade = (e) => e && e.kind === 'upgrade' && e.status !== 'pending';
 
 export function edgesToText(arr) {
   return arr.map((v) => (v === Infinity ? 'inf' : String(v))).join(', ');
@@ -115,23 +115,6 @@ export function parseEdges(text, allowInf) {
   return { edges };
 }
 
-function flow(e) {
-  if (!e) return null;
-  if (e.kind === 'case') return { cost: num(e.casePrice), ret: num(e.item && e.item.price) };
-  if (e.kind === 'upgrade' && e.status !== 'pending') return { cost: num(e.stake), ret: num(e.returned) };
-  return null;
-}
-
-function cumulative(events) {
-  const sorted = events.filter((e) => flow(e)).sort((a, b) => num(a.ts) - num(b.ts));
-  let net = 0;
-  return sorted.map((e) => {
-    const f = flow(e);
-    net += f.ret - f.cost;
-    return { ts: num(e.ts), v: net };
-  });
-}
-
 const ICON = { viewBox: '0 0 16 16', 'aria-hidden': 'true', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.6, 'stroke-linecap': 'round' };
 function iconClose() {
   return s('svg', ICON, s('path', { d: 'M4 4l8 8M12 4l-8 8' }));
@@ -148,7 +131,6 @@ function iconSettings() {
 
 export function mountDashboard(opts = {}) {
   const o = opts;
-  const stats = o.stats || {};
   const cur = () => {
     try {
       return String((o.currency && o.currency()) ?? '');
@@ -173,7 +155,6 @@ export function mountDashboard(opts = {}) {
     tab: TABS.some(([id]) => id === savedTab) ? savedTab : 'overview',
     lastTab: 'overview',
     upSub: UP_SUBS.some(([id]) => id === savedSub) ? savedSub : 'odds',
-    events: [],
     loaded: false,
     loading: false,
     again: false,
@@ -210,14 +191,16 @@ export function mountDashboard(opts = {}) {
     }
   }
 
+  // Local work that is only redone after a refresh.
   const memo = (key, fn) => {
     if (!state.cache.has(key)) state.cache.set(key, safe(fn));
     return state.cache.get(key);
   };
-  const call = (name, ...args) => {
-    if (typeof stats[name] !== 'function') throw new Error(`stats.${name} is missing`);
-    return stats[name](...args);
-  };
+  /** One statistic from the stats server: {value, stale?} | {error} | {loading: true}. */
+  const stat = (name, ...args) => (o.remote ? o.remote.get(name, ...args) : { error: new Error('The stats server is not connected.') });
+  /** Counts of the shown account (server view "meta"), or null until they arrive. */
+  const counts = () => stat('meta').value || null;
+  const loadingBox = () => h('p', { class: 'muted loading', role: 'status', text: 'Loading…' });
 
   // ---------- launcher ----------
   const launcher = h(
@@ -382,6 +365,8 @@ export function mountDashboard(opts = {}) {
   const onResize = debounce(() => state.open && render(), 150);
   window.addEventListener('resize', onResize);
   const reattach = setInterval(() => attach(host), 2000);
+  // Answers from the stats server arrive after the render that asked for them: draw again then.
+  const unsubscribe = o.remote ? o.remote.subscribe(() => state.open && render()) : () => {};
 
   function open() {
     state.open = true;
@@ -432,13 +417,8 @@ export function mountDashboard(opts = {}) {
       return;
     }
     state.loading = true;
-    try {
-      const ev = await o.getEvents();
-      state.events = Array.isArray(ev) ? ev : [];
-      state.loadError = null;
-    } catch (e) {
-      state.loadError = e;
-    }
+    // New events may have reached the server: ask again (old answers stay on screen meanwhile).
+    o.remote?.invalidate();
     if (typeof o.getAccounts === 'function') state.accounts = safe(() => o.getAccounts()).value || null;
     // Holdings (cash balance + skin value) for the Money tab. Optional; may be sync or async.
     if (typeof o.getHoldings === 'function') {
@@ -475,19 +455,15 @@ export function mountDashboard(opts = {}) {
     const caret = active && active.tagName === 'INPUT' ? [active.selectionStart, active.selectionEnd] : null;
     const scroll = body.scrollTop;
 
-    const n = state.events.length;
-    let first = null;
-    let last = null;
-    for (const e of state.events) {
-      const ts = num(e.ts);
-      if (!ts) continue;
-      if (first === null || ts < first) first = ts;
-      if (last === null || ts > last) last = ts;
-    }
-    subEl.textContent = !state.loaded
-      ? 'Loading…'
-      : n
-        ? `${fmtInt(n)} events · ${fmtDate(first)} ${DASH} ${fmtDate(last)}`
+    const metaRes = stat('meta');
+    const m = metaRes.value || null;
+    state.loadError = metaRes.error || o.remote?.lastError() || null;
+    subEl.textContent = !m
+      ? metaRes.error
+        ? 'Stats server unreachable'
+        : 'Loading…'
+      : m.total
+        ? `${fmtInt(m.total)} events · ${fmtDate(m.firstTs)} ${DASH} ${fmtDate(m.lastTs)}`
         : 'No events recorded yet';
     renderAccounts();
     const stHead = safe(() => (o.getStatus ? o.getStatus() : {})).value || {};
@@ -510,7 +486,7 @@ export function mountDashboard(opts = {}) {
     else body.removeAttribute('aria-label');
 
     let content;
-    if (!state.loaded) content = [h('p', { class: 'muted', text: 'Loading your events…' })];
+    if (!m && state.tab !== 'data') content = metaRes.error ? [errorBox(metaRes.error, 'Could not reach the stats server')] : [loadingBox()];
     else {
       const views = {
         overview: viewOverview,
@@ -526,7 +502,7 @@ export function mountDashboard(opts = {}) {
         console.warn('[caser-tracker] render failed', e);
         content = [errorBox(e)];
       }
-      if (state.loadError && state.tab !== 'data') content.unshift(errorBox(state.loadError, 'Could not read stored events'));
+      if (state.loadError && state.tab !== 'data') content.unshift(errorBox(state.loadError, 'Could not reach the stats server'));
     }
     const view = h('div', { class: ['view', state.tabChanged && 'enter'] }, content);
     body.replaceChildren(view);
@@ -813,7 +789,9 @@ export function mountDashboard(opts = {}) {
   const ctx = {
     state,
     memo,
-    call,
+    stat,
+    counts,
+    loadingBox,
     cur,
     contentWidth,
     render,
@@ -838,12 +816,12 @@ export function mountDashboard(opts = {}) {
 
   // ---------- Overview ----------
   function viewOverview() {
-    const ev = state.events;
-    if (!ev.length) {
+    if (!counts().total) {
       return emptyState('No events yet', 'Open a case or make an upgrade on the site and it shows up here. You can also import your past history.', goDataButton());
     }
     const c = cur();
-    const sum = memo('summary', () => call('summarize', ev));
+    const sum = stat('summarize');
+    if (sum.loading) return [loadingBox()];
     if (sum.error) return [errorBox(sum.error)];
     const { total = {}, cases = {}, upgrades = {} } = sum.value || {};
     const out = [];
@@ -870,32 +848,40 @@ export function mountDashboard(opts = {}) {
       ),
     );
 
-    const series = memo('series', () => cumulative(ev)).value || [];
+    const seriesRes = stat('cumulative');
+    const series = seriesRes.value || [];
     out.push(
       h(
         'section',
         null,
         sectionHead('Net over time', 'Running total of every case open and upgrade, oldest on the left. Hover the chart to read a point.'),
-        series.length >= 2 ? lineChart({ points: series, width: contentWidth(), currency: c }) : h('p', { class: 'muted', text: 'The chart needs at least two events.' }),
+        seriesRes.loading
+          ? loadingBox()
+          : seriesRes.error
+            ? errorBox(seriesRes.error)
+            : series.length >= 2
+              ? lineChart({ points: series, width: contentWidth(), currency: c, count: (counts().kinds?.case ?? 0) + (counts().settled ?? 0) })
+              : h('p', { class: 'muted', text: 'The chart needs at least two events.' }),
       ),
     );
 
-    out.push(h('section', null, sectionHead('Upgrade odds check'), calibrationBlock(ev)));
+    out.push(h('section', null, sectionHead('Upgrade odds check'), calibrationBlock()));
 
-    const ses = memo('sessions', () => call('sessions', ev));
+    const ses = stat('sessions');
     out.push(
       h(
         'section',
         null,
         sectionHead('Recent sessions', 'A session is a stretch of play without a long break.'),
-        ses.error ? errorBox(ses.error) : sessionsList(ses.value || [], c),
+        ses.loading ? loadingBox() : ses.error ? errorBox(ses.error) : sessionsList(ses.value || [], c),
       ),
     );
     return out;
   }
 
-  function calibrationBlock(ev) {
-    const cal = memo('calibration', () => call('calibration', ev));
+  function calibrationBlock() {
+    const cal = stat('calibration');
+    if (cal.loading) return loadingBox();
     if (cal.error) return errorBox(cal.error);
     const r = cal.value;
     if (!r || !r.n) return callout('neutral', 'No upgrades yet', 'This check compares how often you win upgrades with the chance the site showed.');
@@ -948,11 +934,11 @@ export function mountDashboard(opts = {}) {
 
   // ---------- Cases ----------
   function viewCases() {
-    const ev = state.events;
-    if (!ev.some((e) => e.kind === 'case')) {
+    if (!counts().kinds?.case) {
       return emptyState('No case opens yet', 'Open a case on the site, or import your drop history.', goDataButton());
     }
-    const res = memo('caseRoi', () => call('caseRoi', ev));
+    const res = stat('caseRoi');
+    if (res.loading) return [loadingBox()];
     if (res.error) return [errorBox(res.error)];
     const all = [...(res.value || [])];
     const c = cur();
@@ -1088,12 +1074,12 @@ export function mountDashboard(opts = {}) {
 
   // ---------- Upgrades ----------
   function viewUpgrades() {
-    const ev = state.events;
-    if (!ev.some(settledUpgrade)) {
+    const m = counts();
+    if (!m.settled) {
       return emptyState('No upgrades yet', 'Make an upgrade on the site, or import your upgrade history.', goDataButton());
     }
-    const hasNormal = ev.some((e) => settledUpgrade(e) && !e.mystery);
-    const hasMystery = ev.some((e) => settledUpgrade(e) && e.mystery);
+    const hasNormal = m.settledNormal > 0;
+    const hasMystery = m.settledMystery > 0;
     if (state.upSub === 'mystery' && !hasMystery) state.upSub = 'odds';
     if (state.upSub !== 'mystery' && !hasNormal && hasMystery) state.upSub = 'mystery';
     const nav = h(
@@ -1120,9 +1106,9 @@ export function mountDashboard(opts = {}) {
 
   // ---------- Factors ----------
   function viewFactors() {
-    const ev = state.events;
-    const hasUp = ev.some(settledUpgrade);
-    const hasCase = ev.some((e) => e.kind === 'case');
+    const m = counts();
+    const hasUp = m.settled > 0;
+    const hasCase = (m.kinds?.case ?? 0) > 0;
     if (!hasUp && !hasCase) {
       return emptyState('Nothing to compare yet', 'Factors compare your results by time, session and bet type. Record some events first.', goDataButton());
     }
@@ -1168,7 +1154,8 @@ export function mountDashboard(opts = {}) {
       h('p', { class: 'hint', style: { margin: '0 0 12px' }, text: 'Does anything (time of day, streaks, bet size…) change your results? Pick a factor.' }),
       h('div', { class: 'controls' }, kindSeg, select),
     ];
-    const res = memo(`factor:${kind}:${fdef.key}`, () => call('factor', ev, fdef.key, { kind }));
+    const res = stat('factor', fdef.key, { kind });
+    if (res.loading) return [...out, loadingBox()];
     if (res.error) return [...out, errorBox(res.error)];
     const r = res.value || {};
     const rows = (r.rows || []).filter((x) => x && x.n > 0);
@@ -1349,45 +1336,31 @@ export function mountDashboard(opts = {}) {
     return h('div', { class: 'card' }, h('div', { class: 'ct', text: title }), desc ? h('p', { class: 'cd', text: desc }) : null, children);
   }
 
-  // Cloud sync: one random key shared by all the user's browsers names their common history.
+  // The sync key: a random name for this history on the stats server. Every browser that holds it
+  // shows and adds to the same history.
   function cloudCard(cl, btn) {
-    const on = !!cl.key;
-    if (!on) {
-      const keyInput = h('input', {
-        type: 'text',
-        class: 'key-input',
-        placeholder: 'Paste the sync key from your other browser',
-        autocomplete: 'off',
-        spellcheck: 'false',
-        'aria-label': 'Sync key',
-        'data-fk': 'cloud-key-input',
-        value: state.cloudKeyDraft || '',
-        on: { input: (e) => (state.cloudKeyDraft = e.target.value) },
-      });
-      return card(
-        'Sync between browsers',
-        'Keep one history in every browser you use. Start in one browser, then paste the key in the others.',
-        h(
-          'div',
-          { class: 'btns' },
-          btn('cloud-start', 'Start cloud sync', 'primary', () => run('cloud-start', () => o.onCloudStart(), () => 'Cloud sync is on. Copy the key into your other browsers.')),
-        ),
-        h(
-          'div',
-          { class: 'btns key-row' },
-          keyInput,
-          btn('cloud-join', 'Use key', '', () =>
-            run('cloud-join', () => o.onCloudJoin(state.cloudKeyDraft), (r) => {
-              state.cloudKeyDraft = '';
-              return `Cloud sync is on. ${fmtInt(num(r && r.added))} events came from your other browsers.`;
-            }),
-          ),
-        ),
-      );
+    const keyInput = h('input', {
+      type: 'text',
+      class: 'key-input',
+      placeholder: 'Paste the sync key from your other browser',
+      autocomplete: 'off',
+      spellcheck: 'false',
+      'aria-label': 'Sync key from another browser',
+      'data-fk': 'cloud-key-input',
+      value: state.cloudKeyDraft || '',
+      on: { input: (e) => (state.cloudKeyDraft = e.target.value) },
+    });
+    if (!cl.key) {
+      return card('Your history on the server', 'Preparing your sync key…');
     }
-
     const stateText =
-      cl.state === 'syncing' ? `Syncing… ${cl.progress || ''}` : cl.state === 'error' ? `Failed: ${cl.error}` : ok(cl.lastPull) ? `Up to date, checked ${fmtAgo(cl.lastPull)}` : 'Waiting';
+      cl.state === 'syncing'
+        ? `Working… ${cl.progress || ''}`
+        : cl.state === 'error'
+          ? `Failed: ${cl.error}`
+          : ok(cl.lastPush) || ok(cl.lastPull)
+            ? `Up to date, checked ${fmtAgo(Math.max(num(cl.lastPush), num(cl.lastPull)))}`
+            : 'Waiting';
     // Shown in a read-only field: the site turns off text selection on the page, inputs keep it.
     const shown = state.cloudKeyShown
       ? h('input', {
@@ -1402,14 +1375,14 @@ export function mountDashboard(opts = {}) {
         })
       : `${cl.key.slice(0, 4)}${'•'.repeat(12)}`;
     return card(
-      'Sync between browsers',
-      null,
+      'Your history on the server',
+      'Your events are stored on the tracker\'s server under this key, and the statistics are computed there. Keep a copy of the key: without it the history cannot be reached.',
       h(
         'dl',
         { class: 'status' },
-        h('dt', { text: 'Cloud' }),
+        h('dt', { text: 'Server' }),
         h('dd', { class: cl.state === 'error' ? 'neg' : null }, h('span', { class: ['dot', cl.state === 'error' ? 'off' : 'on'], 'aria-hidden': 'true' }), stateText),
-        h('dt', null, 'Sync key', tip('Anyone with this key can read and change your history, so keep it private. Checks for new events every minute while the tab is open.')),
+        h('dt', null, 'Sync key', tip('Anyone with this key can read and change your history, so keep it private. Paste it into your other browsers to see the same history there.')),
         h('dd', { class: 'num key-text' }, shown),
       ),
       h(
@@ -1422,7 +1395,7 @@ export function mountDashboard(opts = {}) {
             state.pendingFocus = 'cloud-copy';
             render();
           };
-          const copied = () => done('Key copied. Paste it under Settings → Sync between browsers in your other browser.', 'pos');
+          const copied = () => done('Key copied. Keep it somewhere safe, and paste it below in your other browsers.', 'pos');
           const failed = () => {
             state.cloudKeyShown = true;
             done('Could not copy. The key is shown above: click it, then press Ctrl+C.', 'neg');
@@ -1442,11 +1415,21 @@ export function mountDashboard(opts = {}) {
           state.pendingFocus = 'cloud-show';
           render();
         }),
-        btn('cloud-sync', 'Sync now', '', () => run('cloud-sync', () => o.onCloudSync(), (r) => `Cloud sync done: ${fmtInt(num(r && r.added))} new events.`), {
-          busyLabel: 'Syncing…',
+        btn('cloud-sync', 'Check now', '', () => run('cloud-sync', () => o.onCloudSync(), () => 'Everything recorded here is on the server.'), {
+          busyLabel: 'Checking…',
           disabled: cl.state === 'syncing',
         }),
-        btn('cloud-stop', 'Stop', 'ghost', () => run('cloud-stop', () => o.onCloudStop(), () => 'Cloud sync is off in this browser. The cloud copy is kept.')),
+      ),
+      h(
+        'div',
+        { class: 'btns key-row' },
+        keyInput,
+        btn('cloud-join', 'Use this key', '', () =>
+          run('cloud-join', () => o.onCloudJoin(state.cloudKeyDraft), () => {
+            state.cloudKeyDraft = '';
+            return 'This browser now shows the history of that key.';
+          }),
+        ),
       ),
     );
   }
@@ -1514,17 +1497,17 @@ export function mountDashboard(opts = {}) {
   const msgLine = () => h('p', { class: ['msg', state.msg && state.msg.tone], role: 'status', 'aria-live': 'polite', text: state.msg ? state.msg.text : '' });
 
   function viewData() {
-    const ev = state.events;
     const c = cur();
     const st = safe(() => (o.getStatus ? o.getStatus() : {})).value || {};
-    const count = (k) => ev.filter((e) => e.kind === k).length;
+    const m = counts() || { total: 0, kinds: {} };
+    const count = (k) => m.kinds?.[k] ?? 0;
     const nCase = count('case');
     const nUp = count('upgrade');
     const nDep = count('deposit');
     const nWd = count('withdrawal');
     // Export and "Clear all" cover every account, not only the one shown.
     const nAccounts = state.accounts && Array.isArray(state.accounts.list) ? state.accounts.list.length : 1;
-    const totalEvents = state.accounts && ok(state.accounts.total) ? state.accounts.total : ev.length;
+    const totalEvents = state.accounts && ok(state.accounts.total) ? state.accounts.total : m.total;
     const busy = !!state.busy;
 
     const btn = (name, label, cls, onClick, extra = {}) =>
@@ -1539,7 +1522,7 @@ export function mountDashboard(opts = {}) {
       });
 
     const out = [h('h2', { class: 'view-title', text: 'Settings and data' })];
-    if (state.loadError) out.push(h('section', null, errorBox(state.loadError, 'Could not read stored events')));
+    if (state.loadError) out.push(h('section', null, errorBox(state.loadError, 'Could not reach the stats server')));
     const lk = st.lock && st.lock.set && typeof o.onUnlock === 'function' ? st.lock : null;
     const isGuest = !!(lk && lk.guest);
     if (lk && lk.guest) out.push(h('section', null, lockCard(lk, btn), lockRun() ? msgLine() : null));
@@ -1562,7 +1545,7 @@ export function mountDashboard(opts = {}) {
             h('dd', {
               class: 'num',
               'data-tip': `${fmtInt(nCase)} case opens, ${fmtInt(nUp)} upgrades, ${fmtInt(nDep)} deposits, ${fmtInt(nWd)} withdrawals`,
-              text: fmtInt(ev.length),
+              text: fmtInt(m.total),
             }),
             h('dt', { text: 'Last event' }),
             h('dd', { class: 'num', text: ok(st.lastEventTs) ? fmtAgo(st.lastEventTs) : 'none yet', 'data-tip': ok(st.lastEventTs) ? fmtDateTime(st.lastEventTs) : null }),
@@ -1579,8 +1562,6 @@ export function mountDashboard(opts = {}) {
             h(
               'dl',
               { class: 'status' },
-              h('dt', null, 'Storage', tip('Whether the browser promised not to clear the stored history on its own.')),
-              h('dd', { text: st.storagePersisted === true ? 'Kept by the browser' : st.storagePersisted === false ? 'May be cleared when space runs low' : DASH }),
               h('dt', null, 'Unknown responses', tip('Site responses the parser did not recognise. Above 0 can mean the site changed.')),
               h('dd', { class: ['num', num(st.unknownResponses) > 0 && 'neg'], text: fmtInt(num(st.unknownResponses)) }),
               h('dt', { text: 'Version' }),
@@ -1596,7 +1577,7 @@ export function mountDashboard(opts = {}) {
     const sync = [
       card(
         'Your history',
-        'Stored in this browser. Syncs with the site on its own when you open it, at most every 15 minutes. The first sync takes a few minutes.',
+        'Read from the site on its own when you open it, at most every 15 minutes, and stored on the tracker server. The first sync takes a few minutes.',
         h(
           'div',
           { class: 'btns' },
@@ -1608,7 +1589,7 @@ export function mountDashboard(opts = {}) {
         ),
       ),
     ];
-    if (st.cloud && typeof o.onCloudStart === 'function') sync.push(cloudCard(st.cloud, btn));
+    if (st.cloud && typeof o.onCloudJoin === 'function') sync.push(cloudCard(st.cloud, btn));
     out.push(h('section', null, sectionHead('History and sync'), sync));
 
     // Preferences
@@ -1686,7 +1667,7 @@ export function mountDashboard(opts = {}) {
     if (!isGuest) {
       const del = card(
         'Delete data',
-        'Removes every recorded event from this browser.',
+        'Removes every recorded event from the server, for every browser that uses this sync key.',
         btn(
           'clear',
           'Clear all',
@@ -1706,7 +1687,7 @@ export function mountDashboard(opts = {}) {
             { class: 'confirm', role: 'alertdialog', 'aria-labelledby': 'cst-confirm-text' },
             h('p', {
               id: 'cst-confirm-text',
-              text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ''} from this browser? This cannot be undone. Export first if you want a backup.`,
+              text: `Delete all ${fmtInt(totalEvents)} recorded events${nAccounts > 1 ? ` of all ${nAccounts} accounts` : ''} from the server? Every browser with this sync key loses them. This cannot be undone. Export first if you want a backup.`,
             }),
             h(
               'div',
@@ -1740,6 +1721,7 @@ export function mountDashboard(opts = {}) {
       refresh.cancel();
       onResize.cancel();
       clearInterval(reattach);
+      unsubscribe();
       window.removeEventListener('keydown', onWindowKey);
       window.removeEventListener('resize', onResize);
       host.remove();

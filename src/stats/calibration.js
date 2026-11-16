@@ -1,7 +1,7 @@
 // Calibration of shown odds, edge map by chance bucket, and the single-upgrade quote.
 import { num, shownChance } from '../schema.js';
 import {
-  ALPHA, DEFAULT_CHANCE_EDGES, DEFAULT_CURVE_EDGES, DEFAULT_STAKE_EDGES, baseMetrics, bucketIndex, chanceOf, groupByBucket, isWin,
+  ALPHA, DEFAULT_CHANCE_EDGES, DEFAULT_CURVE_EDGES, DEFAULT_STAKE_EDGES, baseMetrics, bucketIndex, chanceOf, costOf, returnedOf, groupByBucket, isWin,
   makeBuckets, markSignificant, oddsEvents, targetPriceOf, winMetrics,
 } from './core.js';
 import { binomialPmf, mean, pmfQuantile, wilson } from './math.js';
@@ -105,21 +105,52 @@ function longRun(stake, targetPrice, chance) {
  * @param {{includeSuperDrop?:boolean}} [opts]
  */
 export function upgradeQuote(sel, events, opts = {}) {
+  return quoteFromBase(sel, quoteBase(events, opts));
+}
+
+/**
+ * The history part of upgradeQuote, small enough to send over the network: per chance bucket
+ * (DEFAULT_CHANCE_EDGES) n, cost and returned, and per chance x stake bucket (DEFAULT_STAKE_EDGES) n and wins.
+ * @param {object[]} events
+ * @param {{includeSuperDrop?:boolean}} [opts]
+ * @returns {{chance: {n:number, cost:number, returned:number}[], cells: {n:number, wins:number}[][]}}
+ */
+export function quoteBase(events, opts = {}) {
+  const nc = DEFAULT_CHANCE_EDGES.length - 1;
+  const ns = DEFAULT_STAKE_EDGES.length - 1;
+  const chance = Array.from({ length: nc }, () => ({ n: 0, cost: 0, returned: 0 }));
+  const cells = Array.from({ length: nc }, () => Array.from({ length: ns }, () => ({ n: 0, wins: 0 })));
+  for (const e of oddsEvents(events, opts)) {
+    const ci = bucketIndex(num(e.chanceShown), DEFAULT_CHANCE_EDGES);
+    if (ci < 0) continue;
+    chance[ci].n += 1;
+    chance[ci].cost += costOf(e);
+    chance[ci].returned += returnedOf(e);
+    const si = bucketIndex(num(e.stake), DEFAULT_STAKE_EDGES);
+    if (si < 0) continue;
+    cells[ci][si].n += 1;
+    if (isWin(e)) cells[ci][si].wins += 1;
+  }
+  return { chance, cells };
+}
+
+/**
+ * upgradeQuote from a quoteBase result instead of the events.
+ * @param {{stake:number, targetPrice:number, chanceShown?:number|null}} sel
+ * @param {ReturnType<typeof quoteBase>|null} base
+ */
+export function quoteFromBase(sel, base) {
   const stake = num(sel && sel.stake);
   const targetPrice = num(sel && sel.targetPrice);
   const given = sel && sel.chanceShown != null ? num(sel.chanceShown) : null;
   const chanceShown = given !== null ? given : shownChance(stake, targetPrice);
   const ev = (chanceShown / 100) * targetPrice - stake;
 
-  const ups = oddsEvents(events, opts);
   const chanceBucket = bucketIndex(chanceShown, DEFAULT_CHANCE_EDGES);
-  const sameChance = chanceBucket < 0 ? [] : ups.filter((e) => bucketIndex(num(e.chanceShown), DEFAULT_CHANCE_EDGES) === chanceBucket);
   const stakeBucket = bucketIndex(stake, DEFAULT_STAKE_EDGES);
-  const similar = stakeBucket < 0 ? [] : sameChance.filter((e) => bucketIndex(num(e.stake), DEFAULT_STAKE_EDGES) === stakeBucket);
-
-  const edgeBase = baseMetrics(sameChance);
-  const wins = similar.filter(isWin).length;
-  const realEdge = sameChance.length >= MIN_N_FOR_EDGE && edgeBase.cost > 0 ? edgeBase.returned / edgeBase.cost - 1 : null;
+  const edgeBase = (chanceBucket >= 0 && base?.chance?.[chanceBucket]) || { n: 0, cost: 0, returned: 0 };
+  const cell = (chanceBucket >= 0 && stakeBucket >= 0 && base?.cells?.[chanceBucket]?.[stakeBucket]) || { n: 0, wins: 0 };
+  const realEdge = edgeBase.n >= MIN_N_FOR_EDGE && edgeBase.cost > 0 ? edgeBase.returned / edgeBase.cost - 1 : null;
   // With enough history, project the long run from the return actually achieved at these odds
   // (the shown odds always promise about +3%, so projecting from them would mislead).
   const longRunChance = realEdge !== null && targetPrice > 0 ? (1 + realEdge) * (stake / targetPrice) * 100 : chanceShown;
@@ -131,10 +162,10 @@ export function upgradeQuote(sel, events, opts = {}) {
     evPct: stake > 0 ? ev / stake : null,
     realEdge,
     similar: {
-      n: similar.length,
-      wins,
-      winRate: similar.length ? wins / similar.length : null,
-      winRateCI: similar.length ? wilson(wins, similar.length) : null,
+      n: cell.n,
+      wins: cell.wins,
+      winRate: cell.n ? cell.wins / cell.n : null,
+      winRateCI: cell.n ? wilson(cell.wins, cell.n) : null,
     },
     longRun: { ...longRun(stake, targetPrice, longRunChance), basis: realEdge !== null ? 'history' : 'shown' },
   };

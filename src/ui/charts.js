@@ -51,7 +51,9 @@ function compact(v) {
  * Cumulative line chart.
  * points: [{ts, v}] in order; x is the event index (equal spacing), labels show dates.
  */
-export function lineChart({ points, width, height = 170, currency = '' }) {
+/** count: how many events the points stand for (the server thins long series), default points.length. */
+export function lineChart({ points, width, height = 170, currency = '', count = null }) {
+  const nEvents = Number.isFinite(count) ? count : points.length;
   const W = Math.max(200, Math.floor(width));
   const H = height;
   const padL = 44;
@@ -82,7 +84,7 @@ export function lineChart({ points, width, height = 170, currency = '' }) {
     readout.replaceChildren(
       'Now ',
       h('span', { class: ['num', signClass(last.v)], text: fmtMoney(last.v, currency, { sign: true }) }),
-      h('span', { class: 'faint', text: `  after ${fmtNumber(points.length, 0)} events` }),
+      h('span', { class: 'faint', text: `  after ${fmtNumber(nEvents, 0)} events` }),
     );
   };
 
@@ -91,7 +93,7 @@ export function lineChart({ points, width, height = 170, currency = '' }) {
     height: H,
     viewBox: `0 0 ${W} ${H}`,
     role: 'img',
-    'aria-label': `Cumulative net over ${points.length} events, now ${fmtMoney(last.v, currency, { sign: true })}`,
+    'aria-label': `Cumulative net over ${nEvents} events, now ${fmtMoney(last.v, currency, { sign: true })}`,
   });
 
   for (const t of ticks) {

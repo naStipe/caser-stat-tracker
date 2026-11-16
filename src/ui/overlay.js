@@ -258,45 +258,37 @@ export function mountUpgradeOverlay(opts = {}) {
   }, 120);
   window.addEventListener('resize', onResize);
 
-  // ---------- events ----------
-  let events = [];
+  // ---------- history (from the stats server) ----------
+  // Three small summaries of the history: the real odds curve, the outlook model and the quote's
+  // bucket counts. They change only when events arrive; every poll below works from them locally.
   let curveRows = null;
   let olModel = null;
+  let qBase = null;
   let version = 0;
-  let loading = false;
-  let again = false;
-  async function loadEvents() {
-    if (loading) {
-      again = true;
-      return;
-    }
-    loading = true;
-    try {
-      const ev = await o.getEvents();
-      events = Array.isArray(ev) ? ev : [];
-    } catch (e) {
-      console.warn('[caser-tracker] overlay could not read events', e);
-    }
-    // The real odds curve is computed once per load, not on every poll.
-    const curve = safe(() => (typeof stats.calibrationCurve === 'function' ? stats.calibrationCurve(events) : null));
-    curveRows = Array.isArray(curve.value) ? curve.value : null;
-    // The outlook's history part is also built once per load; per render only the clock-dependent part runs.
-    const m = safe(() => (typeof stats.outlookModel === 'function' ? stats.outlookModel(events) : null));
-    olModel = m.value || null;
+  function pull() {
+    if (!o.remote) return;
+    const curve = o.remote.get('calibrationCurve');
+    const model = o.remote.get('outlookModel');
+    const base = o.remote.get('quoteBase');
+    if ('value' in curve) curveRows = Array.isArray(curve.value) ? curve.value : null;
+    if ('value' in model) olModel = model.value || null;
+    if ('value' in base) qBase = base.value || null;
     quoteCache = null;
-    loading = false;
     version += 1;
-    if (again) {
-      again = false;
-      loadEvents();
-    }
   }
-  const refresh = debounce(loadEvents, 300);
+  const unsubscribe = o.remote ? o.remote.subscribe(() => {
+    pull();
+    tick();
+  }) : () => {};
+  const refresh = debounce(() => {
+    o.remote?.invalidate();
+    pull();
+  }, 300);
 
   // ---------- render ----------
   let lastKey = null;
   let lastVersion = -1;
-  // upgradeQuote scans the whole history, so it is cached until the selection or the events change.
+  // The quote is cached until the selection or the history summaries change.
   let quoteCache = null;
 
   function tick() {
@@ -337,8 +329,8 @@ export function mountUpgradeOverlay(opts = {}) {
       quoteCache && quoteCache.key === qKey
         ? quoteCache.res
         : safe(() => {
-            if (typeof stats.upgradeQuote !== 'function') throw new Error('stats.upgradeQuote is missing');
-            return stats.upgradeQuote(input, events);
+            if (typeof stats.quoteFromBase !== 'function') throw new Error('stats.quoteFromBase is missing');
+            return stats.quoteFromBase(input, qBase);
           });
     quoteCache = { key: qKey, res };
     if (res.error || !res.value) {
@@ -418,7 +410,7 @@ export function mountUpgradeOverlay(opts = {}) {
       h('div', { class: 'line' }, h('span', { text: 'Chance to end in profit' }), h('span', { class: 'num', text: fmtPct(lr.probProfit, 0) })),
     );
 
-    const ol = safe(() => (typeof stats.upgradeOutlook === 'function' ? stats.upgradeOutlook(input, events, { now: Date.now(), model: olModel || undefined }) : null));
+    const ol = safe(() => (typeof stats.upgradeOutlook === 'function' && olModel ? stats.upgradeOutlook(input, [], { now: Date.now(), model: olModel }) : null));
     let balance = null;
     try {
       const hv = o.getHoldings ? o.getHoldings() : null;
@@ -436,12 +428,14 @@ export function mountUpgradeOverlay(opts = {}) {
   }
 
   const timer = setInterval(tick, POLL_MS);
-  loadEvents().then(tick);
+  pull();
+  tick();
 
   return {
     refresh,
     destroy() {
       clearInterval(timer);
+      unsubscribe();
       refresh.cancel();
       onResize.cancel();
       window.removeEventListener('resize', onResize);
