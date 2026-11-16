@@ -68,7 +68,7 @@ export const DEFAULTS = {
   activeMs: 30 * 60 * 1000,
   counterChecks: true, // check players who are not playing now through their counters first
   counterSlackMs: 60_000, // rows this close to a counter check are not counted as missed by it
-  knownMax: 5000, // players remembered for revisits
+  knownMax: 20000, // players remembered for revisits (players never seen playing are dropped first)
   knownKeepMs: 14 * 24 * HOUR, // forget players neither in the feed nor seen playing for this long
   maxPlayers: 30, // followed at once
   maxQueue: 40, // found players waiting for their first look (oldest dropped first)
@@ -243,7 +243,10 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     const last = (k) => Math.max(k.seen, lastPlayed(k));
     for (const [id, k] of known) if (t - last(k) > opt.knownKeepMs) known.delete(id);
     if (known.size > opt.knownMax) {
-      const oldest = [...known].sort((a, b) => last(a[1]) - last(b[1])).slice(0, known.size - opt.knownMax);
+      // Players never seen playing go first: they hold no rows, while dropping a player with rows loses the
+      // site id that links those rows to later reads (their lifetime counters, revisits).
+      const played = (k) => (k.newest.upgrade > 0 || k.newest.case > 0 ? 1 : 0);
+      const oldest = [...known].sort((a, b) => played(a[1]) - played(b[1]) || last(a[1]) - last(b[1])).slice(0, known.size - opt.knownMax);
       for (const [id] of oldest) known.delete(id);
     }
   }

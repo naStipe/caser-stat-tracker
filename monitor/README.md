@@ -163,7 +163,7 @@ One request every 8 seconds (`PULSE_GAP_MS`), about 450 an hour. Each turn does 
      them are left out, or every player would start with a big win.
    - 2 × **follow**: one of the two lists of a followed player about every 90 s, for 2 hours after they were found.
    - 1 × **revisit a player playing now**, 1 × **any revisit that is due**: every player the feed has shown is
-     remembered (up to 5,000, for 14 days after they were last seen) and checked again for new rows: every 10
+     remembered (up to 20,000, for 14 days after they were last seen; over the cap, players never seen playing go first) and checked again for new rows: every 10
      minutes while they played in the last 30 minutes (these come first), every 30 minutes if they played in the
      last 3 hours, every 2 hours within a day, every 6 hours within 3 days (`REVISIT_HOURS`), else every 24 hours
      (`REVISIT_STALE_HOURS`). When more checks are due than requests allow, the most overdue for their tier go

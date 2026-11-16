@@ -1386,3 +1386,14 @@ test('arrivalShare: share of rows earlier windows had at the same age, 24-hour r
   assert.equal(arrivalShare({ upgrade_12: { windows: 8, present: 0, final: 0 } }, 'upgrade', 10), null);
   assert.equal(arrivalShare(null, 'upgrade', 10), null);
 });
+
+test('collector: over the known cap, players never seen playing are forgotten before players with rows', async () => {
+  const k = (id, seen, upgrade) => ({ id, seen, revisited: T0, newest: { upgrade, case: 0 }, hist: { upgrade: null, case: null } });
+  const known = [k('old-player', T0 - 5 * HOUR, T0 - 5 * HOUR), k('new-idle', T0 - HOUR, 0), k('old-idle', T0 - 6 * HOUR, 0), k('new-player', T0 - HOUR, T0 - HOUR)];
+  const c = createCollector({
+    getJson: async () => { c.stop(); return {}; }, hashUser: async (id) => id, saveRows: async () => {}, saveVolume: async () => {},
+    initial: { known, profileProbed: true }, now: () => T0, sleep: async () => {}, options: { knownMax: 2 },
+  });
+  await c.start();
+  assert.deepEqual(c.exportState().known.map((x) => x.id).sort(), ['new-player', 'old-player']);
+});
