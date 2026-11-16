@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CasePrices, upgradeRows, caseRows, feedDrops, feedTier, feedItems, feedSample, volumeSample, hashUser } from '../src/parse.js';
 import { aggregate, ratioOf, compareRatios, combine, volumeRates, pulseSummary, pulseWindows, indexOf, compareIndex, HOUR } from '../dashboard/stats.js';
-import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, sharedShift, depositCheck, STEP, DEFAULT_LAG } from '../dashboard/view.js';
+import { rangeSpec, buildReport, monitorHealth, compareSpec, windowsFor, pickWindow, settledAt, againstNormal, persistence, situation, dailyPattern, sumsToSeries, sharedShift, depositCheck, STEP, DEFAULT_LAG, tailCounts } from '../dashboard/view.js';
 import { createCollector, HttpError, fieldNames } from '../src/collector.js';
 import { createSite, jwtExpiry } from '../src/site.js';
 import { createCloud } from '../src/cloud.js';
@@ -584,6 +584,7 @@ test('dashboard view: windows, comparison, heat map and tables from the report',
   assert.equal(k.best[0].start, spec.to - 3 * W, 'the best settled window; the provisional one is left out');
   assert.ok(!k.best.some((w) => w.provisional));
   assert.equal(k.worst[0].start, spec.to - 2 * HOUR);
+  assert.equal(k.tails.windows, k.windows.filter((w) => !w.provisional && w.index.n >= 10 && w.z != null).length, 'tails count the ranked windows');
   assert.ok(at(spec.to - 3 * W).smooth != null);
   assert.equal(k.money.ratio, 0.95);
   // Against normal over the 30 minutes before the settled time: 66 wins where 48 are normal, z = 3.
@@ -1207,4 +1208,14 @@ test('view: drop-line colours per window, and the thirds by cheap-colour share',
   assert.ok(same.z < 0);
   assert.equal(f.check.upgrade[1].windows, 5, 'the next window exists for all but the last');
   assert.equal(f.check.case[0].windows, 0);
+});
+
+test('tailCounts: windows beyond 2 and 3 standard errors on each side, against chance', () => {
+  const zs = [-3.4, -2.5, -2, -1.9, 0, 0.4, 2.1, 3, 3.2, ...Array(991).fill(0)];
+  const t = tailCounts(zs.map((z) => ({ z })));
+  assert.equal(t.windows, 1000);
+  assert.deepEqual(t.levels.map((l) => [l.z, l.low, l.high]), [[2, 3, 3], [3, 1, 2]]);
+  assert.ok(Math.abs(t.levels[0].expected - 22.75) < 0.05, 'one tail beyond 2: 2.28% of windows');
+  assert.ok(Math.abs(t.levels[1].expected - 1.35) < 0.01, 'one tail beyond 3: 0.135% of windows');
+  assert.deepEqual(tailCounts([]), { windows: 0, levels: [{ z: 2, low: 0, high: 0, expected: 0 }, { z: 3, low: 0, high: 0, expected: 0 }] });
 });

@@ -398,6 +398,27 @@ export function dailyPattern(week) {
   return [...days.values()].sort((a, b) => a.day - b.day).map((d) => ({ day: d.day, fresh: indexOf(d.fresh), high: indexOf(d.high) }));
 }
 
+/** How far from the range average (in standard errors) the extreme-window counts are taken. */
+export const TAIL_Z = [2, 3];
+
+/**
+ * How many settled windows sit beyond each TAIL_Z on either side of the range average, against how many pure chance
+ * gives (windows x one tail of the normal curve). Low and high both well past chance: windows just vary more than
+ * chance. Only the low side past chance: there were real dips.
+ */
+export function tailCounts(ranked) {
+  const n = ranked.length;
+  return {
+    windows: n,
+    levels: TAIL_Z.map((z) => ({
+      z,
+      low: ranked.filter((w) => w.z <= -z).length,
+      high: ranked.filter((w) => w.z >= z).length,
+      expected: n * normCdf(-z),
+    })),
+  };
+}
+
 /**
  * @param {Object} o
  * @param {any} o.report    monitor_report over the range, per window
@@ -455,6 +476,7 @@ export function buildReport({ report, cmp, week = null, predict = null, heatRepo
       money: ratioOf({ n: total.n ?? 0, players: 0, sx: total.sx ?? 0, sy: total.sy ?? 0 }),
       best: ranked.filter((w) => w.z > 0).slice(0, 5),
       worst: ranked.filter((w) => w.z < 0).reverse().slice(0, 5),
+      tails: tailCounts(ranked),
     };
 
     // The last `compareMinutes` before the settled time, against normal and against the 3 times as long before.

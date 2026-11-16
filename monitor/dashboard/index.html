@@ -374,8 +374,26 @@ function windowList(title, list, kind) {
       ? h('table', null, h('tbody', null, list.map((w) => h('tr', null,
           h('td', { text: spanLabel(w.start, w.start + view.spec.window) }),
           h('td', { class: ['num', sign(w.index.index - 1)], text: fmt2(w.index.index) }),
-          h('td', { class: 'num faint', text: `${fmtInt(w.index.n)} ${NAMES[kind][1]}` })))))
+          h('td', { class: 'num faint', text: `${fmtInt(w.index.n)} ${NAMES[kind][1]}` }),
+          h('td', { class: 'num faint', title: 'Standard errors from the range average', text: `z ${signed1(w.z)}` })))))
       : h('p', { class: 'faint', text: 'Not enough windows with 10 or more rows yet.' }));
+}
+
+const signed1 = (v) => (ok(v) ? `${v >= 0 ? '+' : '−'}${fmt(Math.abs(v), 1)}` : DASH);
+const chanceText = (v) => (v >= 10 ? fmtInt(v) : v >= 1 ? fmt(v, 1) : fmt(v, 2));
+
+/** Settled windows beyond ±2 and ±3 standard errors, against what chance alone gives. */
+function tailLine(t) {
+  if (!t?.windows) return null;
+  const side = (key, sym) => t.levels.map((l) => {
+    const past = l[key] > Math.max(2, 2 * l.expected);
+    return h('span', { class: past ? (key === 'low' ? 'neg' : 'pos') : null, text: `${l[key]} ${key === 'low' ? 'below' : 'above'} ${sym}${l.z}` });
+  });
+  const join = (parts) => parts.flatMap((p, i) => (i ? [', ', p] : [p]));
+  const chance = t.levels.map((l) => `${chanceText(l.expected)} beyond ${l.z}`).join(', ');
+  return h('p', { class: 'num', style: 'margin:10px 0 0' },
+    `Of ${fmtInt(t.windows)} settled windows with 10 or more rows: `, ...join(side('low', '−')), '; ', ...join(side('high', '+')),
+    `. Chance alone gives about ${chance} on each side.`);
 }
 
 /** Weekday x hour, colored by the index (or return) against 1, faded where the sample is small. */
@@ -905,7 +923,8 @@ function timeTab(v, width) {
           toggle(METRICS[kind], metric[kind], (x) => { metric[kind] = x; store.set(`pulse.metric.${kind}`, x); renderDashboard(); }))),
       windowChart({ v, kind, width }),
       h('div', { class: 'split' }, windowList('Best windows (above the range average)', k.best, kind), windowList('Worst windows', k.worst, kind)),
-      h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin or still arriving (the shaded part, whose rows are not all read yet). Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank settled windows by how far they sit from the average, counting their sample size.' })));
+      tailLine(k.tails),
+      h('p', { class: 'hint', text: 'Filled dots have 20 or more rows; hollow ones are thin or still arriving (the shaded part, whose rows are not all read yet). Green and red dots are clearly above or below the range average (more than 2 standard errors). The best and worst lists rank settled windows by how far they sit from the average, counting their sample size; z is that distance in standard errors. The count line says how many windows are that far out, against what chance alone gives: a count in colour is more than twice chance. Only the low side in colour means real dips; both sides in colour means windows just vary more than chance (the same busy players in a window, big stakes). With 1-hour windows over 7 days (168 windows), chance gives a z of −3 or lower about once a month.' })));
   }
 
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Site activity' })), activityChart({ v, width })));
