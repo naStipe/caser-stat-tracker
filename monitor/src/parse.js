@@ -2,7 +2,8 @@
 // A row is one paid case open or one settled upgrade:
 //   {id, kind: 'upgrade' | 'case', ts, u, stake, returned, chance, back}
 //   upgrades also: won; cases also: slug (the case), tier (the dropped item's rarity code)
-// u is a salted hash of the player's site id; no names, items or inventories are kept.
+// u is a salted hash of the player's site id; no names, items or inventories are kept. (Case watches keep the
+// names and prices of catalogue items seen on the public drop line, never who dropped them.)
 // Every field read is defensive because the API can change.
 
 import { createHash } from 'node:crypto';
@@ -227,9 +228,38 @@ export function feedItems(body) {
     const id = Number(obj(d)?.id);
     if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, tier: feedTier(d.item), up: num(d.probability) > 0, price: num(obj(d.item)?.price) });
+    const name = obj(d.item)?.marketName ?? obj(d.item)?.name;
+    out.push({ id, tier: feedTier(d.item), up: num(d.probability) > 0, price: num(obj(d.item)?.price), name: typeof name === 'string' ? name : '' });
   }
   return out.sort((a, b) => b.id - a.id);
+}
+
+/**
+ * A watched case's public page data -> {slug, ts, opens, price, items: [{name, price, chance}]}, or null.
+ * Custom cases (/api/game/custom-cases/{slug}) publish each item's chance (percent) and the case's total opens;
+ * official ones (/api/game/cases/{slug}) publish neither, so their chance and opens are null.
+ */
+export function caseSnap(body, slug, ts) {
+  const d = obj(unwrap(body));
+  if (!d) return null;
+  const c = obj(d.case) ?? d;
+  const price = num(c.price);
+  if (!(price > 0)) return null;
+  const items = [];
+  for (const raw of arr(d.items ?? c.items)) {
+    const r = obj(raw);
+    if (!r) continue;
+    const it = item(r);
+    if (!it.name) continue;
+    items.push({ name: it.name, price: it.price, chance: numOrNull(r.chancePercent ?? r.chance) });
+  }
+  const opens = numOrNull(c.totalOpens ?? c.total_opens);
+  return { slug: String(c.slug ?? slug), ts, opens: opens == null ? null : Math.round(opens), price, items };
+}
+
+/** Items of a case worth at least its price: the drops a case watch counts on the drop line. */
+export function hitItems(snap) {
+  return (snap?.items ?? []).filter((i) => i.price >= snap.price);
 }
 
 /**

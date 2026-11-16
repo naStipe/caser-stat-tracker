@@ -262,6 +262,44 @@ test('collector: a custom case gets its price from the custom-case endpoint, so 
   assert.equal(row.slug, 'case-e180f124');
 });
 
+test('case watch: the page read gives opens, price and chances; the drop line gives its big drops once each', async () => {
+  const { caseSnap, hitItems } = await import('../src/parse.js');
+  const page = { id: 'x', slug: 'case-w', title: 'T', price: '548.460', totalOpens: 24001, items: [
+    { item: { marketName: '★ Knife', price: '10144.120' }, chancePercent: '5' }, { item: { marketName: 'Negev', price: '28.990' }, chancePercent: 95 }] };
+  const snap = caseSnap(page, 'case-w', T0);
+  assert.deepEqual(snap, { slug: 'case-w', ts: T0, opens: 24001, price: 548.46, items: [{ name: '★ Knife', price: 10144.12, chance: 5 }, { name: 'Negev', price: 28.99, chance: 95 }] });
+  assert.deepEqual(hitItems(snap).map((i) => i.name), ['★ Knife']);
+  assert.equal(caseSnap({ case: { slug: 'magnum', price: '19' }, items: [] }, 'magnum', T0).opens, null, 'official cases show no opens');
+
+  const site = fakeSite();
+  site.feed = { liveDrops: [
+    { id: 7, probability: '0.0000', user: { id: '42' }, item: { marketName: '★ Knife', price: '10144.12' } },
+    { id: 6, probability: '12.5', user: { id: '43' }, item: { marketName: '★ Knife', price: '10144.12' } },
+    { id: 5, probability: '0', user: { id: '44' }, item: { marketName: 'Negev', price: '28.99' } }] };
+  const orig = site.getJson;
+  let pageReads = 0;
+  site.getJson = async (path) => {
+    if (path === '/api/game/custom-cases/case-w') { pageReads++; return page; }
+    return orig(path);
+  };
+  let t = T0;
+  const snaps = [], hits = [];
+  let budget = 30;
+  const c = createCollector({
+    getJson: async (p) => { if (--budget === 0) c.stop(); return site.getJson(p); },
+    hashUser: async (id) => `h${id}`, saveRows: async () => {}, saveVolume: async () => {},
+    loadWatch: async () => ['case-w', 'bad slug!'],
+    saveCaseSnap: async (x) => snaps.push(x), saveCaseHits: async (l) => hits.push(...l),
+    now: () => t, sleep: async (ms) => { t += ms; }, options: { gapMs: 1000, feedEveryMs: 5000, feedMaxMs: 5000 },
+  });
+  await c.start();
+  assert.ok(pageReads >= 1 && snaps.length === pageReads, 'the watched page is read and kept');
+  assert.equal(snaps[0].opens, 24001);
+  assert.ok(hits.length >= 1, 'the knife from a case shows as a hit');
+  assert.ok(hits.every((h) => h.slug === 'case-w' && h.dropId === 7), 'not the upgrade (it has a chance), not the cheap item');
+  assert.equal(c.status().watchedCases, 1, 'a slug that is not one is left out');
+});
+
 test('collector: 429 pauses, 401 stops', async () => {
   const site = fakeSite();
   const { c } = harness(site);

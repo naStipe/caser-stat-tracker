@@ -111,6 +111,8 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
   state.pendingRows ||= [];
   state.pendingVolume ||= [];
   state.pendingFeed ||= [];
+  state.pendingSnaps ||= [];
+  state.pendingHits ||= [];
   state.pendingEvents ||= [];
 
   let saving = Promise.resolve();
@@ -157,6 +159,15 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
       state.pendingFeed.push(f);
       if (state.pendingFeed.length > MAX_PENDING_VOLUME) state.pendingFeed = state.pendingFeed.slice(-MAX_PENDING_VOLUME);
     },
+    loadWatch: () => cloud.watchList(),
+    saveCaseSnap: async (x) => {
+      state.pendingSnaps.push(x);
+      if (state.pendingSnaps.length > MAX_PENDING_VOLUME) state.pendingSnaps = state.pendingSnaps.slice(-MAX_PENDING_VOLUME);
+    },
+    saveCaseHits: async (list) => {
+      state.pendingHits.push(...list);
+      if (state.pendingHits.length > MAX_PENDING_VOLUME) state.pendingHits = state.pendingHits.slice(-MAX_PENDING_VOLUME);
+    },
     onEvent: (e) => report(e.level, e.code, e.message, { force: e.code === 'login' || e.code === 'blocked' }),
     initial: state.collector ?? {},
     now,
@@ -195,13 +206,17 @@ export async function createMonitor({ env, fetch: fetchFn, version, log = consol
     const rows = state.pendingRows.slice();
     const volume = state.pendingVolume.slice();
     const feed = state.pendingFeed.slice();
+    const snaps = state.pendingSnaps.slice();
+    const hits = state.pendingHits.slice();
     const events = state.pendingEvents.slice();
     try {
-      if (rows.length || volume.length || feed.length) await cloud.push(rows, volume, feed);
+      if (rows.length || volume.length || feed.length || snaps.length || hits.length) await cloud.push(rows, volume, feed, snaps, hits);
       pushed += rows.length;
       state.pendingRows = state.pendingRows.slice(rows.length);
       state.pendingVolume = state.pendingVolume.slice(volume.length);
       state.pendingFeed = state.pendingFeed.slice(feed.length);
+      state.pendingSnaps = state.pendingSnaps.slice(snaps.length);
+      state.pendingHits = state.pendingHits.slice(hits.length);
       if (events.length) await cloud.events(events);
       state.pendingEvents = state.pendingEvents.slice(events.length);
       if (now() - lastPrune >= PRUNE_EVERY_MS) {

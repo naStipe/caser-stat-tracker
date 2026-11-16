@@ -16,7 +16,7 @@ export function createCloud({ fetch, url, key }) {
   // Legacy keys are JWTs and also go in Authorization; new secret keys only in apikey.
   if (key.startsWith('eyJ')) headers.authorization = `Bearer ${key}`;
 
-  async function call(method, path, body, prefer) {
+  async function call(method, path, body, prefer, json = false) {
     const res = await fetch(base + path, { method, headers: { ...headers, ...(prefer ? { prefer } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -26,6 +26,7 @@ export function createCloud({ fetch, url, key }) {
       } catch {}
       throw new Error(`Supabase answered ${res.status} for ${method} ${path.split('?')[0]}${msg ? `: ${msg}` : ''}`);
     }
+    return json ? res.json() : undefined;
   }
 
   async function insert(table, conflict, list, resolution) {
@@ -39,7 +40,7 @@ export function createCloud({ fetch, url, key }) {
      * Adds rows, volume samples and drop-line colour counts. A row read again replaces the stored one (that
      * fills in columns older versions did not send); a volume sample or feed count already there is left as it is.
      */
-    async push(rows, volume, feed = []) {
+    async push(rows, volume, feed = [], snaps = [], hits = []) {
       if (rows.length) {
         // One request must not hold the same id twice (Postgres refuses to update a row twice).
         const byId = new Map(rows.map((r) => [r.id, r]));
@@ -74,6 +75,23 @@ export function createCloud({ fetch, url, key }) {
           up: f.up, value: f.value,
         })), 'ignore-duplicates');
       }
+      if (snaps.length) {
+        const byKey = new Map(snaps.map((x) => [`${x.slug}/${Math.round(x.ts)}`, x]));
+        await insert('monitor_case_snap', 'slug,ts', [...byKey.values()].map((x) => ({
+          slug: x.slug, ts: Math.round(x.ts), opens: x.opens ?? null, price: x.price, items: x.items,
+        })), 'ignore-duplicates');
+      }
+      if (hits.length) {
+        const byKey = new Map(hits.map((x) => [`${x.slug}/${x.dropId}`, x]));
+        await insert('monitor_case_hits', 'slug,drop_id', [...byKey.values()].map((x) => ({
+          slug: x.slug, drop_id: x.dropId, ts: Math.round(x.ts), item: String(x.item).slice(0, 200), price: x.price,
+        })), 'ignore-duplicates');
+      }
+    },
+    /** Slugs of the cases watched from the dashboard. */
+    async watchList() {
+      const list = await call('GET', '/rest/v1/monitor_case_watch?select=slug', undefined, undefined, true);
+      return Array.isArray(list) ? list.map((r) => r.slug) : [];
     },
     /** Adds events to the log the dashboard shows: [{level, code, message, at?}]. */
     async events(list) {

@@ -37,7 +37,7 @@
 // Page size: the site's own pages ask for 50 rows. The collector asks for `tryPageSize` (100) once and
 // keeps it if the site sends more than 50 rows, or falls back to 50.
 
-import { CasePrices, upgradeRows, caseRows, feedDrops, feedItems, feedSample, volumeSample } from './parse.js';
+import { CasePrices, upgradeRows, caseRows, feedDrops, feedItems, feedSample, volumeSample, caseSnap, hitItems } from './parse.js';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -48,6 +48,7 @@ export const DEFAULTS = {
   feedBusy: 2, // a read that adds this many players to the look queue sets the shortest interval
   statsEveryMs: 60_000,
   casesEveryMs: 6 * HOUR,
+  watchEveryMs: 5 * 60 * 1000, // watched cases: their page (opens and chances) read this often
   profileEveryMs: 90 * 1000, // one list per turn, so each list about every 3 min
   watchMs: 2 * HOUR, // follow time after a player is found
   idleDropMs: 40 * 60 * 1000, // stop following a player with no new rows for this long
@@ -128,9 +129,12 @@ function importKnown(k, t, opt) {
  * @param {() => void} [o.onChange]  status changed
  * @param {(e: {level: 'info'|'warn'|'error', code: string, message: string}) => void} [o.onEvent]
  * @param {{known?: any[], pageSize?: number, pageProbe?: string}} [o.initial]  from exportState() of an earlier run
+ * @param {() => Promise<string[]>} [o.loadWatch]  slugs of the watched cases (the dashboard's case watch)
+ * @param {(snap: any) => Promise<void>} [o.saveCaseSnap]  a watched case's page: total opens, price, items and chances
+ * @param {(hits: any[]) => Promise<void>} [o.saveCaseHits]  drop-line drops of a watched case's items worth its price
  * @param {Partial<typeof DEFAULTS>} [o.options]
  */
-export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveFeed = async () => {}, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
+export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveFeed = async () => {}, loadWatch = async () => [], saveCaseSnap = async () => {}, saveCaseHits = async () => {}, now = Date.now, sleep, onChange, onEvent, initial = {}, options = {} }) {
   const opt = { ...DEFAULTS, ...options };
   const prices = new CasePrices();
   const players = new Map(); // followed: site id -> {u, added, lastPolled, lastRow, seen: {upgrade, case}, nextStream}
@@ -168,6 +172,11 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
   let lastFeedAt = null;
   let lastStats = -Infinity;
   let lastCases = -Infinity;
+  // Case watch: slugs to read this round, and item name -> slugs of watched cases where it is worth the price.
+  let lastWatch = -Infinity;
+  let watched = [];
+  const watchQueue = [];
+  const watchHits = new Map(); // slug -> Set of item names
   let pausedUntil = 0;
   let backoff = opt.backoffMs;
   let error = null;
@@ -261,6 +270,14 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
       lastFeedId = items[0].id; // also when the numbers went backwards: counting starts over from here
       lastFeedAt = lastFeed;
     }
+    // Drops of a watched case's valuable items (case drops only: an upgrade has a chance). The drop number keeps
+    // a drop seen in two reads from counting twice.
+    const hits = [];
+    for (const d of items) {
+      if (d.up || !d.name) continue;
+      for (const [slug, names] of watchHits) if (names.has(d.name)) hits.push({ slug, dropId: d.id, ts: lastFeed, item: d.name, price: d.price });
+    }
+    if (hits.length) await saveCaseHits(hits);
     for (const [id, skip] of feedDrops(body)) {
       remember(id);
       if (players.has(id) || backfilled.has(id)) continue;
@@ -276,6 +293,39 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     // Requests go to the feed while it brings players, and to their histories while it does not.
     if (added >= opt.feedBusy) feedGap = opt.feedEveryMs;
     else if (!added) feedGap = Math.min(Math.round(feedGap * 1.5), Math.max(opt.feedMaxMs, opt.feedEveryMs));
+  }
+
+  /** Starts a round of the case watch: the watched list comes from the database, no site request. */
+  async function startWatchRound() {
+    lastWatch = now();
+    try {
+      watched = [...new Set((await loadWatch()).map(String).filter((x) => /^[A-Za-z0-9_-]{1,200}$/.test(x)))];
+    } catch (e) {
+      event('warn', 'case-watch', `Could not load the watched cases: ${e.message}`);
+    }
+    for (const slug of watchHits.keys()) if (!watched.includes(slug)) watchHits.delete(slug);
+    watchQueue.length = 0;
+    watchQueue.push(...watched);
+  }
+
+  /** Reads one watched case's page, as the site's case page does: custom first (it has chances), official on 404. */
+  async function readWatched(slug) {
+    const enc = encodeURIComponent(slug);
+    for (const path of [`/api/game/custom-cases/${enc}`, `/api/game/cases/${enc}`]) {
+      let body;
+      try {
+        body = await get(path);
+      } catch (e) {
+        if (isHttp(e, 404)) continue;
+        throw e;
+      }
+      const snap = caseSnap(body, slug, now());
+      if (!snap) return;
+      prices.add({ slug, price: snap.price });
+      watchHits.set(slug, new Set(hitItems(snap).map((i) => i.name)));
+      await saveCaseSnap(snap);
+      return;
+    }
   }
 
   async function readStats() {
@@ -557,6 +607,8 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
     if (t - lastCases >= opt.casesEveryMs) return readCases();
     if (t - lastFeed >= feedGap) return readFeed();
     if (t - lastStats >= opt.statsEveryMs) return readStats();
+    if (t - lastWatch >= opt.watchEveryMs) await startWatchRound();
+    if (watchQueue.length) return readWatched(watchQueue.shift());
     if (!profileProbed && known.size) return probeProfile();
     const n = opt.turns.length;
     const start = turn++ % n;
@@ -650,6 +702,7 @@ export function createCollector({ getJson, hashUser, saveRows, saveVolume, saveF
         historyPages: [...known.values()].reduce((s, k) => s + STREAMS.filter((st) => k.hist[st]).length, 0),
         recentPlayers: backfilled.size, // players first looked at in the last watchMs
         feedEveryMs: feedGap, // current feed interval
+        watchedCases: watched.length,
         counterChecks: !countersOff,
         counterMisses, // counter checks that said "no new play" when the list later showed some
         requestsLastHour: requests.length,

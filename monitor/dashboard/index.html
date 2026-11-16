@@ -135,7 +135,7 @@
 <script type="module">
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './config.js';
-import { CASE_RANGES, caseSlugFrom, caseSpec, caseReport } from './case.js';
+import { CASE_RANGES, caseSlugFrom, caseSpec, caseReport, watchReport } from './case.js';
 import { RANGES, KINDS, windowsFor, pickWindow, rangeSpec, compareSpec, buildReport, monitorHealth, CHANCE_GROUPS, BANDS, PHASES, situation, PREDICT_WINDOWS, SHARED_WINDOWS, SHARED_DAYS, sharedShift, depositCheck, DEPOSIT_MIN_SEEN, FEED_TIERS, FEED_MIN_SEEN, WINDOWS, feedReport, arrivalShare, ARRIVAL_MIN_WINDOWS } from './view.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
@@ -992,8 +992,9 @@ async function loadCase() {
   renderDashboard();
   let next;
   try {
-    const data = await rpc('monitor_case', { case_slug: slug, from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket });
-    next = { key, slug, spec, report: caseReport(data, spec) };
+    const args = { case_slug: slug, from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.bucket };
+    const [data, w] = await Promise.all([rpc('monitor_case', args), rpc('monitor_case_watch_report', args).catch((e) => ({ error: e.message || String(e) }))]);
+    next = { key, slug, spec, report: caseReport(data, spec), watch: w?.error ? null : watchReport(w, spec), watchError: w?.error ?? null };
   } catch (e) {
     next = { key, slug, error: e.message || String(e) };
   }
@@ -1005,10 +1006,70 @@ async function loadCase() {
 
 const fmtAmount = (v) => (ok(v) ? (Math.abs(v) >= 100 ? fmtInt(v) : fmt(v, 2)) : DASH);
 
+let caseWatchBusy = false;
+async function setCaseWatch(slug, on) {
+  caseWatchBusy = true;
+  renderDashboard();
+  try {
+    await rpc('monitor_case_watch_set', { case_slug: slug, watch: on });
+  } catch (e) {
+    caseState = { ...caseState, watchError: e.message || String(e) };
+  }
+  caseWatchBusy = false;
+  await loadCase();
+}
+
+/** The case's published odds, the watch switch, and (once watched) its real results from the site's counters. */
+function caseWatchBlock(st, width) {
+  const w = st.watch;
+  const out = [];
+  if (st.watchError) out.push(h('p', { class: 'error', text: `Case watch: ${st.watchError}` }));
+  if (!w) return out;
+  const o = w.odds;
+  const since = w.since ? new Date(w.since).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+  const toggleBtn = h('button', { type: 'button', class: w.watched ? '' : 'primary', disabled: caseWatchBusy, text: w.watched ? 'Stop watching' : 'Watch this case', onclick: () => setCaseWatch(st.slug, !w.watched) });
+  out.push(h('div', { class: 'row', style: 'gap:10px;margin:14px 0 8px;flex-wrap:wrap' }, toggleBtn,
+    h('span', { class: 'muted small-text', text: w.watched
+      ? `Watched since ${since}. Its page is read every 5 minutes (total opens, price, chances) and its big drops are counted on the drop line.${w.latest ? '' : ' First read within 5 minutes.'}`
+      : `Watching reads the case page every 5 minutes and counts its big drops on the drop line, so its real return comes from every open of the case, not only the players the monitor follows.${w.watchCount ? ` ${w.watchCount} of 20 watch slots in use.` : ''}` })));
+  if (o) {
+    const rows = o.items.map((i) => h('tr', null, h('td', { text: i.name }), h('td', { class: 'num', text: fmtAmount(i.price) }), h('td', { class: 'num', text: ok(i.chance) ? `${fmt(i.chance, i.chance < 1 ? 3 : 2)}%` : DASH }),
+      h('td', { class: 'num faint', text: i.price >= o.price ? 'big drop' : '' })));
+    out.push(h('h3', { class: 'muted small-text', style: 'margin:12px 0 4px;font-weight:600', text: `Published odds${w.latest?.ts ? `, read ${fmtAgo(Number(w.latest.ts))}` : ''}` }),
+      tableOf(['Item', 'Price', 'Chance', ''], rows),
+      h('p', { class: 'muted', style: 'margin:6px 0 0' }, o.known
+        ? `By these chances an open of ${fmtAmount(o.price)} pays back ${fmtAmount(o.ev)} on average: return per 1 `
+        : 'The site does not publish chances for this case, so it has no promised return.',
+        o.known ? h('span', { class: ['num', sign(o.ret - 1)], text: fmt3(o.ret) }) : null,
+        o.known ? `, so the site keeps ${pct(1 - o.ret)}${ok(o.chanceSum) && Math.abs(o.chanceSum - 100) > 0.01 ? ` (the chances add up to ${fmt(o.chanceSum, 2)}%, not 100%)` : ''}.` : null,
+        ok(w.latest?.opens) ? ` Opened ${fmtInt(w.latest.opens)} times in all.` : ''));
+  }
+  if (w.watched && w.opens > 0 && o?.known) {
+    const take = w.siteTake;
+    out.push(h('h3', { class: 'muted small-text', style: 'margin:16px 0 4px;font-weight:600', text: `Real results while watched, last ${st.spec.label}` }),
+      h('div', { class: 'kpis' },
+        kpi('Real return per 1', fmt3(w.real), w.realCi ? `range ${fmt3(w.realCi[0])}–${fmt3(w.realCi[1])}, published ${fmt3(o.ret)}` : null,
+          w.realCi ? (w.realCi[0] > o.ret ? 'pos' : w.realCi[1] < o.ret ? 'neg' : '') : null),
+        kpi('Big drops', fmt(w.hitsAdj, w.hitsAdj < 100 ? 1 : 0), `${fmtInt(w.hits)} seen; ${fmt(w.expected, 1)} expected`),
+        kpi('Big-drop rate', w.rate != null ? pct(w.rate, 2) : DASH, w.rateCi ? `range ${pct(w.rateCi[0], 2)}–${pct(w.rateCi[1], 2)}, published ${pct(o.hitChance, 2)}` : null),
+        kpi('Opens counted', fmtInt(w.opens), `${pct(w.coverage, 0)} of the drop line caught`),
+        kpi('Site kept', fmtAmount(take), `of ${fmtAmount(w.opens * o.price)} paid`)),
+      caseChart({
+        r: { slug: st.slug, chartFrom: w.windows[0]?.start ?? st.spec.from, windows: w.windows.map((x) => ({ ...x, n: x.opens, ratio: x.ret, cumRatio: x.cumRet, cumN: x.cumOpens })) },
+        spec: st.spec, width, ref: o.ret,
+        detail: (x) => ` in this window (${fmtInt(x.opens)} opens, ${fmtInt(x.hits)} big drops seen, ${pct(x.coverage, 0)} of the line caught). Running: `,
+      }),
+      h('p', { class: 'hint', text: `Opens come from the case's own counter, read every 5 minutes, so they are exact. Big drops (items worth at least the case price) come from the public drop line, which shows big wins: the monitor reads it every 30 to 90 seconds and keeps each drop once by its number; at busy times a read misses some, so each window's count is divided by the share of the line caught then. A drop that is not big is valued at the published average of the cheaper items. The range comes from the number of big drops seen (Poisson), so it narrows as they add up. Limits: the drop line does not say which case a drop came from, so the same item won from another case or a battle counts too (it can only push the rate up), and opens and drops are matched by window, not to the second.` }));
+  } else if (w.watched && w.latest && o?.known) {
+    out.push(h('p', { class: 'faint', text: `No opens counted in the last ${st.spec.label} yet: the first window starts after the second page read, about 5 minutes after watching begins.` }));
+  }
+  return out;
+}
+
 /** Running return per 1 of one case, window by window, with each window's own return and its opens below. */
-function caseChart({ r, spec, width }) {
+function caseChart({ r, spec, width, ref = null, detail = null }) {
   const ws = r.windows;
-  const vals = [1];
+  const vals = [1, ...(ok(ref) ? [ref] : [])];
   for (const w of ws) for (const q of [w.cumRatio, w.ratio]) if (ok(q)) vals.push(Math.min(3, q));
   const { lo, hi, ticks } = niceTicks(Math.max(0, Math.min(0.5, ...vals) - 0.05), Math.max(1.5, ...vals) + 0.05, 4);
   const t0 = r.chartFrom, t1 = spec.to;
@@ -1024,6 +1085,10 @@ function caseChart({ r, spec, width }) {
     svg.append(s('rect', { x: x(w.start) + (x(w.end) - x(w.start) - bw) / 2, y: f.stripTop + (f.strip - 8 - bh), width: bw, height: bh, fill: COLORS.bar }));
     if (ok(w.ratio)) svg.append(s('circle', { cx: x(w.start + spec.bucket / 2), cy: y(Math.min(hi, w.ratio)), r: 2.5, fill: w.ratio >= 1 ? COLORS.pos : COLORS.neg, 'fill-opacity': 0.55 }));
   }
+  if (ok(ref)) {
+    const yr = Math.round(y(ref)) + 0.5;
+    svg.append(s('line', { x1: f.padL, x2: f.W - f.padR, y1: yr, y2: yr, stroke: COLORS.warn, 'stroke-width': 1.25, 'stroke-dasharray': '2 3' }));
+  }
   const pts = ws.filter((w) => ok(w.cumRatio));
   if (pts.length > 1) svg.append(s('path', { d: pts.map((w, i) => `${i ? 'L' : 'M'}${x(w.end).toFixed(1)},${y(w.cumRatio).toFixed(1)}`).join(''), fill: 'none', stroke: COLORS.line, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
   if (pts.length) { const w = pts.at(-1); svg.append(s('circle', { cx: x(w.end), cy: y(w.cumRatio), r: 3.5, fill: COLORS.line })); }
@@ -1033,13 +1098,14 @@ function caseChart({ r, spec, width }) {
   idle();
   hover(f, marks, ({ w }) => readout.replaceChildren(`${spanLabel(w.start, w.end)}: `,
     h('span', { class: ['num', sign(w.ratio - 1)], text: fmt3(w.ratio) }),
-    h('span', { class: 'faint', text: ` in this window (${fmtInt(w.n)} opens, ${fmtInt(w.players)} players). Running: ` }),
+    h('span', { class: 'faint', text: detail ? detail(w) : ` in this window (${fmtInt(w.n)} opens, ${fmtInt(w.players)} players). Running: ` }),
     h('span', { class: ['num', sign(w.cumRatio - 1)], text: fmt3(w.cumRatio) }),
     h('span', { class: 'faint', text: ` over ${fmtInt(w.cumN)} opens.` })), idle);
   const legend = h('div', { class: 'legend' },
     h('span', null, h('i', { style: `background:${COLORS.line}` }), 'return per 1 so far'),
     h('span', null, h('i', { class: 'dot', style: `background:${COLORS.pos};opacity:.55` }), h('i', { class: 'dot', style: `background:${COLORS.neg};opacity:.55;margin-left:-2px` }), 'each window'),
     h('span', null, h('i', { style: `background:${COLORS.diag}` }), '1 = players get back what they pay'),
+    ok(ref) ? h('span', null, h('i', { style: `background:${COLORS.warn}` }), `published return (${fmt3(ref)})`) : null,
     h('span', null, h('i', { style: `background:${COLORS.bar};height:8px` }), 'opens'));
   return h('div', { class: 'chart' }, legend, readout, svg);
 }
@@ -1066,8 +1132,12 @@ function caseSection(v) {
   if (caseLoadingKey) body.push(h('p', { class: 'faint', text: 'Loading…' }));
   if (st?.error) body.push(h('p', { class: 'error', role: 'alert', text: st.slug ? `Could not load ${st.slug}: ${st.error}` : st.error }));
   const r = st?.report;
+  if (st && !st.error) body.push(...caseWatchBlock(st, width));
+  if (r) body.push(h('h3', { class: 'muted small-text', style: 'margin:18px 0 4px;font-weight:600', text: `From the players the monitor follows, last ${st.spec.label}` }));
+  const near = st?.watch?.nearOpens ?? 0;
+  const nearText = near ? ` ${fmtInt(near)} more opens of it were stored but left out, because they came right around the moment their player was found on the drop line.` : '';
   if (r && !r.n) {
-    body.push(h('p', { class: 'muted', text: `No opens of “${r.slug}” in the last ${st.spec.label}${r.last ? ` (last seen ${spanLabel(r.last, r.last + 30 * 60000)})` : ''}.` }));
+    body.push(h('p', { class: 'muted', text: `No counted opens of “${r.slug}” in the last ${st.spec.label}${r.last ? ` (last seen ${spanLabel(r.last, r.last + 30 * 60000)})` : ''}.${nearText}` }));
     if (r.matches.length) body.push(h('p', { class: 'muted' }, 'Did you mean: ', ...r.matches.flatMap((m, i) => [i ? ', ' : '', h('button', { type: 'button', class: 'linkish', text: m, onclick: () => lookupCase(m) })]), '?'));
   } else if (r) {
     const m = r.money;
@@ -1078,9 +1148,10 @@ function caseSection(v) {
       kpi('Hit rate', pct(r.hitRate), `${fmtInt(r.hits)} drops worth the price or more`),
       kpi('Price', fmtAmount(r.price), r.first ? `data since ${new Date(r.first).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : null)),
       caseChart({ r, spec: st.spec, width }));
+    if (nearText) body.push(h('p', { class: 'faint small-text', text: nearText.trim() }));
   }
   return h('section', null, head, form, ...body,
-    h('p', { class: 'hint', text: 'Paste a case page link (or just the part after /cases/) and press Show. Return per 1: what players got back for each 1 they paid for this case, from every open the monitor saw; above 1 means players came out ahead. The range is clustered by player, so one lucky player counts as one sample, not as many opens: with few players it is wide, and a single big drop can move the return a lot. Site keeps: the share of what was paid that players did not get back. The line is the return so far from the start of the range; dots are each window on its own. Click a case in the table below to look it up. Opens next to the moment a player was found (right after a big win) are left out, as everywhere on this page. Custom cases (made by players) were not kept before 16 November 2026.' }));
+    h('p', { class: 'hint', text: 'Paste a case page link (or just the part after /cases/) and press Show. Followed players: the monitor follows at most 30 players at a time, found on the drop line, so this part is a sample. Return per 1: what players got back for each 1 they paid for this case, from every open the monitor saw; above 1 means players came out ahead. The range is clustered by player, so one lucky player counts as one sample, not as many opens: with few players it is wide, and a single big drop can move the return a lot. Site keeps: the share of what was paid that players did not get back. The line is the return so far from the start of the range; dots are each window on its own. Click a case in the table below to look it up. Opens next to the moment a player was found (right after a big win) are left out, as everywhere on this page. Custom cases (made by players) were not kept before 16 November 2026.' }));
 }
 
 function tablesTab(v) {
