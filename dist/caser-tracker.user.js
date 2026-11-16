@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.13.1
+// @version      0.13.2
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Data stays in your browser (shared between both domains); optional cloud sync between browsers; only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -3319,6 +3319,8 @@ td .second { display: block; color: var(--muted); font-size: 11px; margin-top: 1
 .badge.good { color: var(--pos); border-color: #234635; background: #121d17; }
 .badge.warn { color: var(--warn); border-color: #4d3d22; background: #1d1912; }
 .badge.faint { color: var(--faint); background: transparent; }
+.badge.soft-bad { color: var(--neg); }
+.badge.soft-good { color: var(--pos); }
 .badge.bad-strong { color: #160b0b; border-color: var(--neg); background: var(--neg); }
 .badge.good-strong { color: #08160f; border-color: var(--pos); background: var(--pos); }
 .verdict { display: flex; align-items: baseline; gap: 10px; color: var(--muted); font-size: 12px; }
@@ -4650,19 +4652,39 @@ option { background: var(--surface); color: var(--text); }
   var runChance = (len, p) => len > 0 ? fmtPct(p, 0) : DASH;
   function verdictOf(x) {
     if (!(x.oddsN >= 10) || !ok4(x.p) || !ok4(x.z)) {
-      return { label: "Too few", tone: "faint", text: "Fewer than 10 normal upgrades: too few to judge." };
+      return { label: "Too few", tone: "faint", text: "Fewer than 10 normal upgrades: too few to judge.", rarity: null };
     }
     const down = x.z < 0;
+    const tail = x.p / 2;
+    const rarity = tail < 0.25 ? `About 1 in ${oneIn(tail)} fair sessions this size end this ${down ? "badly or worse" : "well or better"}.` : null;
+    const pick = (bad, good) => ({ ...down ? bad : good, rarity });
     if (x.significant) {
-      return down ? { label: "Beyond bad luck", tone: "bad-strong", text: "Far more losses than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this bad." } : { label: "Beyond good luck", tone: "good-strong", text: "Far more wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this good." };
+      return pick(
+        { label: "Beyond bad luck", tone: "bad-strong", text: "Far fewer wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this bad." },
+        { label: "Beyond good luck", tone: "good-strong", text: "Far more wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this good." }
+      );
     }
     if (x.p < 0.05) {
-      return down ? { label: "Unlucky", tone: "warn", text: "Unusually unlucky, but still within luck: with this many sessions, a few this bad are expected." } : { label: "Lucky", tone: "good", text: "Unusually lucky, but still within luck: with this many sessions, a few this good are expected." };
+      return pick(
+        { label: "Unlucky", tone: "bad", text: "Unusually unlucky, but still within luck: with this many sessions, a few this bad are expected." },
+        { label: "Lucky", tone: "good", text: "Unusually lucky, but still within luck: with this many sessions, a few this good are expected." }
+      );
     }
-    return { label: "Normal", tone: "", text: "A normal session: the gap to the shown odds is ordinary luck." };
+    if (tail < 0.25) {
+      return pick(
+        { label: "Below average", tone: "soft-bad", text: "Fewer wins than expected, but an ordinary amount of bad luck." },
+        { label: "Above average", tone: "soft-good", text: "More wins than expected, but an ordinary amount of good luck." }
+      );
+    }
+    return { label: "Normal", tone: "", text: "About as many wins as the shown odds expect.", rarity: null };
+  }
+  function oneIn(tail) {
+    const n = 1 / tail;
+    if (n >= 1e6) return "more than a million";
+    return fmtInt(n >= 100 ? Math.round(n / 10) * 10 : Math.round(n));
   }
   function verdictBadge(v) {
-    return h("span", { class: ["badge", v.tone], text: v.label, "data-tip": v.text });
+    return h("span", { class: ["badge", v.tone], text: v.label, "data-tip": [v.text, v.rarity].filter(Boolean).join(" ") });
   }
   function viewSessions(ctx2) {
     const { state, memo, call, cur, render, errorBox, emptyState, table, th, kpi, sectionHead, more, callout, edgeEditor } = ctx2;
@@ -4699,7 +4721,7 @@ option { background: var(--surface); color: var(--text); }
         null,
         sectionHead(
           "Sessions",
-          "Newest first. Normal: ordinary luck. Lucky / Unlucky: unusual for one session, but a few are expected over many sessions. Beyond good / bad luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level."
+          "Newest first. Normal: about as many wins as expected. Below / above average: off by an ordinary amount of luck (rarer than 1 in 4). Unlucky / Lucky: rarer than 1 in 40, but a few are expected over many sessions. Beyond bad / good luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level."
         ),
         h("div", { class: "list" }, shown.map(sessionRow)),
         sessions2.length > shown.length ? h(
@@ -4810,7 +4832,7 @@ option { background: var(--surface); color: var(--text); }
           kpi("Longest losing run", fmtInt(x.longestLosses), x.longestLosses > 0 ? `chance ${fmtPct(x.longestP, 0)}` : null),
           kpi("Deposits", fmtInt(x.deposits), x.deposits ? fmtMoney(x.deposited, "") : x.cases ? `${fmtInt(x.cases)} case opens` : null)
         ),
-        h("div", { class: ["verdict", v.tone] }, verdictBadge(v), h("span", { text: v.text, "data-tip": x.oddsN ? `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` : null })),
+        h("div", { class: ["verdict", v.tone] }, verdictBadge(v), h("span", { text: [v.text, v.rarity].filter(Boolean).join(" "), "data-tip": x.oddsN ? `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` : null })),
         (x.byChance || []).length ? table(
           [th("Chance"), th("Upgrades"), th("Won"), th("Expected", "Sum of the shown chances"), th("Rate"), th("Shown")],
           x.byChance.map(
@@ -7337,7 +7359,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.13.1" : "dev";
+  var VERSION = true ? "0.13.2" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");

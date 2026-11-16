@@ -12,29 +12,49 @@ const runChance = (len, p) => (len > 0 ? fmtPct(p, 0) : DASH);
 
 /**
  * How one session compares with the shown odds, from weakest to strongest finding:
- * too few to judge, normal, unusually lucky/unlucky (p < 0.05 for this session alone),
+ * too few to judge, normal, below/above average (a fair session this size does this badly / well
+ * or worse less than 1 time in 4), unlucky/lucky (p < 0.05 for this session alone),
  * beyond luck (still significant after Holm correction across all sessions).
+ * x.p is two-sided, so the one-sided tail is p / 2.
  */
 function verdictOf(x) {
   if (!(x.oddsN >= 10) || !ok(x.p) || !ok(x.z)) {
-    return { label: 'Too few', tone: 'faint', text: 'Fewer than 10 normal upgrades: too few to judge.' };
+    return { label: 'Too few', tone: 'faint', text: 'Fewer than 10 normal upgrades: too few to judge.', rarity: null };
   }
   const down = x.z < 0;
+  const tail = x.p / 2;
+  const rarity = tail < 0.25 ? `About 1 in ${oneIn(tail)} fair sessions this size end this ${down ? 'badly or worse' : 'well or better'}.` : null;
+  const pick = (bad, good) => ({ ...(down ? bad : good), rarity });
   if (x.significant) {
-    return down
-      ? { label: 'Beyond bad luck', tone: 'bad-strong', text: 'Far more losses than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this bad.' }
-      : { label: 'Beyond good luck', tone: 'good-strong', text: 'Far more wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this good.' };
+    return pick(
+      { label: 'Beyond bad luck', tone: 'bad-strong', text: 'Far fewer wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this bad.' },
+      { label: 'Beyond good luck', tone: 'good-strong', text: 'Far more wins than the shown odds allow. Even across all your sessions, luck alone rarely produces a session this good.' },
+    );
   }
   if (x.p < 0.05) {
-    return down
-      ? { label: 'Unlucky', tone: 'warn', text: 'Unusually unlucky, but still within luck: with this many sessions, a few this bad are expected.' }
-      : { label: 'Lucky', tone: 'good', text: 'Unusually lucky, but still within luck: with this many sessions, a few this good are expected.' };
+    return pick(
+      { label: 'Unlucky', tone: 'bad', text: 'Unusually unlucky, but still within luck: with this many sessions, a few this bad are expected.' },
+      { label: 'Lucky', tone: 'good', text: 'Unusually lucky, but still within luck: with this many sessions, a few this good are expected.' },
+    );
   }
-  return { label: 'Normal', tone: '', text: 'A normal session: the gap to the shown odds is ordinary luck.' };
+  if (tail < 0.25) {
+    return pick(
+      { label: 'Below average', tone: 'soft-bad', text: 'Fewer wins than expected, but an ordinary amount of bad luck.' },
+      { label: 'Above average', tone: 'soft-good', text: 'More wins than expected, but an ordinary amount of good luck.' },
+    );
+  }
+  return { label: 'Normal', tone: '', text: 'About as many wins as the shown odds expect.', rarity: null };
+}
+
+/** "14" for a tail chance of 0.07; very small chances are capped. */
+function oneIn(tail) {
+  const n = 1 / tail;
+  if (n >= 1e6) return 'more than a million';
+  return fmtInt(n >= 100 ? Math.round(n / 10) * 10 : Math.round(n));
 }
 
 function verdictBadge(v) {
-  return h('span', { class: ['badge', v.tone], text: v.label, 'data-tip': v.text });
+  return h('span', { class: ['badge', v.tone], text: v.label, 'data-tip': [v.text, v.rarity].filter(Boolean).join(' ') });
 }
 
 export function viewSessions(ctx) {
@@ -74,7 +94,7 @@ export function viewSessions(ctx) {
       null,
       sectionHead(
         'Sessions',
-        'Newest first. Normal: ordinary luck. Lucky / Unlucky: unusual for one session, but a few are expected over many sessions. Beyond good / bad luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level.',
+        'Newest first. Normal: about as many wins as expected. Below / above average: off by an ordinary amount of luck (rarer than 1 in 4). Unlucky / Lucky: rarer than 1 in 40, but a few are expected over many sessions. Beyond bad / good luck: too far from the shown odds to be luck even across all sessions. Click a session for its win rate per chance level.',
       ),
       h('div', { class: 'list' }, shown.map(sessionRow)),
       sessions.length > shown.length
@@ -194,7 +214,7 @@ export function viewSessions(ctx) {
         kpi('Longest losing run', fmtInt(x.longestLosses), x.longestLosses > 0 ? `chance ${fmtPct(x.longestP, 0)}` : null),
         kpi('Deposits', fmtInt(x.deposits), x.deposits ? fmtMoney(x.deposited, '') : x.cases ? `${fmtInt(x.cases)} case opens` : null),
       ),
-      h('div', { class: ['verdict', v.tone] }, verdictBadge(v), h('span', { text: v.text, 'data-tip': x.oddsN ? `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` : null })),
+      h('div', { class: ['verdict', v.tone] }, verdictBadge(v), h('span', { text: [v.text, v.rarity].filter(Boolean).join(' '), 'data-tip': x.oddsN ? `z = ${fmtZ(x.z)}, ${fmtPEq(x.p)}` : null })),
       (x.byChance || []).length
         ? table(
             [th('Chance'), th('Upgrades'), th('Won'), th('Expected', 'Sum of the shown chances'), th('Rate'), th('Shown')],
