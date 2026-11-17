@@ -41,6 +41,13 @@ Both, and the session phase, come from columns the database fills itself (`phase
 minute for new rows and refreshes the 7-day normal rates (`monitor_cal`) every 30 minutes. The monitor sends
 nothing extra.
 
+The page reads its heavy reports (`monitor_report`, `monitor_window_sums`, `monitor_shared`) through a cache,
+`monitor_cached()` (see `supabase/migrations/*_monitor_cache.sql`), so they answer in milliseconds instead of
+seconds. A second `pg_cron` job, `monitor_cache_warm()`, recomputes every minute the reports asked for in the last
+15 minutes once they are older than their refresh time (under a minute for ranges up to 8 hours, 2 minutes up to a
+day, 5 minutes beyond, 10 minutes for the 7- and 30-day checks), and computes the next window's report shortly
+before the page moves on to it.
+
 Sections:
 
 - **right now**, one card each for upgrades and cases: the last 30 minutes (or hour) up to the settled time against

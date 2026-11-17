@@ -1536,13 +1536,33 @@ async function rpc(name, args) {
   }
 }
 
+/**
+ * The heavy reports come from the database's cache (monitor_cached), which a cron job refreshes every minute for
+ * the reports asked for in the last 15 minutes, so they answer in milliseconds. roll and lead say how `to_ms`
+ * moves with time (to_ms = floor(now / roll) * roll + lead), so the job can compute the next window ahead of
+ * time. A report not cached yet and too slow to compute at once comes back as {pending: true}: the job computes
+ * it within a minute, so ask again a little later.
+ */
+async function cached(name, args, roll, lead) {
+  for (let i = 0; ; i++) {
+    const data = await rpc('monitor_cached', { name, args, roll_ms: roll, lead_ms: lead });
+    if (!data?.pending) return data;
+    if (i >= 4) throw new Error('This view is still being prepared. It should appear within a minute.');
+    await new Promise((go) => setTimeout(go, 15000));
+  }
+}
+let viewerChecked = null; // the user id monitor_is_viewer said yes to
+
 async function load() {
   if (!session || loading) return;
   loading = true;
   if (view) renderDashboard();
   try {
-    const isViewer = await rpc('monitor_is_viewer', {});
-    if (!isViewer) { loading = false; renderNotViewer(); return; }
+    if (viewerChecked !== session.user.id) {
+      const isViewer = await rpc('monitor_is_viewer', {});
+      if (!isViewer) { loading = false; renderNotViewer(); return; }
+      viewerChecked = session.user.id;
+    }
     const now = Date.now();
     const spec = rangeSpec(rangeKey, now, windowMin);
     const cs = compareSpec(now, compareMin);
@@ -1553,14 +1573,17 @@ async function load() {
     const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
     const pc = predictCache.get(predictMin);
     const predictFresh = pc && now - pc.at < 10 * 60 * 1000;
+    // Only the range's own report is needed to draw the page; the others fill their sections when they come.
+    let partial = null;
+    const optional = (p) => p.catch((e) => { partial = e.message || String(e); return null; });
     const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew, feed, ownFeed] = await Promise.all([
-      rpc('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }),
-      rpc('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }),
-      rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }),
+      cached('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }, spec.window, spec.window),
+      optional(cached('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }, cs.bucket, cs.bucket)),
+      rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }).catch(() => []),
       sb.from('monitor_status').select('updated_at,status').maybeSingle(),
       sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
-      weekFresh ? Promise.resolve(null) : rpc('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }),
-      predictFresh ? Promise.resolve(null) : rpc('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }),
+      weekFresh ? Promise.resolve(null) : optional(cached('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }, HOUR, HOUR)),
+      predictFresh ? Promise.resolve(null) : optional(cached('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }, HOUR, HOUR)),
       // The drop-line colours are an extra: the rest of the page works without them.
       rpc('monitor_feed_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window }).catch(() => []),
       fetchFeed(now).catch((e) => { feedError = e.message || String(e); return null; }),
@@ -1573,7 +1596,7 @@ async function load() {
     view = buildReport({ report, cmp, week: weekCache?.report ?? null, predict, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, feed, spec, now });
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
-    loadError = null;
+    loadError = partial ? `part of the page did not load (${partial}); it is tried again in a minute` : null;
   } catch (e) {
     loadError = e.message || String(e);
   }
@@ -1614,7 +1637,7 @@ async function loadShared() {
     const args = { from_ms: to - sharedDays * 24 * HOUR, to_ms: to, bucket_ms: sharedMin * 60000 };
     // A first read of 30 days can take several seconds while the database loads the synced history from disk;
     // rpc() tries a timed-out read once more, and the second try finds it in memory.
-    const data = await rpc('monitor_shared', args);
+    const data = await cached('monitor_shared', args, 30 * 60000, 0);
     sharedCache.set(key, { at: now, data });
     sharedError = null;
   } catch (e) {
