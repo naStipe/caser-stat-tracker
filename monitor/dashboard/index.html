@@ -127,7 +127,14 @@
   td .ci { display: block; color: var(--faint); font-size: 11.5px; }
   .fade { animation: fade 160ms ease-out; }
   @keyframes fade { from { opacity: 0.4; } to { opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .fade { animation: none; } button { transition: none; } }
+  .sync { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sync.busy { color: var(--muted); }
+  .sync.bad { color: var(--neg); }
+  .sync .bar { flex: none; width: 72px; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; opacity: 0; transition: opacity 200ms; }
+  .sync.busy .bar { opacity: 1; }
+  .sync .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 200ms ease-out; }
+  @media (max-width: 520px) { .sync .bar { width: 40px; } }
+  @media (prefers-reduced-motion: reduce) { .fade { animation: none; } button, .sync .bar, .sync .bar i { transition: none; } }
 </style>
 </head>
 <body>
@@ -189,6 +196,42 @@ let events = [];
 let session = null;
 let loading = false;
 let loadError = null;
+
+/**
+ * The indicator next to Reload: while requests to the database run, a bar fills as they finish ("Updating 3/7",
+ * with the seconds so far once it takes a while); otherwise when the page last updated and when it updates next.
+ * It lives outside the re-rendered page and repaints itself every second.
+ */
+const sync = { active: 0, done: 0, total: 0, since: 0, lastAt: 0, failedAt: 0, nextAt: 0 };
+const syncFill = document.createElement('i');
+const syncBar = document.createElement('span');
+syncBar.className = 'bar';
+syncBar.append(syncFill);
+const syncText = document.createElement('span');
+const syncEl = document.createElement('span');
+syncEl.title = 'Requests to the database: finished of started. The page updates every minute while it is open.';
+syncEl.append(syncBar, syncText);
+function paintSync() {
+  const now = Date.now();
+  const busy = sync.active > 0;
+  const failed = !busy && sync.failedAt > sync.lastAt;
+  syncEl.className = `sync${busy ? ' busy' : failed ? ' bad' : ''}`;
+  syncFill.style.width = busy ? `${Math.max(6, (100 * sync.done) / sync.total)}%` : '100%';
+  const secs = Math.floor((now - sync.since) / 1000);
+  syncText.textContent = busy ? `Updating ${sync.done}/${sync.total}${secs >= 2 ? ` · ${secs} s` : ''}`
+    : failed ? `Update failed ${fmtAgo(sync.failedAt)}`
+    : sync.lastAt ? `Updated ${fmtAgo(sync.lastAt)}${sync.nextAt > now ? ` · next in ${Math.ceil((sync.nextAt - now) / 1000)} s` : ''}`
+    : '';
+}
+/** Counts a request (or a wait for one) in the indicator until it settles. */
+function track(p) {
+  if (!sync.active) { sync.done = 0; sync.total = 0; sync.since = Date.now(); }
+  sync.active++;
+  sync.total++;
+  paintSync();
+  return Promise.resolve(p).finally(() => { sync.active--; sync.done++; paintSync(); });
+}
+setInterval(() => { if (!document.hidden) paintSync(); }, 1000);
 
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -860,6 +903,7 @@ function header() {
       h('h1', { text: 'Pulse monitor' }),
       h('button', { type: 'button', class: ['status', lvl], title: 'Monitor status and recent events', onclick: () => setTab('monitor') }, h('i'), h('span', { text: health?.text ?? 'Loading…' }))),
     h('div', { class: 'row' },
+      syncEl,
       h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
       h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
 }
@@ -1527,7 +1571,7 @@ async function rpcOnce(name, args) {
   }
 }
 const isTimeout = (e) => e?.code === '57014' || /statement timeout/i.test(e?.message ?? '');
-async function rpc(name, args) {
+async function rpcRetry(name, args) {
   try {
     return await rpcOnce(name, args);
   } catch (e) {
@@ -1535,6 +1579,7 @@ async function rpc(name, args) {
     return rpcOnce(name, args);
   }
 }
+const rpc = (name, args) => track(rpcRetry(name, args));
 
 /**
  * The heavy reports come from the database's cache (monitor_cached), which a cron job refreshes every minute for
@@ -1548,7 +1593,7 @@ async function cached(name, args, roll, lead) {
     const data = await rpc('monitor_cached', { name, args, roll_ms: roll, lead_ms: lead });
     if (!data?.pending) return data;
     if (i >= 4) throw new Error('This view is still being prepared. It should appear within a minute.');
-    await new Promise((go) => setTimeout(go, 15000));
+    await track(new Promise((go) => setTimeout(go, 15000)));
   }
 }
 let viewerChecked = null; // the user id monitor_is_viewer said yes to
@@ -1580,8 +1625,8 @@ async function load() {
       cached('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }, spec.window, spec.window),
       optional(cached('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }, cs.bucket, cs.bucket)),
       rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }).catch(() => []),
-      sb.from('monitor_status').select('updated_at,status').maybeSingle(),
-      sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30),
+      track(sb.from('monitor_status').select('updated_at,status').maybeSingle()),
+      track(sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30)),
       weekFresh ? Promise.resolve(null) : optional(cached('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }, HOUR, HOUR)),
       predictFresh ? Promise.resolve(null) : optional(cached('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }, HOUR, HOUR)),
       // The drop-line colours are an extra: the rest of the page works without them.
@@ -1597,9 +1642,12 @@ async function load() {
     health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
     events = eventsRes.error ? [] : eventsRes.data ?? [];
     loadError = partial ? `part of the page did not load (${partial}); it is tried again in a minute` : null;
+    sync.lastAt = Date.now();
   } catch (e) {
     loadError = e.message || String(e);
+    sync.failedAt = Date.now();
   }
+  paintSync();
   loading = false;
   renderDashboard();
   if (view) { loadShared(); loadArrival(); }
@@ -1693,7 +1741,8 @@ sb.auth.onAuthStateChange((_event, s2) => {
   if (!session) { view = null; health = null; renderLogin(); return; }
   if (session.user.id !== was) { view = null; renderDashboard(); setTimeout(load, 0); }
 });
-setInterval(() => { if (session && !document.hidden) load(); }, 60000);
+sync.nextAt = Date.now() + 60000;
+setInterval(() => { sync.nextAt = Date.now() + 60000; if (session && !document.hidden) load(); }, 60000);
 let resizeTimer = null;
 addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (session && view) renderDashboard(); }, 150); });
 </script>
