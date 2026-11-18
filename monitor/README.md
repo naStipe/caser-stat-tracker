@@ -329,6 +329,14 @@ Redeploy after changes with `vercel deploy --prod` in that folder, or connect th
 (root directory `monitor/dashboard`) so every push deploys it. `dashboard/config.js` holds the Supabase URL and the
 publishable key, which are public by design: on their own they read nothing.
 
+Switching views is meant to feel instant. The page keeps the last answer of every report it read (in memory and,
+for this browser only, in localStorage; cleared on sign-out), so a range or window seen before draws at once and
+is refreshed behind it. Resting the pointer on a range or window button reads that view's report ahead
+(`monitor_cached(..., warm => false)`, which the cron job does not keep refreshing). Reads for the view on screen
+go first, and reads for a view you already left are dropped. While a picked view is still loading, a line slides
+under the tabs, a note says what is loading (or that the server is preparing it), the picked button pulses, and
+the old view stays on screen, dimmed.
+
 Give someone access once:
 
 1. Supabase dashboard, Authentication, Users, "Add user": email and password ("Auto Confirm User" on).

@@ -134,7 +134,25 @@
   .sync.busy .bar { opacity: 1; }
   .sync .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 200ms ease-out; }
   @media (max-width: 520px) { .sync .bar { width: 40px; } }
-  @media (prefers-reduced-motion: reduce) { .fade { animation: none; } button, .sync .bar, .sync .bar i { transition: none; } }
+  /* Switching views: a sliding line under the tabs, the old view dimmed until the new one is drawn, and the picked
+     button pulsing. Solid colours only, short and quiet. */
+  .tabs .busyline { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden; opacity: 0; transition: opacity 150ms; pointer-events: none; }
+  .tabs .busyline.on { opacity: 1; }
+  .tabs .busyline i { position: absolute; top: 0; bottom: 0; left: 0; width: 30%; background: var(--accent); animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  #tab-panel { transition: opacity 150ms ease-out; }
+  #tab-panel.stale { opacity: 0.45; }
+  .group button.on.wait { animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.6; } }
+  .waitnote { display: flex; align-items: center; gap: 8px; margin: -8px 0 12px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .waitnote[hidden] { display: none; }
+  .waitnote .spin { flex: none; width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .placeholder { min-height: 240px; display: grid; place-items: center; color: var(--faint); }
+  @media (prefers-reduced-motion: reduce) {
+    .fade, .tabs .busyline i, .group button.on.wait, .waitnote .spin { animation: none; }
+    button, .sync .bar, .sync .bar i, #tab-panel, .tabs .busyline { transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -176,11 +194,9 @@ const metricName = (kind, m) => (METRICS[kind].find(([v]) => v === m) ?? METRICS
 let rangeKey = RANGES[store.get('pulse.range')] ? store.get('pulse.range') : '1h';
 let windowMin = pickWindow(rangeKey, store.get(`pulse.window.${rangeKey}`));
 let compareMin = Number(store.get('pulse.compare', 30)) === 60 ? 60 : 30;
-let weekCache = null; // the 7-day report in 30-minute buckets (self-check, lookup, day by day, heat map), reused for 10 minutes
 let pickBand = store.get('pulse.band', 'b');
 let pickPhase = Number(store.get('pulse.phase', 1));
 let predictMin = PREDICT_WINDOWS.includes(Number(store.get('pulse.predict', 10))) ? Number(store.get('pulse.predict', 10)) : 10;
-const predictCache = new Map(); // window minutes -> {at, rows} from monitor_window_sums, reused for 10 minutes
 let sharedMin = SHARED_WINDOWS.includes(Number(store.get('pulse.shared.win', 60))) ? Number(store.get('pulse.shared.win', 60)) : 60;
 let sharedDays = SHARED_DAYS.includes(Number(store.get('pulse.shared.days', 30))) ? Number(store.get('pulse.shared.days', 30)) : 30;
 const sharedCache = new Map(); // `${days}/${minutes}` -> {at, data} from monitor_shared, reused for 10 minutes
@@ -231,7 +247,37 @@ function track(p) {
   paintSync();
   return Promise.resolve(p).finally(() => { sync.active--; sync.done++; paintSync(); });
 }
-setInterval(() => { if (!document.hidden) paintSync(); }, 1000);
+setInterval(() => { if (!document.hidden) { paintSync(); paintWait(); } }, 1000);
+
+/**
+ * What the page waits for after a pick (range, window, compare or predict window) that memory could not draw at
+ * once: name -> {label, since, pending}. While it is not empty a line slides under the tabs and a note says what
+ * is loading; while the range or compare report is missing the old view stays on screen, dimmed.
+ */
+const waiting = new Map();
+const waitEl = document.createElement('p');
+waitEl.className = 'waitnote';
+waitEl.setAttribute('role', 'status');
+waitEl.setAttribute('aria-live', 'polite');
+waitEl.hidden = true;
+const waitSpin = document.createElement('i');
+waitSpin.className = 'spin';
+const waitText = document.createElement('span');
+waitEl.append(waitSpin, waitText);
+/** The waits the open tab shows: the range's report on the range tabs, the "right now" parts on Right now. */
+const WAIT_TABS = { report: ['time', 'tables', 'feed'], cmp: ['now'], predict: ['now'] };
+const shownWaits = () => [...waiting].filter(([k]) => WAIT_TABS[k]?.includes(tab)).map(([, w]) => w);
+const busyNow = (k) => waiting.has(k) && WAIT_TABS[k].includes(tab);
+function paintWait() {
+  const w = shownWaits()[0];
+  waitEl.hidden = !w;
+  if (!w) return;
+  const secs = Math.floor((Date.now() - w.since) / 1000);
+  waitText.textContent = w.pending
+    ? `Preparing ${w.label} on the server. A view nobody opened lately takes up to a minute the first time${secs >= 2 ? ` · ${secs} s` : ''}`
+    : `Loading ${w.label}…${secs >= 2 ? ` ${secs} s` : ''}`;
+}
+const dimmed = () => busyNow('report') || busyNow('cmp');
 
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -253,9 +299,22 @@ function s(tag, attrs) {
   }
   return el;
 }
-function toggle(options, current, onPick, label) {
+/**
+ * A row of buttons for one choice. o.busy: the picked option is still loading (its button pulses). o.ahead(v): called
+ * when the pointer or focus rests on an option, to read its data before the click.
+ */
+function toggle(options, current, onPick, label, o = {}) {
   return h('span', { class: 'row' }, label ? h('span', { class: 'label', text: label }) : null,
-    h('span', { class: 'group', role: 'group' }, options.map(([v, text, title]) => h('button', { type: 'button', class: String(v) === String(current) ? 'on' : '', 'aria-pressed': String(String(v) === String(current)), title, text, onclick: () => onPick(v) }))));
+    h('span', { class: 'group', role: 'group', 'aria-busy': o.busy ? 'true' : null }, options.map(([v, text, title]) => {
+      const on = String(v) === String(current);
+      return h('button', {
+        type: 'button', class: [on ? 'on' : '', on && o.busy ? 'wait' : ''], 'aria-pressed': String(on), title, text,
+        onclick: () => onPick(v),
+        onpointerenter: o.ahead && !on ? () => o.ahead(v) : null,
+        onfocus: o.ahead && !on ? () => o.ahead(v) : null,
+        onpointerleave: o.ahead ? () => clearTimeout(aheadTimer) : null,
+      });
+    })));
 }
 
 function timeLabel(t, span) {
@@ -904,7 +963,7 @@ function header() {
       h('button', { type: 'button', class: ['status', lvl], title: 'Monitor status and recent events', onclick: () => setTab('monitor') }, h('i'), h('span', { text: health?.text ?? 'Loading…' }))),
     h('div', { class: 'row' },
       syncEl,
-      h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load() }),
+      h('button', { type: 'button', text: loading ? 'Loading…' : 'Reload', disabled: loading, onclick: () => load({ force: true }) }),
       h('button', { type: 'button', text: 'Sign out', onclick: () => sb.auth.signOut() })));
 }
 
@@ -938,22 +997,23 @@ function tabBar() {
   return h('nav', { class: 'tabs', 'aria-label': 'Sections' },
     h('div', { class: 'tab-list', role: 'tablist' }, TABS.map(([k, label, title]) =>
       h('button', { type: 'button', role: 'tab', id: `tab-${k}`, 'aria-selected': String(k === tab), 'aria-controls': 'tab-panel', class: k === tab ? 'on' : '', title, text: label, onclick: () => setTab(k) }))),
-    RANGE_TABS.has(tab) ? toggle(Object.entries(RANGES).map(([k, r]) => [k, k, `Last ${r.label}`]), rangeKey, setRange, 'Range') : null);
+    RANGE_TABS.has(tab) ? toggle(Object.entries(RANGES).map(([k, r]) => [k, k, `Last ${r.label}`]), rangeKey, setRange, 'Range', { busy: waiting.has('report'), ahead: (k) => readAhead(k, null) }) : null,
+    h('span', { class: ['busyline', shownWaits().length ? 'on' : ''], 'aria-hidden': 'true' }, h('i')));
 }
 /** Window-size picker for the per-window charts. */
 function windowToggle() {
-  return toggle(windowsFor(rangeKey).map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window');
+  return toggle(windowsFor(rangeKey).map((m) => [m, m >= 60 ? `${m / 60}h` : `${m}m`, `${m}-minute windows`]), windowMin, setWindow, 'Window', { busy: waiting.has('report'), ahead: (m) => readAhead(rangeKey, m) });
 }
 
 function nowTab(v, width) {
   const out = [];
   out.push(h('div', { class: 'sec-head' }, h('h2', { text: 'Right now' }),
-    toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over')));
+    toggle([[30, '30 min', 'the 30 minutes up to the settled time, against normal'], [60, '1 hour', 'the hour up to the settled time, against normal']], compareMin, setCompare, 'Over', { busy: waiting.has('cmp') })));
   const gw = width >= 680 ? Math.floor((width - 16) / 2) - 2 : width;
   out.push(h('div', { class: 'glance' }, glanceCard('upgrade', gw), glanceCard('case', gw)));
   const pm = v.predict?.minutes ?? compareMin;
   out.push(h('section', null, h('div', { class: 'sec-head' }, h('h2', { text: 'Does one window predict the next?' }),
-      toggle(PREDICT_WINDOWS.map((m) => [m, m >= 60 ? '1 h' : `${m} min`, `${m}-minute windows`]), predictMin, setPredict, 'Window')),
+      toggle(PREDICT_WINDOWS.map((m) => [m, m >= 60 ? '1 h' : `${m} min`, `${m}-minute windows`]), predictMin, setPredict, 'Window', { busy: waiting.has('predict') })),
     h('div', { class: 'split' }, persistenceChart({ kind: 'upgrade', width: gw - 34 }), persistenceChart({ kind: 'case', width: gw - 34 })),
     h('p', { class: 'hint', text: `Each dot is one ${pm}-minute window of the last 7 days (x) against the one right after it (y), both as how far from normal they were in standard errors. If good windows were followed by good ones, the dots would lean along a rising line. A round cloud and a flat line mean checking “right now” tells you nothing about the next ${pm} minutes. Short windows hold few rows (windows with under 3 expected wins or hits are left out), so each dot is noisier, but there are more of them. A small positive value for upgrades can also come from the same players in both windows: the monitor does not see top-up deposits, so a player’s own boost after one shows up in two windows in a row.` })));
   out.push(sharedSection());
@@ -1355,13 +1415,15 @@ function monitorTab(v) {
 }
 
 let shownTab = null;
+let shownView = null;
 function renderDashboard() {
   const v = view;
   const width = Math.min(root.clientWidth || 1000, 1008) - 34;
-  const out = [header(), tabBar()];
+  paintWait();
+  const out = [header(), tabBar(), waitEl];
   if (loadError) out.push(h('section', { class: 'error', role: 'alert', text: `Could not load the data: ${loadError}` }));
   if (!v) {
-    out.push(tab === 'monitor' ? problemsSection() : h('p', { class: 'faint', text: 'Loading…' }));
+    out.push(tab === 'monitor' ? problemsSection() : h('div', { class: 'placeholder', text: shownWaits().length ? '' : 'Loading…' }));
     root.replaceChildren(...out);
     return;
   }
@@ -1370,9 +1432,13 @@ function renderDashboard() {
     : tab === 'feed' ? [feedSection({ v, width })]
     : tab === 'monitor' ? monitorTab(v)
     : nowTab(v, width);
-  // Keep the page where it is on the minute refresh: only a new tab fades in.
-  const panel = h('div', { id: 'tab-panel', role: 'tabpanel', 'aria-labelledby': `tab-${tab}`, class: shownTab !== tab ? 'fade' : '' }, page);
+  // Keep the page where it is on the minute refresh: only a new tab or a newly picked view fades in. A view that
+  // is not the picked one yet (its data is loading) stays dimmed.
+  const viewId = `${v.spec.key} ${v.spec.window} ${v.compareMinutes} ${v.predict?.minutes ?? ''}`;
+  const fresh = shownTab !== tab || (shownView !== null && shownView !== viewId);
+  const panel = h('div', { id: 'tab-panel', role: 'tabpanel', 'aria-labelledby': `tab-${tab}`, 'aria-busy': dimmed() ? 'true' : null, class: [fresh ? 'fade' : '', dimmed() ? 'stale' : ''] }, page);
   shownTab = tab;
+  shownView = viewId;
   out.push(panel);
   root.replaceChildren(...out);
 }
@@ -1554,12 +1620,25 @@ function renderNotViewer() {
 }
 
 // The database has a small, shared CPU: reads sent all at once slow each other past its 8 s statement timeout.
-// At most RPC_SLOTS run at a time, and a read cancelled by the timeout is tried once more.
+// At most RPC_SLOTS run at a time, and the view on screen goes first: prio 0 is the report a picked view waits
+// for, 1 the rest of the page, 2 reads ahead (the pointer resting on a button). A queued read whose view was left
+// before it started is dropped (StaleRead), and a read cancelled by the timeout is tried once more.
 const RPC_SLOTS = 3;
 let rpcBusy = 0;
 const rpcQueue = [];
-async function rpcOnce(name, args) {
-  if (rpcBusy >= RPC_SLOTS) await new Promise((go) => rpcQueue.push(go));
+class StaleRead extends Error {}
+function waitSlot(prio) {
+  return new Promise((go) => {
+    const i = rpcQueue.findIndex((q) => q.prio > prio);
+    rpcQueue.splice(i < 0 ? rpcQueue.length : i, 0, { go, prio });
+  });
+}
+async function rpcOnce(name, args, o = {}) {
+  if (rpcBusy >= RPC_SLOTS) await waitSlot(o.prio ?? 1);
+  if (o.stale?.()) {
+    if (rpcBusy < RPC_SLOTS) rpcQueue.shift()?.go();
+    throw new StaleRead('view left');
+  }
   rpcBusy++;
   try {
     const { data, error } = await sb.rpc(name, args);
@@ -1567,90 +1646,247 @@ async function rpcOnce(name, args) {
     return data ?? [];
   } finally {
     rpcBusy--;
-    rpcQueue.shift()?.();
+    rpcQueue.shift()?.go();
   }
 }
 const isTimeout = (e) => e?.code === '57014' || /statement timeout/i.test(e?.message ?? '');
-async function rpcRetry(name, args) {
+async function rpcRetry(name, args, o) {
   try {
-    return await rpcOnce(name, args);
+    return await rpcOnce(name, args, o);
   } catch (e) {
     if (!isTimeout(e)) throw e;
-    return rpcOnce(name, args);
+    return rpcOnce(name, args, o);
   }
 }
-const rpc = (name, args) => track(rpcRetry(name, args));
+/** o: {prio, stale, quiet}; quiet reads are left out of the indicator next to Reload. */
+const rpc = (name, args, o) => (o?.quiet ? rpcRetry(name, args, o) : track(rpcRetry(name, args, o)));
 
 /**
  * The heavy reports come from the database's cache (monitor_cached), which a cron job refreshes every minute for
  * the reports asked for in the last 15 minutes, so they answer in milliseconds. roll and lead say how `to_ms`
  * moves with time (to_ms = floor(now / roll) * roll + lead), so the job can compute the next window ahead of
- * time. A report not cached yet and too slow to compute at once comes back as {pending: true}: the job computes
- * it within a minute, so ask again a little later.
+ * time. A report not cached yet and too slow to compute at once comes back as {pending: true} (at once, while the
+ * job prepares it): the page asks again every 3 seconds. Reads ahead pass warm: false, so the job does not keep
+ * refreshing views nobody opened. Two asks for the same report share one read; it is dropped only when every
+ * view that asked for it was left.
+ * o: {prio, stale, ahead, quiet, onPending}
  */
-async function cached(name, args, roll, lead) {
-  for (let i = 0; ; i++) {
-    const data = await rpc('monitor_cached', { name, args, roll_ms: roll, lead_ms: lead });
-    if (!data?.pending) return data;
-    if (i >= 4) throw new Error('This view is still being prepared. It should appear within a minute.');
-    await track(new Promise((go) => setTimeout(go, 15000)));
+const cachedReads = new Map();
+function cached(name, args, roll, lead, o = {}) {
+  const key = `${name} ${JSON.stringify(args)} ${roll}/${lead}`;
+  let r = cachedReads.get(key);
+  const fresh = !r;
+  if (fresh) r = { wants: [], pendingFns: [] };
+  r.wants.push(o.stale ?? (() => false));
+  if (o.onPending) r.pendingFns.push(o.onPending);
+  if (fresh) {
+    const stale = () => r.wants.every((f) => f());
+    r.p = (async () => {
+      for (let i = 0; ; i++) {
+        const t0 = Date.now();
+        const ask = { name, args, roll_ms: roll, lead_ms: lead };
+        if (o.ahead) ask.warm = false;
+        const data = await rpc('monitor_cached', ask, { prio: o.prio, stale, quiet: true });
+        if (!data?.pending) return data;
+        for (const f of r.pendingFns) f();
+        if (i >= 30) throw new Error('This view is still being prepared. It should appear within a minute.');
+        // A quick "pending" is a lookup: ask again soon. A slow one means this ask tried to compute the report
+        // itself (a database without the 2026-11-18 change), so leave the database some room.
+        await new Promise((go) => setTimeout(go, Date.now() - t0 < 1500 ? 3000 : 12000));
+        if (stale()) throw new StaleRead('view left');
+      }
+    })();
+    cachedReads.set(key, r);
+    r.p.finally(() => cachedReads.delete(key)).catch(() => {});
   }
+  return o.quiet || o.ahead ? r.p : track(r.p);
 }
 let viewerChecked = null; // the user id monitor_is_viewer said yes to
 
-async function load() {
-  if (!session || loading) return;
+/**
+ * The last answer of every series the page read: a series is one read whose range moves with time (the same
+ * report for a newer window). A view seen before draws from here at once and is refreshed behind it, and the
+ * newest answers survive a reload in localStorage (this browser only, cleared on sign-out).
+ * series -> {to, at, data}
+ */
+const MEM_KEY = 'pulse.mem.v1';
+const MEM_MAX = 60;
+const MEM_BYTES = 2_000_000;
+const mem = new Map();
+try { for (const [k, v] of JSON.parse(localStorage.getItem(MEM_KEY) || '[]')) if (v && typeof v === 'object') mem.set(k, v); } catch {}
+let memSaveTimer = null;
+function memPut(series, to, data) {
+  mem.delete(series);
+  mem.set(series, { to, at: Date.now(), data });
+  while (mem.size > MEM_MAX) mem.delete(mem.keys().next().value);
+  clearTimeout(memSaveTimer);
+  memSaveTimer = setTimeout(memSave, 1500);
+}
+function memSave() {
+  const out = [];
+  let size = 0;
+  for (const e of [...mem].reverse()) {
+    const s = JSON.stringify(e);
+    if (size + s.length > MEM_BYTES) break;
+    size += s.length;
+    out.push(s);
+  }
+  try { localStorage.setItem(MEM_KEY, `[${out.reverse().join(',')}]`); } catch {}
+}
+function memClear() {
+  mem.clear();
+  clearTimeout(memSaveTimer);
+  try { localStorage.removeItem(MEM_KEY); } catch {}
+}
+
+/** How long a report counts as fresh: the same times as the database's cache. */
+const reportTtl = (span) => (span <= 8 * HOUR ? 50_000 : span <= 25 * HOUR ? 110_000 : 290_000);
+const tzNow = () => -new Date().getTimezoneOffset();
+const reportSeries = (spec, tz) => `report ${spec.to - spec.from} ${spec.window} ${tz}`;
+const reportArgs = (spec, tz) => ({ from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz });
+
+/** Reads a view's report ahead while the pointer rests on its button, so the click usually finds it ready. */
+let aheadTimer = null;
+function readAhead(range, win) {
+  clearTimeout(aheadTimer);
+  aheadTimer = setTimeout(() => {
+    if (!session || viewerChecked !== session.user.id) return;
+    const now = Date.now();
+    const spec = rangeSpec(range, now, win ?? pickWindow(range, store.get(`pulse.window.${range}`)));
+    const tz = tzNow();
+    const series = reportSeries(spec, tz);
+    const e = mem.get(series);
+    if (e && e.to === spec.to && now - e.at < reportTtl(spec.to - spec.from)) return;
+    cached('monitor_report', reportArgs(spec, tz), spec.window, spec.window, { prio: 2, ahead: true })
+      .then((d) => memPut(series, spec.to, d))
+      .catch(() => {});
+  }, 120);
+}
+
+let loadGen = 0;
+let loadsActive = 0;
+/**
+ * Draws the picked view from memory at once (when it was seen before) and reads what is missing or out of date.
+ * Each pick starts a new load; reads of a load whose view was left are dropped or kept in memory only. The page is
+ * redrawn as answers come in: it waits only for the range's report and the "right now" report.
+ * o.force: read everything again (the Reload button).
+ */
+async function load(o = {}) {
+  if (!session) return;
+  const gen = ++loadGen;
+  const current = () => gen === loadGen;
+  const left = () => !current();
+  loadsActive++;
   loading = true;
-  if (view) renderDashboard();
   try {
     if (viewerChecked !== session.user.id) {
       const isViewer = await rpc('monitor_is_viewer', {});
-      if (!isViewer) { loading = false; renderNotViewer(); return; }
+      if (!current()) return;
+      if (!isViewer) { renderNotViewer(); return; }
       viewerChecked = session.user.id;
     }
     const now = Date.now();
     const spec = rangeSpec(rangeKey, now, windowMin);
     const cs = compareSpec(now, compareMin);
-    const tz = -new Date().getTimezoneOffset();
+    const tz = tzNow();
     // The heat map always covers at least 7 days; for shorter ranges it comes from its own report.
     const needHeat = spec.to - spec.from < 7 * 24 * HOUR;
-    const weekFresh = weekCache && now - weekCache.at < 10 * 60 * 1000 && weekCache.tz === tz;
     const weekTo = Math.floor(now / HOUR) * HOUR + HOUR;
-    const pc = predictCache.get(predictMin);
-    const predictFresh = pc && now - pc.at < 10 * 60 * 1000;
-    // Only the range's own report is needed to draw the page; the others fill their sections when they come.
-    let partial = null;
-    const optional = (p) => p.catch((e) => { partial = e.message || String(e); return null; });
-    const [report, cmp, volume, statusRes, eventsRes, weekNew, predictNew, feed, ownFeed] = await Promise.all([
-      cached('monitor_report', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window, tz_offset_min: tz }, spec.window, spec.window),
-      optional(cached('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }, cs.bucket, cs.bucket)),
-      rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }).catch(() => []),
-      track(sb.from('monitor_status').select('updated_at,status').maybeSingle()),
-      track(sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30)),
-      weekFresh ? Promise.resolve(null) : optional(cached('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }, HOUR, HOUR)),
-      predictFresh ? Promise.resolve(null) : optional(cached('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }, HOUR, HOUR)),
+    const inp = { report: null, cmp: null, cmpDone: false, week: null, predict: null, volume: [], feed: [] };
+
+    let queued = false;
+    const draw = () => {
+      if (queued || !current()) return;
+      queued = true;
+      queueMicrotask(() => {
+        queued = false;
+        if (!current() || !inp.report || !(inp.cmp || inp.cmpDone)) return;
+        view = buildReport({
+          report: inp.report, cmp: inp.cmp, week: inp.week, predict: inp.predict ? { minutes: predictMin, rows: inp.predict } : null,
+          heatReport: needHeat ? inp.week : null, compareMinutes: compareMin, volume: inp.volume, feed: inp.feed, spec, now,
+        });
+        renderDashboard();
+        if (!drawn) { drawn = true; loadShared(); loadArrival(); }
+      });
+    };
+    let drawn = false;
+    const settle = (name) => { if (current() && waiting.delete(name)) renderDashboard(); };
+
+    /**
+     * Hands over the series' last answer at once (if any), then reads a new one unless that answer is for this
+     * window and younger than ttl. A part with nothing in memory is listed in `waiting` under name.
+     */
+    const part = (name, label, series, to, ttl, read, put) => {
+      const e = mem.get(series);
+      if (e) put(e.data);
+      else if (label && !waiting.has(name)) waiting.set(name, { label, since: Date.now(), pending: false });
+      if (e && e.to === to && Date.now() - e.at < ttl && !o.force) { settle(name); return Promise.resolve(); }
+      return read().then((d) => {
+        memPut(series, to, d);
+        if (current()) { put(d); settle(name); draw(); }
+      }, (err) => { if (current()) settle(name); throw err; });
+    };
+    // Parts this view does not use any more stop showing as loading.
+    for (const k of ['report', 'cmp', 'predict']) waiting.delete(k);
+
+    const winText = spec.window >= HOUR ? `${spec.window / HOUR}-hour` : `${spec.window / 60000}-minute`;
+    const mainRead = (name, args, roll, lead, prio, waitName) => () => cached(name, args, roll, lead, {
+      prio, stale: left,
+      onPending: () => { const w = waiting.get(waitName); if (current() && w && !w.pending) { w.pending = true; paintWait(); } },
+    });
+    const tasks = [
+      part('report', `${spec.label} in ${winText} windows`, reportSeries(spec, tz), spec.to, reportTtl(spec.to - spec.from),
+        mainRead('monitor_report', reportArgs(spec, tz), spec.window, spec.window, 0, 'report'), (d) => { inp.report = d; draw(); }),
+      part('cmp', `the last ${compareMin === 60 ? 'hour' : '30 minutes'}`, `cmp ${cs.to - cs.from} ${cs.bucket} ${tz}`, cs.to, 50_000,
+        mainRead('monitor_report', { from_ms: cs.from, to_ms: cs.to, bucket_ms: cs.bucket, tz_offset_min: tz }, cs.bucket, cs.bucket, 0, 'cmp'),
+        (d) => { inp.cmp = d; draw(); }).finally(() => { inp.cmpDone = true; draw(); }),
+      part('volume', null, `volume ${spec.coarse.to - spec.coarse.from} ${spec.coarse.bucket}`, spec.coarse.to, 50_000,
+        () => rpc('monitor_volume_agg', { from_ms: spec.coarse.from, to_ms: spec.coarse.to, bucket_ms: spec.coarse.bucket }, { prio: 1, stale: left }),
+        (d) => { inp.volume = d; draw(); }),
+      part('week', null, `week ${tz}`, weekTo, 10 * 60_000,
+        () => cached('monitor_report', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: 30 * 60 * 1000, tz_offset_min: tz }, HOUR, HOUR, { prio: 1, stale: left }),
+        (d) => { inp.week = d; draw(); }),
+      part('predict', `${predictMin}-minute windows of the last 7 days`, `predict ${predictMin}`, weekTo, 10 * 60_000,
+        mainRead('monitor_window_sums', { from_ms: weekTo - 7 * 24 * HOUR, to_ms: weekTo, bucket_ms: predictMin * 60 * 1000 }, HOUR, HOUR, 1, 'predict'),
+        (d) => { inp.predict = d; draw(); }),
       // The drop-line colours are an extra: the rest of the page works without them.
-      rpc('monitor_feed_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window }).catch(() => []),
-      fetchFeed(now).catch((e) => { feedError = e.message || String(e); return null; }),
-    ]);
-    if (ownFeed) { feedView = ownFeed; feedError = null; }
-    if (statusRes.error) throw statusRes.error;
-    if (weekNew) weekCache = { at: now, tz, report: weekNew };
-    if (predictNew) predictCache.set(predictMin, { at: now, rows: predictNew });
-    const predict = predictCache.get(predictMin) ? { minutes: predictMin, rows: predictCache.get(predictMin).rows } : null;
-    view = buildReport({ report, cmp, week: weekCache?.report ?? null, predict, heatReport: needHeat ? weekCache?.report ?? null : null, compareMinutes: compareMin, volume, feed, spec, now });
-    health = { ...monitorHealth(statusRes.data, now), status: statusRes.data?.status ?? null };
-    events = eventsRes.error ? [] : eventsRes.data ?? [];
-    loadError = partial ? `part of the page did not load (${partial}); it is tried again in a minute` : null;
-    sync.lastAt = Date.now();
+      part('feed', null, `feed ${spec.to - spec.from} ${spec.window}`, spec.to, 50_000,
+        () => rpc('monitor_feed_agg', { from_ms: spec.from, to_ms: spec.to, bucket_ms: spec.window }, { prio: 1, stale: left }),
+        (d) => { inp.feed = d; draw(); }),
+      track(sb.from('monitor_status').select('updated_at,status').maybeSingle()).then((r) => {
+        if (r.error) throw r.error;
+        health = { ...monitorHealth(r.data, Date.now()), status: r.data?.status ?? null };
+        if (current() && view) renderDashboard();
+      }),
+      track(sb.from('monitor_events').select('at,level,code,message').order('at', { ascending: false }).limit(30)).then((r) => {
+        events = r.error ? [] : r.data ?? [];
+      }),
+      fetchFeed(now).then((f) => { if (f) { feedView = f; feedError = null; } }, (e) => { feedError = e.message || String(e); }),
+    ];
+    renderDashboard();
+
+    const res = await Promise.allSettled(tasks);
+    if (!current()) return;
+    const msg = (r) => (r.status === 'rejected' && !(r.reason instanceof StaleRead) ? r.reason?.message || String(r.reason) : null);
+    const mainErr = msg(res[0]);
+    const partErr = res.slice(1).map(msg).find(Boolean);
+    if (!inp.report) {
+      loadError = mainErr ?? 'no answer from the database';
+      sync.failedAt = Date.now();
+    } else {
+      loadError = mainErr || partErr ? `part of the page did not load (${mainErr || partErr}); it is tried again in a minute` : null;
+      sync.lastAt = Date.now();
+    }
+    waiting.clear();
+    renderDashboard();
   } catch (e) {
-    loadError = e.message || String(e);
-    sync.failedAt = Date.now();
+    if (current()) { loadError = e.message || String(e); sync.failedAt = Date.now(); waiting.clear(); }
+  } finally {
+    loadsActive--;
+    loading = loadsActive > 0;
+    paintSync();
+    if (current()) renderDashboard();
   }
-  paintSync();
-  loading = false;
-  renderDashboard();
-  if (view) { loadShared(); loadArrival(); }
 }
 
 /** How complete the "Right now" window usually is at its age; loads on its own, the card says so meanwhile. */
@@ -1711,17 +1947,16 @@ function setSharedDays(d) {
   loadShared();
 }
 
+// A pick redraws at once (the buttons, and the view from memory when it was seen before) and starts its own load.
 function setRange(k) {
   rangeKey = k;
   store.set('pulse.range', k);
   windowMin = pickWindow(rangeKey, store.get(`pulse.window.${k}`));
-  view = null;
   load();
 }
 function setWindow(m) {
   windowMin = pickWindow(rangeKey, m);
   store.set(`pulse.window.${rangeKey}`, String(windowMin));
-  view = null;
   load();
 }
 function setPredict(m) {
@@ -1738,11 +1973,14 @@ function setCompare(m) {
 sb.auth.onAuthStateChange((_event, s2) => {
   const was = session?.user?.id;
   session = s2;
-  if (!session) { view = null; health = null; renderLogin(); return; }
+  if (!session) { view = null; health = null; memClear(); renderLogin(); return; }
+  if (was && session.user.id !== was) memClear();
   if (session.user.id !== was) { view = null; renderDashboard(); setTimeout(load, 0); }
 });
 sync.nextAt = Date.now() + 60000;
-setInterval(() => { sync.nextAt = Date.now() + 60000; if (session && !document.hidden) load(); }, 60000);
+// Every minute, and when the tab comes back after a while: memory draws at once, then what is out of date is read.
+setInterval(() => { sync.nextAt = Date.now() + 60000; if (session && !document.hidden && !loadsActive) load(); }, 60000);
+addEventListener('visibilitychange', () => { if (!document.hidden && session && view && Date.now() - sync.lastAt > 60000 && !loadsActive) load(); });
 let resizeTimer = null;
 addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (session && view) renderDashboard(); }, 150); });
 </script>
