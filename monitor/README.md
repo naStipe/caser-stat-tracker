@@ -325,8 +325,8 @@ running monitor keeps working until it is updated.
 ## The dashboard
 
 `dashboard/` is a static page (HTML and two small modules, plus supabase-js from jsDelivr), hosted on Vercel.
-Redeploy after changes with `vercel deploy --prod` in that folder, or connect the Vercel project to the GitHub repo
-(root directory `monitor/dashboard`) so every push deploys it. `dashboard/config.js` holds the Supabase URL and the
+The Vercel project is connected to the GitHub repo (root directory `monitor/dashboard`), so every push to `main`
+deploys it within seconds; `vercel deploy --prod` from that folder fails because of the root directory setting. `dashboard/config.js` holds the Supabase URL and the
 publishable key, which are public by design: on their own they read nothing.
 
 Switching views is meant to feel instant. The page keeps the last answer of every report it read (in memory and,
