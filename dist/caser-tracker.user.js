@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.15.0
+// @version      0.16.0
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Your events are stored on the tracker's server under a random sync key, which also computes the statistics; no site login or token is sent. Only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -20,6 +20,7 @@
 // @connect      csfloat.com
 // @connect      hafnhxumrqyaljmciqqq.supabase.co
 // @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @noframes
 // @homepageURL  https://github.com/naStipe/caser-stat-tracker
 // @updateURL    https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js
@@ -2054,12 +2055,32 @@
     }
     return 0;
   }
+  function parseRawUrl(url) {
+    const m = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(String(url));
+    return m ? { owner: m[1], repo: m[2], ref: m[3], path: m[4] } : null;
+  }
+  function headCommitUrl({ owner, repo, ref }) {
+    return `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+  }
+  async function pinnedUrl(url, request) {
+    const p = parseRawUrl(url);
+    if (!p) return null;
+    try {
+      const res = await request(`${headCommitUrl(p)}?t=${Date.now()}`, { accept: "application/vnd.github.sha" });
+      const sha = String(res.text ?? "").trim();
+      if (res.status < 200 || res.status >= 300 || !/^[0-9a-f]{40}$/.test(sha)) return null;
+      return `https://raw.githubusercontent.com/${p.owner}/${p.repo}/${sha}/${p.path}`;
+    } catch {
+      return null;
+    }
+  }
   async function checkForUpdate({ url, current, request }) {
-    const res = await request(`${url}?t=${Date.now()}`);
+    const pinned = await pinnedUrl(url, request);
+    const res = await request(pinned ?? `${url}?t=${Date.now()}`);
     if (res.status < 200 || res.status >= 300) throw new Error(`Update check answered ${res.status}`);
     const latest = headerVersion(res.text);
     if (!latest) throw new Error("The published script has no @version");
-    return { latest, newer: compareVersions(latest, current) > 0, checkedAt: Date.now() };
+    return { latest, newer: compareVersions(latest, current) > 0, checkedAt: Date.now(), installUrl: pinned ?? url };
   }
 
   // src/ui/dom.js
@@ -5257,6 +5278,7 @@ option { background: var(--surface); color: var(--text); }
       );
     }
     const lockRun = () => typeof state.lastRun === "string" && state.lastRun.startsWith("lock-");
+    const updateRun = () => state.lastRun === "update-check";
     const msgLine = () => h("p", { class: ["msg", state.msg && state.msg.tone], role: "status", "aria-live": "polite", text: state.msg ? state.msg.text : "" });
     function viewData() {
       const c = cur();
@@ -5284,6 +5306,32 @@ option { background: var(--surface); color: var(--text); }
       const lk = st.lock && st.lock.set && typeof o.onUnlock === "function" ? st.lock : null;
       const isGuest2 = !!(lk && lk.guest);
       if (lk && lk.guest) out.push(h("section", null, lockCard(lk, btn), lockRun() ? msgLine() : null));
+      if (st.update && st.update.available && typeof o.onCheckUpdate === "function") {
+        const u = st.update;
+        out.push(
+          h(
+            "section",
+            null,
+            card(
+              "Updates",
+              u.newer ? `Version ${u.latest} is available. Install opens Tampermonkey: press Update, then reload this page.` : `You run ${versionText(st)}. Tampermonkey also checks once a day.`,
+              h(
+                "div",
+                { class: "btns" },
+                u.newer && typeof o.onOpenUpdate === "function" ? btn("update-install", `Install v${u.latest}`, "primary", () => safe(() => o.onOpenUpdate())) : null,
+                btn(
+                  "update-check",
+                  "Check for updates",
+                  "",
+                  () => run("update-check", () => o.onCheckUpdate(), (r) => r && r.newer ? `Version ${r.latest} is available.` : "You have the latest version."),
+                  { busyLabel: "Checking\u2026", disabled: !!u.checking }
+                )
+              )
+            ),
+            updateRun() ? msgLine() : null
+          )
+        );
+      }
       out.push(
         h(
           "section",
@@ -5372,27 +5420,6 @@ option { background: var(--surface); color: var(--text); }
           )
         );
       }
-      if (st.update && st.update.available && typeof o.onCheckUpdate === "function") {
-        const u = st.update;
-        prefs.push(
-          card(
-            "Updates",
-            u.newer ? `Version ${u.latest} is available. Install opens Tampermonkey: press Update, then reload this page.` : `You run ${versionText(st)}. Tampermonkey also checks once a day.`,
-            h(
-              "div",
-              { class: "btns" },
-              u.newer && typeof o.onOpenUpdate === "function" ? btn("update-install", `Install v${u.latest}`, "primary", () => safe(() => o.onOpenUpdate())) : null,
-              btn(
-                "update-check",
-                "Check for updates",
-                "",
-                () => run("update-check", () => o.onCheckUpdate(), (r) => r && r.newer ? `Version ${r.latest} is available.` : "You have the latest version."),
-                { busyLabel: "Checking\u2026", disabled: !!u.checking }
-              )
-            )
-          )
-        );
-      }
       if (lk && !lk.guest) prefs.push(lockCard(lk, btn));
       if (prefs.length) out.push(h("section", null, sectionHead("Preferences"), prefs, lk && !lk.guest && lockRun() ? msgLine() : null));
       const exp = (format) => {
@@ -5458,7 +5485,7 @@ option { background: var(--surface); color: var(--text); }
         backup.push(del);
       }
       out.push(h("section", null, sectionHead("Backup"), backup));
-      if (!lockRun()) out.push(msgLine());
+      if (!lockRun() && !updateRun()) out.push(msgLine());
       return out;
     }
     doRefresh();
@@ -6405,7 +6432,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.15.0" : "dev";
+  var VERSION = true ? "0.16.0" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
@@ -6878,9 +6905,9 @@ Click for the sales chart.` : r.name;
         const r = await checkForUpdate({
           url: UPDATE_URL,
           current: VERSION,
-          request: (url) => gmRequest({ url, headers: { accept: "text/plain" } })
+          request: (url, headers) => gmRequest({ url, headers: headers ?? { accept: "text/plain" } })
         });
-        browserPrefs.set("update:last", { latest: r.latest, checkedAt: r.checkedAt });
+        browserPrefs.set("update:last", { latest: r.latest, checkedAt: r.checkedAt, installUrl: r.installUrl });
         updateError = null;
         return updateState();
       } catch (err) {
@@ -6900,8 +6927,10 @@ Click for the sales chart.` : r.name;
   }
   function openUpdate() {
     if (!UPDATE_URL) return;
-    if (typeof GM_openInTab === "function") GM_openInTab(UPDATE_URL, { active: true });
-    else window.open(UPDATE_URL, "_blank", "noopener");
+    const pinned = browserPrefs.get("update:last")?.installUrl;
+    const url = typeof pinned === "string" && pinned.startsWith("https://raw.githubusercontent.com/") ? pinned : UPDATE_URL;
+    if (typeof GM_openInTab === "function") GM_openInTab(url, { active: true });
+    else window.open(url, "_blank", "noopener");
   }
   var prices = createPriceClient({ request: csfloatRequest, storage: store });
   var { origFetch } = installHook(pageWindow, async (ex) => {

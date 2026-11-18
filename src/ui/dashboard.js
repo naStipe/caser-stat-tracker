@@ -1492,8 +1492,9 @@ export function mountDashboard(opts = {}) {
     );
   }
 
-  // Result line of the last action. Lock actions show it under the lock, the rest at the bottom.
+  // Result line of the last action. Lock and update actions show it under their card, the rest at the bottom.
   const lockRun = () => typeof state.lastRun === 'string' && state.lastRun.startsWith('lock-');
+  const updateRun = () => state.lastRun === 'update-check';
   const msgLine = () => h('p', { class: ['msg', state.msg && state.msg.tone], role: 'status', 'aria-live': 'polite', text: state.msg ? state.msg.text : '' });
 
   function viewData() {
@@ -1526,6 +1527,34 @@ export function mountDashboard(opts = {}) {
     const lk = st.lock && st.lock.set && typeof o.onUnlock === 'function' ? st.lock : null;
     const isGuest = !!(lk && lk.guest);
     if (lk && lk.guest) out.push(h('section', null, lockCard(lk, btn), lockRun() ? msgLine() : null));
+
+    // Updates first, so a new version is the first thing seen.
+    if (st.update && st.update.available && typeof o.onCheckUpdate === 'function') {
+      const u = st.update;
+      out.push(
+        h(
+          'section',
+          null,
+          card(
+            'Updates',
+            u.newer ? `Version ${u.latest} is available. Install opens Tampermonkey: press Update, then reload this page.` : `You run ${versionText(st)}. Tampermonkey also checks once a day.`,
+            h(
+              'div',
+              { class: 'btns' },
+              u.newer && typeof o.onOpenUpdate === 'function' ? btn('update-install', `Install v${u.latest}`, 'primary', () => safe(() => o.onOpenUpdate())) : null,
+              btn(
+                'update-check',
+                'Check for updates',
+                '',
+                () => run('update-check', () => o.onCheckUpdate(), (r) => (r && r.newer ? `Version ${r.latest} is available.` : 'You have the latest version.')),
+                { busyLabel: 'Checking…', disabled: !!u.checking },
+              ),
+            ),
+          ),
+          updateRun() ? msgLine() : null,
+        ),
+      );
+    }
 
     // Status
     out.push(
@@ -1620,27 +1649,6 @@ export function mountDashboard(opts = {}) {
         ),
       );
     }
-    if (st.update && st.update.available && typeof o.onCheckUpdate === 'function') {
-      const u = st.update;
-      prefs.push(
-        card(
-          'Updates',
-          u.newer ? `Version ${u.latest} is available. Install opens Tampermonkey: press Update, then reload this page.` : `You run ${versionText(st)}. Tampermonkey also checks once a day.`,
-          h(
-            'div',
-            { class: 'btns' },
-            u.newer && typeof o.onOpenUpdate === 'function' ? btn('update-install', `Install v${u.latest}`, 'primary', () => safe(() => o.onOpenUpdate())) : null,
-            btn(
-              'update-check',
-              'Check for updates',
-              '',
-              () => run('update-check', () => o.onCheckUpdate(), (r) => (r && r.newer ? `Version ${r.latest} is available.` : 'You have the latest version.')),
-              { busyLabel: 'Checking…', disabled: !!u.checking },
-            ),
-          ),
-        ),
-      );
-    }
     if (lk && !lk.guest) prefs.push(lockCard(lk, btn));
     if (prefs.length) out.push(h('section', null, sectionHead('Preferences'), prefs, lk && !lk.guest && lockRun() ? msgLine() : null));
 
@@ -1708,7 +1716,7 @@ export function mountDashboard(opts = {}) {
       backup.push(del);
     }
     out.push(h('section', null, sectionHead('Backup'), backup));
-    if (!lockRun()) out.push(msgLine());
+    if (!lockRun() && !updateRun()) out.push(msgLine());
     return out;
   }
 

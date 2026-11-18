@@ -637,9 +637,9 @@ function checkUpdate() {
       const r = await checkForUpdate({
         url: UPDATE_URL,
         current: VERSION,
-        request: (url) => gmRequest({ url, headers: { accept: 'text/plain' } }),
+        request: (url, headers) => gmRequest({ url, headers: headers ?? { accept: 'text/plain' } }),
       });
-      browserPrefs.set('update:last', { latest: r.latest, checkedAt: r.checkedAt });
+      browserPrefs.set('update:last', { latest: r.latest, checkedAt: r.checkedAt, installUrl: r.installUrl });
       updateError = null;
       return updateState();
     } catch (err) {
@@ -659,12 +659,17 @@ function maybeCheckUpdate() {
   checkUpdate().catch((err) => console.warn('[caser-tracker] update check failed', err));
 }
 
-/** Opens the published script; Tampermonkey shows its update page for it. */
+/**
+ * Opens the published script; Tampermonkey shows its update page for it. Uses the file the last check read
+ * (pinned to a commit), since the branch URL can still serve the old version for a few minutes.
+ */
 function openUpdate() {
   if (!UPDATE_URL) return;
+  const pinned = browserPrefs.get('update:last')?.installUrl;
+  const url = typeof pinned === 'string' && pinned.startsWith('https://raw.githubusercontent.com/') ? pinned : UPDATE_URL;
   // eslint-disable-next-line no-undef
-  if (typeof GM_openInTab === 'function') GM_openInTab(UPDATE_URL, { active: true });
-  else window.open(UPDATE_URL, '_blank', 'noopener');
+  if (typeof GM_openInTab === 'function') GM_openInTab(url, { active: true });
+  else window.open(url, '_blank', 'noopener');
 }
 
 const prices = createPriceClient({ request: csfloatRequest, storage: uiStore });
