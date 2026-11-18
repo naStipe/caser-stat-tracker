@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caser Stat Tracker
 // @namespace    caser-stat-tracker
-// @version      0.14.0
+// @version      0.15.0
 // @description  Records your case opens and upgrades on caser.gg / caser.one and shows ROI, upgrade odds and factor statistics. Your events are stored on the tracker's server under a random sync key, which also computes the statistics; no site login or token is sent. Only item names go to CSFloat for prices.
 // @match        https://caser.gg/*
 // @match        https://www.caser.gg/*
@@ -6405,7 +6405,7 @@ Click for the sales chart.` : r.name;
   }
 
   // src/main.js
-  var VERSION = true ? "0.14.0" : "dev";
+  var VERSION = true ? "0.15.0" : "dev";
   var UPDATE_URL = true ? "https://raw.githubusercontent.com/naStipe/caser-stat-tracker/main/dist/caser-tracker.user.js" : null;
   var pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   var site = location.hostname.replace(/^www\./, "");
