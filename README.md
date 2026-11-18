@@ -42,7 +42,8 @@ statistics and method notes sit in "?" tooltips and "more" expanders:
   price trend and the gain or loss against your current item. Click a row (or your item's box) for a chart of every
   recent sale with its date, price and float, plus the typical, fast-sale and CSFloat base prices, the active
   listings and a link to the CSFloat listings. Clicking a row also selects that item in the site's list; you still
-  confirm on the site. Only the 50 items the site offers are ranked. Float and stickers change a real item's price,
+  confirm on the site. Prices are in euros, converted from CSFloat's US dollars with CSFloat's own exchange rate.
+  Only the 50 items the site offers are ranked. Float and stickers change a real item's price,
   so check the listing.
 
 Your events are stored on the tracker's server (Supabase), and the statistics are computed there, so the
@@ -50,7 +51,8 @@ script stays light however long your history gets. The history is filed under a 
 script makes on first run (Settings shows it; keep a copy, without it the history cannot be reached). The
 server gets the events the script records (cases, upgrades, deposits, withdrawals, item names and prices,
 your site account id and nickname), never your site login, cookies or token. The other outside request is
-to CSFloat's public sales history, which gets only item names. Prices are cached for 6 hours.
+to CSFloat's public sales history and exchange rates, which get only item names. Prices and the euro rate are
+cached for 6 hours.
 The script only reads the site's API responses; it never changes requests or places bets.
 
 ## Install

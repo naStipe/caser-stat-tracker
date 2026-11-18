@@ -17,7 +17,8 @@ const MIN_SALES_KEY = 'cst.ui.exchangeMinSales';
 const POLL_MS = 500;
 
 const okNum = (v) => typeof v === 'number' && Number.isFinite(v);
-const usd = (v, opts) => (okNum(v) ? (v < 0 ? '−$' : opts?.sign && v > 0 ? '+$' : '$') + fmtNumber(Math.abs(v), 2) : DASH);
+/** CSFloat prices, converted to euros by the price client. */
+const eur = (v, opts) => (okNum(v) ? (v < 0 ? '−€' : opts?.sign && v > 0 ? '+€' : '€') + fmtNumber(Math.abs(v), 2) : DASH);
 const feePct = `${fmtNumber(CSFLOAT_SELLER_FEE * 100, 0)}%`;
 
 function icon(d) {
@@ -30,7 +31,7 @@ const sold30 = (m) => `${fmtInt(m.sales30d)}${m.salesCapped ? '+' : ''}`;
 function splitText(m) {
   const sp = m?.split;
   if (!sp) return null;
-  return `Two price groups: ${fmtPct(sp.lowShare, 0)} of sales at ${usd(sp.lowMin)}–${usd(sp.lowMax)}, the rest at ${usd(sp.highMin)}–${usd(sp.highMax)} (pattern, phase or float). Prices use the lower group; the upper group is upside you only see once you hold the item.`;
+  return `Two price groups: ${fmtPct(sp.lowShare, 0)} of sales at ${eur(sp.lowMin)}–${eur(sp.lowMax)}, the rest at ${eur(sp.highMin)}–${eur(sp.highMax)} (pattern, phase or float). Prices use the lower group; the upper group is upside you only see once you hold the item.`;
 }
 
 function sourceText(m) {
@@ -51,7 +52,7 @@ function trendTag(m) {
 function detail(name, m, basis, width) {
   if (!m) return h('div', { class: 'detail' }, h('p', { class: 'faint', text: 'Loading CSFloat sales…' }));
   const stat = (k, v, extra) => h('div', { class: 'st' }, h('div', { class: 'k', text: k }), h('div', { class: 'v num' }, v, extra ?? null));
-  const fmtRange = okNum(m.low) && okNum(m.high) ? `${usd(m.low)} – ${usd(m.high)}` : DASH;
+  const fmtRange = okNum(m.low) && okNum(m.high) ? `${eur(m.low)} – ${eur(m.high)}` : DASH;
   return h(
     'div',
     { class: 'detail' },
@@ -60,12 +61,12 @@ function detail(name, m, basis, width) {
     h(
       'div',
       { class: 'stats' },
-      stat('You get, typical', usd(m.net), basis === 'typical' ? h('span', { class: 'tag', text: 'ranked' }) : null),
-      stat('You get, fast sale', usd(m.quickNet), basis === 'fast' ? h('span', { class: 'tag', text: 'ranked' }) : null),
+      stat('You get, typical', eur(m.net), basis === 'typical' ? h('span', { class: 'tag', text: 'ranked' }) : null),
+      stat('You get, fast sale', eur(m.quickNet), basis === 'fast' ? h('span', { class: 'tag', text: 'ranked' }) : null),
       stat('Listed now', okNum(m.listings) ? fmtInt(m.listings) : DASH),
-      stat('Typical price', usd(m.value)),
-      stat('Fast-sale price', usd(m.quick)),
-      stat('CSFloat base', usd(m.basePrice)),
+      stat('Typical price', eur(m.value)),
+      stat('Fast-sale price', eur(m.quick)),
+      stat('CSFloat base', eur(m.basePrice)),
       stat('Range of used sales', fmtRange),
       stat('Trend 14 d', okNum(m.trend) ? h('span', { class: signClass(m.trend), text: fmtPct(m.trend, 1, { sign: true }) }) : DASH),
       stat('Sold 7 d / 30 d', `${fmtInt(m.sales7d)}${m.salesCapped && m.sales7d === m.n ? '+' : ''} / ${sold30(m)}`),
@@ -73,7 +74,7 @@ function detail(name, m, basis, width) {
     h(
       'div',
       { class: 'dfoot' },
-      h('span', { class: 'faint', text: `Typical = ${sourceText(m)}. You get = price minus CSFloat's ${feePct} seller fee.` }),
+      h('span', { class: 'faint', text: `Typical = ${sourceText(m)}. You get = price minus CSFloat's ${feePct} seller fee, in euros at CSFloat's USD rate.` }),
       h('a', { href: marketUrl(name), target: '_blank', rel: 'noopener noreferrer', on: { click: (e) => e.stopPropagation() }, text: 'Listings ↗' }),
     ),
   );
@@ -91,7 +92,7 @@ function verdictBanner(v, loading, basisWord, onSelect) {
     return h('div', { class: 'verdict neutral', role: 'status' }, h('div', { class: 'vh', text: 'Checking CSFloat prices…' }), h('div', { class: 'vd', text: 'The answer shows once every offered item has a price.' }));
   }
   const b = v.best;
-  const more = (d) => `${usd(Math.abs(d))} ${d >= 0 ? 'more' : 'less'}`;
+  const more = (d) => `${eur(Math.abs(d))} ${d >= 0 ? 'more' : 'less'}`;
   let cls, head, text;
   if (v.kind === 'unknown') {
     cls = 'neutral';
@@ -116,7 +117,7 @@ function verdictBanner(v, loading, basisWord, onSelect) {
   } else {
     cls = 'neutral';
     head = 'About even';
-    text = `${b.name} sells for ${usd(v.delta, { sign: true })} against your item, inside normal price noise. Keeping is fine.`;
+    text = `${b.name} sells for ${eur(v.delta, { sign: true })} against your item, inside normal price noise. Keeping is fine.`;
   }
   const canSelect = v.kind !== 'unknown' && !!b;
   return h(
@@ -278,14 +279,14 @@ export function mountExchangePanel(o) {
         on: { click: () => toggleOpen('@current') },
       },
       h('div', { class: 'k', text: `Your item, you get (${basisWord})` }),
-      h('div', { class: 'v num' }, usd(curSell), trendTag(curMarket) ? h('span', { class: 'x' }, trendTag(curMarket)) : null),
+      h('div', { class: 'v num' }, eur(curSell), trendTag(curMarket) ? h('span', { class: 'x' }, trendTag(curMarket)) : null),
       h('div', { class: 's', title: curName ?? '', text: curName ? `${curMarket ? `${sold30(curMarket)} sold / 30 d ·` : ''}${curName}` : 'Item name unknown' }),
     );
     const bestBox = h(
       'div',
       { class: 'box' },
       h('div', { class: 'k', text: `Best swap, ${minSales}+ sales / 30 d` }),
-      h('div', { class: 'v num' }, best ? usd(best.sell) : DASH, best && best.delta !== null ? h('span', { class: ['x', signClass(best.delta)], text: usd(best.delta, { sign: true }) }) : null),
+      h('div', { class: 'v num' }, best ? eur(best.sell) : DASH, best && best.delta !== null ? h('span', { class: ['x', signClass(best.delta)], text: eur(best.delta, { sign: true }) }) : null),
       h('div', { class: 's', title: best?.name ?? '', text: best ? best.name : loading ? 'Loading prices…' : 'None liquid enough' }),
     );
 
@@ -344,7 +345,7 @@ export function mountExchangePanel(o) {
       const title = r.error
         ? r.error
         : m
-          ? `${r.name}\nTypical ${usd(m.value)}, fast sale ${usd(m.quick)} (${sourceText(m)}).${m.split ? `\n${splitText(m)}` : ''}\n${sold30(m)} sold in 30 days${okNum(m.listings) ? `, ${fmtInt(m.listings)} listed now` : ''}.\nClick for the sales chart.`
+          ? `${r.name}\nTypical ${eur(m.value)}, fast sale ${eur(m.quick)} (${sourceText(m)}).${m.split ? `\n${splitText(m)}` : ''}\n${sold30(m)} sold in 30 days${okNum(m.listings) ? `, ${fmtInt(m.listings)} listed now` : ''}.\nClick for the sales chart.`
           : r.name;
       const spark = m && m.pts?.length ? salesSparkline({ points: expandPoints(m.pts).filter((p) => Date.now() - p.ts <= 90 * 86_400_000), typical: m.source === 'sales' ? m.value : null }) : null;
       const activate = () => {
@@ -379,10 +380,10 @@ export function mountExchangePanel(o) {
             h(
               'span',
               { class: 'price num' },
-              usd(r.sell),
+              eur(r.sell),
               m?.source && m.source !== 'sales' ? h('span', { class: 'flag', title: sourceText(m), text: '*' }) : null,
               m?.split ? h('span', { class: 'flag', title: splitText(m), text: '²' }) : null,
-              r.delta !== null ? h('span', { class: ['delta', signClass(r.delta)], text: usd(r.delta, { sign: true }) }) : null,
+              r.delta !== null ? h('span', { class: ['delta', signClass(r.delta)], text: eur(r.delta, { sign: true }) }) : null,
             ),
             h('span', { class: 'second num' }, second),
           ),
@@ -404,7 +405,7 @@ export function mountExchangePanel(o) {
       items.length ? h('ul', { class: 'items' }, ...items) : h('p', { class: 'muted pad', text: 'The site offered no items.' }),
       h(
         'div',
-        { class: 'note', text: `You get = recent CSFloat sale prices minus the ${feePct} seller fee. * = under 3 recent sales. ² = two price groups, priced on the lower one. Float and stickers move prices. A row click opens its chart and selects it on the site; you confirm there.` },
+        { class: 'note', text: `You get = recent CSFloat sale prices minus the ${feePct} seller fee, in euros at CSFloat's USD rate. * = under 3 recent sales. ² = two price groups, priced on the lower one. Float and stickers move prices. A row click opens its chart and selects it on the site; you confirm there.` },
       ),
     );
     const list = content.querySelector('.items');

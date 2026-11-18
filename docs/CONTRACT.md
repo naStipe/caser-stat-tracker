@@ -198,6 +198,8 @@ Facts learned from 15,846 real upgrades, 17,517 inventory-history rows and 536 p
 - CSFloat: `GET https://csfloat.com/api/v1/history/{market_hash_name}/sales` is public (no login, no CORS, so it goes
   through `GM_xmlhttpRequest`). Newest ~40 sales, prices in US cents, each with `sold_at`, `item.float_value` and `reference: {base_price, predicted_price, float_factor, quantity}`
   (`quantity` = active listings). `/api/v1/listings` needs a login and is not used.
+  `GET https://csfloat.com/api/v1/meta/exchange-rates` is public too: `{data: {eur, ...}}`, units per US dollar. The
+  exchange panel converts every CSFloat price to euros with `eur`, fetched every 6 hours (the last rate is kept).
 
 ### Event schema additions
 

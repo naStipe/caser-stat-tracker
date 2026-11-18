@@ -808,6 +808,7 @@
   var CSFLOAT_ORIGIN = "https://csfloat.com";
   var CSFLOAT_SELLER_FEE = 0.02;
   var DAY = 864e5;
+  var RATES_URL = `${CSFLOAT_ORIGIN}/api/v1/meta/exchange-rates`;
   function salesUrl(name) {
     return `${CSFLOAT_ORIGIN}/api/v1/history/${encodeURIComponent(name)}/sales`;
   }
@@ -913,6 +914,23 @@
       pts: list.map((r) => [Math.round(r.ts / 6e4), Math.round(r.price * 100), r.float === null ? null : Math.round(r.float * 1e4)])
     };
   }
+  function convertSummary(s2, rate) {
+    const x = (v) => typeof v === "number" && Number.isFinite(v) ? v * rate : v;
+    const sp = s2.split;
+    return {
+      ...s2,
+      value: x(s2.value),
+      quick: x(s2.quick),
+      net: x(s2.net),
+      quickNet: x(s2.quickNet),
+      low: x(s2.low),
+      high: x(s2.high),
+      basePrice: x(s2.basePrice),
+      lastPrice: x(s2.lastPrice),
+      split: sp ? { ...sp, cut: x(sp.cut), lowMin: x(sp.lowMin), lowMax: x(sp.lowMax), highMin: x(sp.highMin), highMax: x(sp.highMax), upper: x(sp.upper) } : sp,
+      pts: (Array.isArray(s2.pts) ? s2.pts : []).map((p) => [p[0], Math.round(p[1] * rate), p[2]])
+    };
+  }
   function createPriceClient(o) {
     const now = o.now ?? (() => Date.now());
     const ttlMs = o.ttlMs ?? 6 * 36e5;
@@ -929,9 +947,46 @@
       for (const old of ["cst.csfloat.v1", "cst.csfloat.v2"]) o.storage?.remove?.(old);
     } catch {
     }
+    const RATE_KEY = "cst.csfloat.eur";
+    let fx = null;
+    try {
+      const r = o.storage?.get(RATE_KEY, null);
+      if (r && ok(r.rate) && r.rate > 0 && ok(r.ts)) fx = r;
+    } catch {
+    }
+    let rateBusy = null;
+    const converted = /* @__PURE__ */ new WeakMap();
     const inflight = /* @__PURE__ */ new Map();
     let queue = Promise.resolve();
     let pausedUntil = 0;
+    function inEur(s2) {
+      const c = converted.get(s2);
+      if (c && c.rate === fx.rate) return c.out;
+      const out = convertSummary(s2, fx.rate);
+      converted.set(s2, { rate: fx.rate, out });
+      return out;
+    }
+    function ensureRate() {
+      if (fx && now() - fx.ts < ttlMs) return Promise.resolve();
+      if (rateBusy) return rateBusy;
+      rateBusy = (async () => {
+        try {
+          const res = await o.request(RATES_URL);
+          const rate = Number(res?.json?.data?.eur);
+          if (res.status < 200 || res.status >= 300 || !ok(rate) || rate <= 0) throw new Error(`CSFloat exchange rate HTTP ${res.status}`);
+          fx = { ts: now(), rate };
+          try {
+            o.storage?.set(RATE_KEY, fx);
+          } catch {
+          }
+        } catch (e) {
+          if (!fx) throw new Error(`No USD to EUR rate: ${e?.message || e}`);
+        } finally {
+          rateBusy = null;
+        }
+      })();
+      return rateBusy;
+    }
     function save() {
       const keys = Object.keys(cache);
       if (keys.length > maxEntries) {
@@ -943,18 +998,23 @@
       } catch {
       }
     }
-    function cached(name) {
+    function cachedUsd(name) {
       const c = cache[name];
       return c && now() - c.ts < ttlMs ? c.s : null;
     }
+    function cached(name) {
+      const s2 = cachedUsd(name);
+      return s2 && fx ? inEur(s2) : null;
+    }
     function get(name) {
       const hit = cached(name);
-      if (hit) return Promise.resolve(hit);
+      if (hit && now() - fx.ts < ttlMs) return Promise.resolve(hit);
       if (inflight.has(name)) return inflight.get(name);
       const p = queue = queue.catch(() => {
       }).then(async () => {
-        const again = cached(name);
-        if (again) return again;
+        await ensureRate();
+        const again = cachedUsd(name);
+        if (again) return inEur(again);
         const wait = Math.max(0, pausedUntil - now());
         if (wait) await sleep2(wait);
         const res = await o.request(salesUrl(name));
@@ -966,14 +1026,14 @@
           const s3 = summarizeSales([], now());
           cache[name] = { ts: now(), s: s3 };
           save();
-          return s3;
+          return inEur(s3);
         }
         if (res.status < 200 || res.status >= 300) throw new Error(`CSFloat HTTP ${res.status}`);
         const s2 = summarizeSales(res.json, now());
         cache[name] = { ts: now(), s: s2 };
         save();
         await sleep2(gapMs);
-        return s2;
+        return inEur(s2);
       });
       inflight.set(name, p);
       p.finally(() => inflight.delete(name)).catch(() => {
@@ -1951,7 +2011,7 @@
         sell,
         liquid: !!market && sell !== null && market.sales30d >= minSales,
         delta: sell !== null && cur !== null ? sell - cur : null,
-        // USD received per 1000 site coins: how much real money the site price buys.
+        // Euros received per 1000 site coins: how much real money the site price buys.
         perK: sell !== null && c.price > 0 ? sell / c.price * 1e3 : null
       };
     });
@@ -3183,7 +3243,7 @@ option { background: var(--surface); color: var(--text); }
     );
     return svg;
   }
-  function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => "$" + fmtNumber(v, 2) }) {
+  function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => "\u20AC" + fmtNumber(v, 2) }) {
     const pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
     if (!pts.length) return h("div", { class: "chart" }, h("p", { class: "faint", text: "No CSFloat sales to draw." }));
     const readout = h("div", { class: "readout", "aria-live": "off" });
@@ -5950,7 +6010,7 @@ option { background: var(--surface); color: var(--text); }
   var MIN_SALES_KEY = "cst.ui.exchangeMinSales";
   var POLL_MS3 = 500;
   var okNum2 = (v) => typeof v === "number" && Number.isFinite(v);
-  var usd = (v, opts) => okNum2(v) ? (v < 0 ? "\u2212$" : opts?.sign && v > 0 ? "+$" : "$") + fmtNumber(Math.abs(v), 2) : DASH;
+  var eur = (v, opts) => okNum2(v) ? (v < 0 ? "\u2212\u20AC" : opts?.sign && v > 0 ? "+\u20AC" : "\u20AC") + fmtNumber(Math.abs(v), 2) : DASH;
   var feePct = `${fmtNumber(CSFLOAT_SELLER_FEE * 100, 0)}%`;
   function icon3(d) {
     return s("svg", { viewBox: "0 0 16 16", "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": 1.6, "stroke-linecap": "round", "stroke-linejoin": "round" }, s("path", { d }));
@@ -5959,7 +6019,7 @@ option { background: var(--surface); color: var(--text); }
   function splitText(m) {
     const sp = m?.split;
     if (!sp) return null;
-    return `Two price groups: ${fmtPct(sp.lowShare, 0)} of sales at ${usd(sp.lowMin)}\u2013${usd(sp.lowMax)}, the rest at ${usd(sp.highMin)}\u2013${usd(sp.highMax)} (pattern, phase or float). Prices use the lower group; the upper group is upside you only see once you hold the item.`;
+    return `Two price groups: ${fmtPct(sp.lowShare, 0)} of sales at ${eur(sp.lowMin)}\u2013${eur(sp.lowMax)}, the rest at ${eur(sp.highMin)}\u2013${eur(sp.highMax)} (pattern, phase or float). Prices use the lower group; the upper group is upside you only see once you hold the item.`;
   }
   function sourceText(m) {
     if (!m) return "";
@@ -5975,7 +6035,7 @@ option { background: var(--surface); color: var(--text); }
   function detail(name, m, basis, width) {
     if (!m) return h("div", { class: "detail" }, h("p", { class: "faint", text: "Loading CSFloat sales\u2026" }));
     const stat = (k, v, extra) => h("div", { class: "st" }, h("div", { class: "k", text: k }), h("div", { class: "v num" }, v, extra ?? null));
-    const fmtRange = okNum2(m.low) && okNum2(m.high) ? `${usd(m.low)} \u2013 ${usd(m.high)}` : DASH;
+    const fmtRange = okNum2(m.low) && okNum2(m.high) ? `${eur(m.low)} \u2013 ${eur(m.high)}` : DASH;
     return h(
       "div",
       { class: "detail" },
@@ -5984,12 +6044,12 @@ option { background: var(--surface); color: var(--text); }
       h(
         "div",
         { class: "stats" },
-        stat("You get, typical", usd(m.net), basis === "typical" ? h("span", { class: "tag", text: "ranked" }) : null),
-        stat("You get, fast sale", usd(m.quickNet), basis === "fast" ? h("span", { class: "tag", text: "ranked" }) : null),
+        stat("You get, typical", eur(m.net), basis === "typical" ? h("span", { class: "tag", text: "ranked" }) : null),
+        stat("You get, fast sale", eur(m.quickNet), basis === "fast" ? h("span", { class: "tag", text: "ranked" }) : null),
         stat("Listed now", okNum2(m.listings) ? fmtInt(m.listings) : DASH),
-        stat("Typical price", usd(m.value)),
-        stat("Fast-sale price", usd(m.quick)),
-        stat("CSFloat base", usd(m.basePrice)),
+        stat("Typical price", eur(m.value)),
+        stat("Fast-sale price", eur(m.quick)),
+        stat("CSFloat base", eur(m.basePrice)),
         stat("Range of used sales", fmtRange),
         stat("Trend 14 d", okNum2(m.trend) ? h("span", { class: signClass(m.trend), text: fmtPct(m.trend, 1, { sign: true }) }) : DASH),
         stat("Sold 7 d / 30 d", `${fmtInt(m.sales7d)}${m.salesCapped && m.sales7d === m.n ? "+" : ""} / ${sold30(m)}`)
@@ -5997,7 +6057,7 @@ option { background: var(--surface); color: var(--text); }
       h(
         "div",
         { class: "dfoot" },
-        h("span", { class: "faint", text: `Typical = ${sourceText(m)}. You get = price minus CSFloat's ${feePct} seller fee.` }),
+        h("span", { class: "faint", text: `Typical = ${sourceText(m)}. You get = price minus CSFloat's ${feePct} seller fee, in euros at CSFloat's USD rate.` }),
         h("a", { href: marketUrl(name), target: "_blank", rel: "noopener noreferrer", on: { click: (e) => e.stopPropagation() }, text: "Listings \u2197" })
       )
     );
@@ -6007,7 +6067,7 @@ option { background: var(--surface); color: var(--text); }
       return h("div", { class: "verdict neutral", role: "status" }, h("div", { class: "vh", text: "Checking CSFloat prices\u2026" }), h("div", { class: "vd", text: "The answer shows once every offered item has a price." }));
     }
     const b = v.best;
-    const more = (d) => `${usd(Math.abs(d))} ${d >= 0 ? "more" : "less"}`;
+    const more = (d) => `${eur(Math.abs(d))} ${d >= 0 ? "more" : "less"}`;
     let cls, head, text;
     if (v.kind === "unknown") {
       cls = "neutral";
@@ -6032,7 +6092,7 @@ option { background: var(--surface); color: var(--text); }
     } else {
       cls = "neutral";
       head = "About even";
-      text = `${b.name} sells for ${usd(v.delta, { sign: true })} against your item, inside normal price noise. Keeping is fine.`;
+      text = `${b.name} sells for ${eur(v.delta, { sign: true })} against your item, inside normal price noise. Keeping is fine.`;
     }
     const canSelect = v.kind !== "unknown" && !!b;
     return h(
@@ -6168,14 +6228,14 @@ option { background: var(--surface); color: var(--text); }
           on: { click: () => toggleOpen("@current") }
         },
         h("div", { class: "k", text: `Your item, you get (${basisWord})` }),
-        h("div", { class: "v num" }, usd(curSell), trendTag(curMarket) ? h("span", { class: "x" }, trendTag(curMarket)) : null),
+        h("div", { class: "v num" }, eur(curSell), trendTag(curMarket) ? h("span", { class: "x" }, trendTag(curMarket)) : null),
         h("div", { class: "s", title: curName ?? "", text: curName ? `${curMarket ? `${sold30(curMarket)} sold / 30 d \xB7` : ""}${curName}` : "Item name unknown" })
       );
       const bestBox = h(
         "div",
         { class: "box" },
         h("div", { class: "k", text: `Best swap, ${minSales}+ sales / 30 d` }),
-        h("div", { class: "v num" }, best ? usd(best.sell) : DASH, best && best.delta !== null ? h("span", { class: ["x", signClass(best.delta)], text: usd(best.delta, { sign: true }) }) : null),
+        h("div", { class: "v num" }, best ? eur(best.sell) : DASH, best && best.delta !== null ? h("span", { class: ["x", signClass(best.delta)], text: eur(best.delta, { sign: true }) }) : null),
         h("div", { class: "s", title: best?.name ?? "", text: best ? best.name : loading ? "Loading prices\u2026" : "None liquid enough" })
       );
       const minSel = h(
@@ -6226,7 +6286,7 @@ option { background: var(--surface); color: var(--text); }
         const sub = `site ${fmtMoney(r.price, c)}${r.refund ? ` \xB7 refund ${fmtMoney(r.refund, c)}` : ""}`;
         const second = r.error ? h("span", { class: "neg", text: "no price" }) : !m ? "loading\u2026" : [`${sold30(m)} sold`, trendTag(m) ? " " : null, trendTag(m)];
         const title = r.error ? r.error : m ? `${r.name}
-Typical ${usd(m.value)}, fast sale ${usd(m.quick)} (${sourceText(m)}).${m.split ? `
+Typical ${eur(m.value)}, fast sale ${eur(m.quick)} (${sourceText(m)}).${m.split ? `
 ${splitText(m)}` : ""}
 ${sold30(m)} sold in 30 days${okNum2(m.listings) ? `, ${fmtInt(m.listings)} listed now` : ""}.
 Click for the sales chart.` : r.name;
@@ -6263,10 +6323,10 @@ Click for the sales chart.` : r.name;
               h(
                 "span",
                 { class: "price num" },
-                usd(r.sell),
+                eur(r.sell),
                 m?.source && m.source !== "sales" ? h("span", { class: "flag", title: sourceText(m), text: "*" }) : null,
                 m?.split ? h("span", { class: "flag", title: splitText(m), text: "\xB2" }) : null,
-                r.delta !== null ? h("span", { class: ["delta", signClass(r.delta)], text: usd(r.delta, { sign: true }) }) : null
+                r.delta !== null ? h("span", { class: ["delta", signClass(r.delta)], text: eur(r.delta, { sign: true }) }) : null
               ),
               h("span", { class: "second num" }, second)
             )
@@ -6287,7 +6347,7 @@ Click for the sales chart.` : r.name;
         items.length ? h("ul", { class: "items" }, ...items) : h("p", { class: "muted pad", text: "The site offered no items." }),
         h(
           "div",
-          { class: "note", text: `You get = recent CSFloat sale prices minus the ${feePct} seller fee. * = under 3 recent sales. \xB2 = two price groups, priced on the lower one. Float and stickers move prices. A row click opens its chart and selects it on the site; you confirm there.` }
+          { class: "note", text: `You get = recent CSFloat sale prices minus the ${feePct} seller fee, in euros at CSFloat's USD rate. * = under 3 recent sales. \xB2 = two price groups, priced on the lower one. Float and stickers move prices. A row click opens its chart and selects it on the site; you confirm there.` }
         )
       );
       const list = content.querySelector(".items");

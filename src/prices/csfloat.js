@@ -1,13 +1,17 @@
 // CSFloat market prices for item names, used to rank the site's item-replacement candidates by the money they
 // really sell for. Uses the public sales-history endpoint (no login): GET /api/v1/history/{market_hash_name}/sales
 // returns the newest ~40 sales, each with its float and a `reference` block (CSFloat's base price and the number of
-// active listings). Prices from CSFloat are in US cents; summaries here are in US dollars.
+// active listings). Prices from CSFloat are in US cents. The cache keeps summaries in US dollars; the client hands
+// them out in euros, converted with CSFloat's own exchange rate (GET /api/v1/meta/exchange-rates, USD based).
 // Only item names are sent to CSFloat. Nothing about the user is sent.
 
 export const CSFLOAT_ORIGIN = 'https://csfloat.com';
 /** CSFloat's seller fee on a completed sale. */
 export const CSFLOAT_SELLER_FEE = 0.02;
 const DAY = 86_400_000;
+
+/** CSFloat's exchange rates, as units of each currency per US dollar: {data: {eur: 0.91, ...}}. */
+export const RATES_URL = `${CSFLOAT_ORIGIN}/api/v1/meta/exchange-rates`;
 
 export function salesUrl(name) {
   return `${CSFLOAT_ORIGIN}/api/v1/history/${encodeURIComponent(name)}/sales`;
@@ -44,19 +48,20 @@ export function expandPoints(pts) {
 
 /**
  * @typedef {Object} PriceSummary
- * @property {number|null} value      typical sale price, USD: median of recent sales without outliers
- * @property {number|null} quick      fast-sale price, USD: 25th percentile of the same sales (undercut to sell fast)
+ * Money fields are US dollars in the cache and euros once the client hands a summary out.
+ * @property {number|null} value      typical sale price: median of recent sales without outliers
+ * @property {number|null} quick      fast-sale price: 25th percentile of the same sales (undercut to sell fast)
  * @property {number|null} net        value after CSFloat's seller fee: what you receive selling at the typical price
  * @property {number|null} quickNet   quick after the fee
  * @property {'sales'|'reference'|'last'|null} source  what `value` is based on
  * @property {number|null} windowDays sales window behind value: 30 or 90 days (null when not from sales)
  * @property {number} used            sales behind value (after outliers are dropped)
- * @property {number|null} low        lowest of those sales, USD
- * @property {number|null} high       highest of those sales, USD
+ * @property {number|null} low        lowest of those sales
+ * @property {number|null} high       highest of those sales
  * @property {number|null} spread     (75th − 25th percentile) / median: how much prices scatter
  * @property {number|null} trend      median of the last 14 days / median of days 14 to 90, minus 1
- * @property {number|null} basePrice  CSFloat reference (base) price, USD
- * @property {number|null} lastPrice  newest sale, USD
+ * @property {number|null} basePrice  CSFloat reference (base) price
+ * @property {number|null} lastPrice  newest sale
  * @property {number|null} lastSaleTs
  * @property {number} sales7d
  * @property {number} sales30d
@@ -185,7 +190,32 @@ export function summarizeSales(rows, now = Date.now()) {
 }
 
 /**
- * Price client with a cache and a request queue (one request at a time, a gap between requests).
+ * A summary with every money field multiplied by `rate` (US dollars to the display currency).
+ * @param {PriceSummary} s
+ * @param {number} rate
+ * @returns {PriceSummary}
+ */
+export function convertSummary(s, rate) {
+  const x = (v) => (typeof v === 'number' && Number.isFinite(v) ? v * rate : v);
+  const sp = s.split;
+  return {
+    ...s,
+    value: x(s.value),
+    quick: x(s.quick),
+    net: x(s.net),
+    quickNet: x(s.quickNet),
+    low: x(s.low),
+    high: x(s.high),
+    basePrice: x(s.basePrice),
+    lastPrice: x(s.lastPrice),
+    split: sp ? { ...sp, cut: x(sp.cut), lowMin: x(sp.lowMin), lowMax: x(sp.lowMax), highMin: x(sp.highMin), highMax: x(sp.highMax), upper: x(sp.upper) } : sp,
+    pts: (Array.isArray(s.pts) ? s.pts : []).map((p) => [p[0], Math.round(p[1] * rate), p[2]]),
+  };
+}
+
+/**
+ * Price client with a cache and a request queue (one request at a time, a gap between requests). Summaries come
+ * out in euros. The USD to EUR rate is fetched once per ttlMs; when a refresh fails, the last stored rate is used.
  * @param {{
  *   request: (url: string) => Promise<{status: number, json: any}>,
  *   storage?: {get: (k: string, d: any) => any, set: (k: string, v: any) => void},
@@ -211,9 +241,49 @@ export function createPriceClient(o) {
   try {
     for (const old of ['cst.csfloat.v1', 'cst.csfloat.v2']) o.storage?.remove?.(old);
   } catch {}
+  const RATE_KEY = 'cst.csfloat.eur';
+  /** @type {{ts: number, rate: number}|null} */
+  let fx = null;
+  try {
+    const r = o.storage?.get(RATE_KEY, null);
+    if (r && ok(r.rate) && r.rate > 0 && ok(r.ts)) fx = r;
+  } catch {}
+  let rateBusy = null;
+  /** Converted summaries, so repeated reads of one cache entry return one object. */
+  const converted = new WeakMap();
   const inflight = new Map();
   let queue = Promise.resolve();
   let pausedUntil = 0;
+
+  function inEur(s) {
+    const c = converted.get(s);
+    if (c && c.rate === fx.rate) return c.out;
+    const out = convertSummary(s, fx.rate);
+    converted.set(s, { rate: fx.rate, out });
+    return out;
+  }
+
+  /** Makes sure a USD to EUR rate is known, fetching it when missing or older than ttlMs. */
+  function ensureRate() {
+    if (fx && now() - fx.ts < ttlMs) return Promise.resolve();
+    if (rateBusy) return rateBusy;
+    rateBusy = (async () => {
+      try {
+        const res = await o.request(RATES_URL);
+        const rate = Number(res?.json?.data?.eur);
+        if (res.status < 200 || res.status >= 300 || !ok(rate) || rate <= 0) throw new Error(`CSFloat exchange rate HTTP ${res.status}`);
+        fx = { ts: now(), rate };
+        try {
+          o.storage?.set(RATE_KEY, fx);
+        } catch {}
+      } catch (e) {
+        if (!fx) throw new Error(`No USD to EUR rate: ${e?.message || e}`);
+      } finally {
+        rateBusy = null;
+      }
+    })();
+    return rateBusy;
+  }
 
   function save() {
     const keys = Object.keys(cache);
@@ -226,19 +296,27 @@ export function createPriceClient(o) {
     } catch {}
   }
 
-  function cached(name) {
+  /** Fresh cached summary in US dollars, or null. */
+  function cachedUsd(name) {
     const c = cache[name];
     return c && now() - c.ts < ttlMs ? c.s : null;
   }
 
-  /** @returns {Promise<PriceSummary>} */
+  /** Fresh cached summary in euros, or null (also while no exchange rate is known). */
+  function cached(name) {
+    const s = cachedUsd(name);
+    return s && fx ? inEur(s) : null;
+  }
+
+  /** @returns {Promise<PriceSummary>} in euros */
   function get(name) {
     const hit = cached(name);
-    if (hit) return Promise.resolve(hit);
+    if (hit && now() - fx.ts < ttlMs) return Promise.resolve(hit);
     if (inflight.has(name)) return inflight.get(name);
     const p = (queue = queue.catch(() => {}).then(async () => {
-      const again = cached(name);
-      if (again) return again;
+      await ensureRate();
+      const again = cachedUsd(name);
+      if (again) return inEur(again);
       const wait = Math.max(0, pausedUntil - now());
       if (wait) await sleep(wait);
       const res = await o.request(salesUrl(name));
@@ -250,14 +328,14 @@ export function createPriceClient(o) {
         const s = summarizeSales([], now());
         cache[name] = { ts: now(), s };
         save();
-        return s;
+        return inEur(s);
       }
       if (res.status < 200 || res.status >= 300) throw new Error(`CSFloat HTTP ${res.status}`);
       const s = summarizeSales(res.json, now());
       cache[name] = { ts: now(), s };
       save();
       await sleep(gapMs);
-      return s;
+      return inEur(s);
     }));
     inflight.set(name, p);
     p.finally(() => inflight.delete(name)).catch(() => {});

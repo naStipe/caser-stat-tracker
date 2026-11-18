@@ -44,7 +44,7 @@ export function rankCandidates(candidates, lookup, opts = {}) {
       sell,
       liquid: !!market && sell !== null && market.sales30d >= minSales,
       delta: sell !== null && cur !== null ? sell - cur : null,
-      // USD received per 1000 site coins: how much real money the site price buys.
+      // Euros received per 1000 site coins: how much real money the site price buys.
       perK: sell !== null && c.price > 0 ? (sell / c.price) * 1000 : null,
     };
   });
@@ -71,7 +71,7 @@ export function rankCandidates(candidates, lookup, opts = {}) {
 
 /**
  * Whether swapping is worth it: compares the best liquid offer (by sell value) against the item being replaced.
- * Differences inside the margin (2% of the current value, at least $0.10) count as even, since recent sale
+ * Differences inside the margin (2% of the current value, at least €0.10) count as even, since recent sale
  * prices are noisy. When the current item itself does not sell (under minSales), an even or better liquid
  * offer is worth taking for liquidity alone.
  * @param {ExchangeRow[]} rows from rankCandidates (same basis as currentSell)

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarizeSales, createPriceClient, salesUrl, expandPoints, findSplit, CSFLOAT_SELLER_FEE } from '../src/prices/csfloat.js';
+import { summarizeSales, createPriceClient, salesUrl, expandPoints, findSplit, convertSummary, RATES_URL, CSFLOAT_SELLER_FEE } from '../src/prices/csfloat.js';
 import { replacementItemId, candidatesFromResponse } from '../src/capture/replacements.js';
 import { rankCandidates, sellValue, replaceVerdict } from '../src/stats/exchange.js';
 
@@ -151,21 +151,51 @@ test('price client caches, shares in-flight requests and reports rate limits', a
   const storage = { get: (k, d) => mem[k] ?? d, set: (k, v) => (mem[k] = v) };
   const request = async (url) => {
     calls.push(url);
+    if (url === RATES_URL) return { status: 200, json: { data: { eur: 0.5, usd: 1 } } };
     if (url.includes('Limited')) return { status: 429, json: null };
     return { status: 200, json: [sale(1, 1000, { base_price: 1000, quantity: 2 })] };
   };
   const client = createPriceClient({ request, storage, now: () => NOW, gapMs: 0 });
   const [a, b] = await Promise.all([client.get('Item'), client.get('Item')]);
-  assert.equal(calls.length, 1);
+  // One rate request and one sales request.
+  assert.deepEqual(calls.map((u) => u === RATES_URL), [true, false]);
   assert.equal(a, b);
-  assert.equal(a.value, 10);
+  // $10 at 0.5 EUR per USD.
+  assert.equal(a.value, 5);
+  assert.equal(a.basePrice, 5);
   await client.get('Item');
-  assert.equal(calls.length, 1);
-  assert.ok(mem['cst.csfloat.v3'].Item);
-  // A new client reads the stored cache.
+  assert.equal(calls.length, 2);
+  // The cache keeps US dollars.
+  assert.equal(mem['cst.csfloat.v3'].Item.s.value, 10);
+  assert.equal(mem['cst.csfloat.eur'].rate, 0.5);
+  // A new client reads the stored cache and rate.
   const again = createPriceClient({ request, storage, now: () => NOW, gapMs: 0 });
-  assert.equal(again.cached('Item').value, 10);
+  assert.equal(again.cached('Item').value, 5);
+  assert.equal(again.cached('Item'), again.cached('Item'));
   await assert.rejects(client.get('Limited'), /rate limit/);
+});
+
+test('price client keeps the last rate when a refresh fails, and fails without any rate', async () => {
+  let t = NOW;
+  const mem = { 'cst.csfloat.eur': { ts: NOW - 7 * 3600_000, rate: 0.8 } };
+  const storage = { get: (k, d) => mem[k] ?? d, set: (k, v) => (mem[k] = v) };
+  const request = async (url) => (url === RATES_URL ? { status: 500, json: null } : { status: 200, json: [sale(1, 1000)] });
+  const client = createPriceClient({ request, storage, now: () => t, gapMs: 0 });
+  assert.equal((await client.get('Item')).value, 8);
+  const none = createPriceClient({ request, storage: { get: (k, d) => d, set() {} }, now: () => t, gapMs: 0 });
+  await assert.rejects(none.get('Item'), /No USD to EUR rate/);
+  assert.equal(none.cached('Item'), null);
+});
+
+test('convertSummary scales every money field and sale point', () => {
+  const s = summarizeSales(Array.from({ length: 40 }, (_, i) => sale(i / 48, i % 5 < 3 ? 9800 + (i % 7) * 100 : 12800 + (i % 9) * 200, { base_price: 10000, quantity: 5 })), NOW);
+  const e = convertSummary(s, 0.9);
+  for (const k of ['value', 'quick', 'net', 'quickNet', 'low', 'high', 'basePrice', 'lastPrice']) assert.ok(Math.abs(e[k] - s[k] * 0.9) < 1e-9, k);
+  assert.ok(Math.abs(e.split.upper - s.split.upper * 0.9) < 1e-9);
+  assert.equal(e.split.lowShare, s.split.lowShare);
+  assert.equal(e.pts[0][1], Math.round(s.pts[0][1] * 0.9));
+  assert.equal(e.pts[0][0], s.pts[0][0]);
+  assert.equal(e.sales30d, s.sales30d);
 });
 
 test('replaceVerdict compares the best liquid offer by value, whatever the sort', () => {

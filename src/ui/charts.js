@@ -533,9 +533,9 @@ export function salesSparkline({ points, typical = null, width = 64, height = 22
  * Sales history scatter: every returned sale as a dot (x = time, y = price) with the typical and fast-sale prices
  * as flat lines and CSFloat's base price as a dotted line. Sales older than 30 days are drawn fainter; sales far
  * from the typical price are pinned to the edge as hollow dots. Hover shows a sale's date, price and float.
- * points: [{ts, price, float}]; prices in USD.
+ * points: [{ts, price, float}]; prices in euros.
  */
-export function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => '$' + fmtNumber(v, 2) }) {
+export function salesChart({ points, typical = null, fast = null, base = null, upper = null, width, height = 150, now = Date.now(), fmt = (v) => '€' + fmtNumber(v, 2) }) {
   const pts = (points || []).filter((p) => okNum(p.ts) && okNum(p.price)).sort((a, b) => a.ts - b.ts);
   if (!pts.length) return h('div', { class: 'chart' }, h('p', { class: 'faint', text: 'No CSFloat sales to draw.' }));
   const readout = h('div', { class: 'readout', 'aria-live': 'off' });
